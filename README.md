@@ -35,12 +35,15 @@ Thread Level  → ThreadReduce, ThreadScan
 ### Prerequisites
 
 - C++20 compatible compiler
-- CMake 3.26+ or XMake 3.0+
-- LuisaCompute (automatically fetched if not found)
+- CMake 3.26+ or XMake 3.0.6+
+- LuisaCompute (prepared with XMake or automatically fetched by CMake)
 
 ### XMake (Recommended)
 
 ```bash
+# Clone LuisaCompute's next branch, or safely fast-forward an existing checkout
+xmake prepare-lc
+
 # Configure and build
 xmake f -m release
 xmake
@@ -56,6 +59,11 @@ xmake run device_scan_test
 xmake run device_segment_reduce
 xmake run device_radix_sort_one_sweep
 ```
+
+`xmake prepare-lc` only updates a clean `LuisaCompute/` checkout on its `next`
+branch with the official `origin` URL. It refuses dirty, divergent, wrong-branch,
+or wrong-remote checkouts instead of overwriting local work. Regular `xmake`
+commands do not access the network when `lc_use_xrepo=false`.
 
 ### CMake
 
