@@ -1,10 +1,12 @@
-set_xmakever("3.0.0")
+set_xmakever("3.0.6")
 set_version("0.0.1")
 
 add_rules("mode.release", "mode.debug", "mode.releasedbg")
 
 option("lcpp_test", {default = true, description = "build test example", type = "boolean"})
 option('lc_use_xrepo', {default = false})
+
+includes("xmake/prepare_lc")
 
 if has_config('lc_use_xrepo') then
     includes("xmake/package.lua")
@@ -15,6 +17,7 @@ else
     local lc_lcpp_options = {
         lc_enable_xir = true,
         lc_enable_tests = false,
+        lc_enable_unity_build = false,
     }
     if lc_options then
         for k,v in pairs(lc_lcpp_options) do
