@@ -17,6 +17,7 @@ else
     local lc_lcpp_options = {
         lc_enable_xir = true,
         lc_enable_tests = false,
+        lc_enable_unity_build = false,
     }
     if lc_options then
         for k,v in pairs(lc_lcpp_options) do
