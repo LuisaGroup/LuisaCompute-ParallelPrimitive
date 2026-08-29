@@ -138,6 +138,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceMergeSort** - Stable key and key-value merge sorting
 - [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
 - [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
+- [x] **DeviceSpmv** - CSR sparse-matrix vector multiplication
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
 - [x] **DeviceHistogram** - Histogram computation
 - [x] **DeviceFor** - Parallel for-loop utilities
@@ -199,7 +200,7 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 - [x] `DeviceAdjacentDifference::SubtractRightCopy` - Copy with right subtraction
 
 #### DeviceSpmv (Sparse Matrix Operations)
-- [ ] `DeviceSpmv::CsrMV` - Sparse matrix-vector multiplication (CSR format)
+- [x] `DeviceSpmv::CsrMV` - Sparse matrix-vector multiplication (CSR format)
 
 #### DeviceCopy
 - [x] `DeviceCopy::Batched` - Batched memory copy operations
