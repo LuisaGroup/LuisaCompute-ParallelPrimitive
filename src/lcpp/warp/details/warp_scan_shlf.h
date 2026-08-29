@@ -32,43 +32,44 @@ namespace details
                            ScanOp                scan_op,
                            const Var<Type4Byte>& initial_value)
         {
-            compute::UInt lane_id   = compute::warp_lane_id();
-            compute::UInt wave_size = compute::warp_lane_count();
-
-            Var<Type4Byte> output = thread_input;
-            compute::UInt  offset = 1u;
-            $while(offset < wave_size)
-            {
-                Var<Type4Byte> temp = ShuffleUp(output, lane_id, offset);
-
-                $if(lane_id >= offset)
-                {
-                    output = scan_op(temp, output);
-                };
-                offset <<= 1;
-            };
-            inclusive_output = scan_op(initial_value, output);
+            Var<Type4Byte> output = inclusive_result(thread_input, scan_op);
+            inclusive_output      = scan_op(initial_value, output);
         }
-
 
         template <typename ScanOp>
         void InclusiveScan(const Var<Type4Byte>& thread_input, Var<Type4Byte>& inclusive_output, ScanOp scan_op)
         {
-            compute::UInt lane_id   = compute::warp_lane_id();
-            compute::UInt wave_size = compute::warp_lane_count();
+            inclusive_output = inclusive_result(thread_input, scan_op);
+        }
 
-            Var<Type4Byte> output = thread_input;
-            compute::UInt  offset = 1u;
-            $while(offset < wave_size)
-            {
-                Var<Type4Byte> temp = ShuffleUp(output, lane_id, offset, 0u);
-                $if(lane_id >= offset)
-                {
-                    output = scan_op(temp, output);
-                };
-                offset <<= 1;
-            };
-            inclusive_output = output;
+        template <typename ScanOp>
+        void InclusiveScan(const Var<Type4Byte>& thread_input,
+                           Var<Type4Byte>&       inclusive_output,
+                           Var<Type4Byte>&       warp_aggregate,
+                           ScanOp                scan_op)
+        {
+            Var<Type4Byte> output = inclusive_result(thread_input, scan_op);
+            inclusive_output      = output;
+            warp_aggregate        = aggregate(output);
+        }
+
+        template <typename ScanOp>
+        void InclusiveScan(const Var<Type4Byte>& thread_input,
+                           Var<Type4Byte>&       inclusive_output,
+                           Var<Type4Byte>&       warp_aggregate,
+                           ScanOp                scan_op,
+                           const Var<Type4Byte>& initial_value)
+        {
+            Var<Type4Byte> output = inclusive_result(thread_input, scan_op);
+            inclusive_output      = scan_op(initial_value, output);
+            warp_aggregate        = aggregate(output);
+        }
+
+        template <typename ScanOp>
+        void ExclusiveScan(const Var<Type4Byte>& thread_input, Var<Type4Byte>& exclusive_output, ScanOp scan_op)
+        {
+            Var<Type4Byte> inclusive_output = inclusive_result(thread_input, scan_op);
+            exclusive_output = exclusive_from_inclusive(inclusive_output, thread_input);
         }
 
         template <typename ScanOp>
@@ -77,13 +78,22 @@ namespace details
                            ScanOp                scan_op,
                            const Var<Type4Byte>& initial_value)
         {
-            Var<Type4Byte> inclusive_output;
-            InclusiveScan(thread_input, inclusive_output, scan_op, initial_value);
-            exclusive_output = ShuffleUp(inclusive_output, compute::warp_lane_id(), 1u);
-            $if(compute::warp_lane_id() == 0)
-            {
-                exclusive_output = initial_value;
-            };
+            Var<Type4Byte> inclusive_output = inclusive_result(thread_input, scan_op);
+            Var<Type4Byte> previous = exclusive_from_inclusive(inclusive_output, thread_input);
+            UInt           lane     = logical_lane();
+            Var<Type4Byte> prefixed = scan_op(initial_value, previous);
+            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+        }
+
+        template <typename ScanOp>
+        void ExclusiveScan(const Var<Type4Byte>& thread_input,
+                           Var<Type4Byte>&       exclusive_output,
+                           Var<Type4Byte>&       warp_aggregate,
+                           ScanOp                scan_op)
+        {
+            Var<Type4Byte> inclusive_output = inclusive_result(thread_input, scan_op);
+            exclusive_output = exclusive_from_inclusive(inclusive_output, thread_input);
+            warp_aggregate   = aggregate(inclusive_output);
         }
 
         template <typename ScanOp>
@@ -93,14 +103,12 @@ namespace details
                            ScanOp                scan_op,
                            const Var<Type4Byte>& initial_value)
         {
-            Var<Type4Byte> inclusive_output;
-            InclusiveScan(thread_input, inclusive_output, scan_op, initial_value);
-            exclusive_output = ShuffleUp(inclusive_output, compute::warp_lane_id(), 1u);
-            $if(compute::warp_lane_id() == 0)
-            {
-                exclusive_output = initial_value;
-            };
-            warp_aggregate = ShuffleUp(inclusive_output, compute::warp_lane_count(), 1u);
+            Var<Type4Byte> inclusive_output = inclusive_result(thread_input, scan_op);
+            Var<Type4Byte> previous = exclusive_from_inclusive(inclusive_output, thread_input);
+            UInt           lane     = logical_lane();
+            Var<Type4Byte> prefixed = scan_op(initial_value, previous);
+            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+            warp_aggregate          = aggregate(inclusive_output);
         }
 
         template <typename ScanOp>
@@ -109,8 +117,9 @@ namespace details
                   Var<Type4Byte>&       exclusive_output,
                   ScanOp                scan_op)
         {
-            InclusiveScan(thread_input, inclusive_output, scan_op);
-            exclusive_output = ShuffleUp(inclusive_output, compute::warp_lane_id(), 1u);
+            Var<Type4Byte> output = inclusive_result(thread_input, scan_op);
+            inclusive_output      = output;
+            exclusive_output      = exclusive_from_inclusive(output, thread_input);
         }
 
         template <typename ScanOp>
@@ -120,12 +129,55 @@ namespace details
                   ScanOp                scan_op,
                   const Var<Type4Byte>& initial_value)
         {
-            InclusiveScan(thread_input, inclusive_output, scan_op, initial_value);
-            exclusive_output = ShuffleUp(inclusive_output, compute::warp_lane_id(), 1u);
-            $if(compute::warp_lane_id() == 0)
+            Var<Type4Byte> output   = inclusive_result(thread_input, scan_op);
+            inclusive_output        = scan_op(initial_value, output);
+            Var<Type4Byte> previous = exclusive_from_inclusive(output, thread_input);
+            UInt           lane     = logical_lane();
+            Var<Type4Byte> prefixed = scan_op(initial_value, previous);
+            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+        }
+
+      private:
+        static UInt logical_warp_base()
+        {
+            UInt physical_lane = compute::warp_lane_id();
+            return physical_lane / UInt(LOGIC_WARP_SIZE) * UInt(LOGIC_WARP_SIZE);
+        }
+
+        static UInt logical_lane() { return compute::warp_lane_id() - logical_warp_base(); }
+
+        template <typename ScanOp>
+        static Var<Type4Byte> inclusive_result(const Var<Type4Byte>& thread_input, ScanOp scan_op)
+        {
+            UInt           physical_lane = compute::warp_lane_id();
+            UInt           warp_base     = logical_warp_base();
+            UInt           lane          = physical_lane - warp_base;
+            Var<Type4Byte> result        = thread_input;
+            for(size_t offset = 1u; offset < LOGIC_WARP_SIZE; offset <<= 1u)
             {
-                exclusive_output = initial_value;
-            };
+                UInt source_lane =
+                    compute::select(physical_lane, physical_lane - UInt(offset), lane >= UInt(offset));
+                Var<Type4Byte> candidate = WarpReadLane(result, source_lane);
+                Var<Type4Byte> combined  = scan_op(candidate, result);
+                result                   = compute::select(result, combined, lane >= UInt(offset));
+            }
+            return result;
+        }
+
+        static Var<Type4Byte> exclusive_from_inclusive(const Var<Type4Byte>& inclusive_output,
+                                                       const Var<Type4Byte>& lane_zero_fallback)
+        {
+            UInt           physical_lane = compute::warp_lane_id();
+            UInt           warp_base     = logical_warp_base();
+            UInt           lane          = physical_lane - warp_base;
+            UInt           source_lane = compute::select(warp_base, physical_lane - 1u, lane > 0u);
+            Var<Type4Byte> previous    = WarpReadLane(inclusive_output, source_lane);
+            return compute::select(lane_zero_fallback, previous, lane > 0u);
+        }
+
+        static Var<Type4Byte> aggregate(const Var<Type4Byte>& inclusive_output)
+        {
+            return WarpReadLane(inclusive_output, logical_warp_base() + UInt(LOGIC_WARP_SIZE - 1u));
         }
     };
 }  // namespace details

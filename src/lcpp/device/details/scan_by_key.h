@@ -40,7 +40,7 @@ namespace details
         using TileStatusViewer = ScanTileStateViewer<FlagValuePairT>;
 
         using ScanTileStateInitKernel =
-            Shader<1, Buffer<uint>, Buffer<FlagValuePairT>, Buffer<FlagValuePairT>, Buffer<KeyType>, Buffer<KeyType>, int>;
+            Shader<1, Buffer<uint>, Buffer<FlagValuePairT>, Buffer<FlagValuePairT>, Buffer<KeyType>, Buffer<KeyType>, uint>;
 
         using ScanByKeyKernel =
             Shader<1, Buffer<uint>, Buffer<FlagValuePairT>, Buffer<FlagValuePairT>, Buffer<KeyType>, Buffer<KeyType>, Buffer<ValueType>, Buffer<ValueType>, ValueType, uint>;
@@ -56,7 +56,7 @@ namespace details
                             BufferVar<FlagValuePairT> tile_inclusive,
                             BufferVar<KeyType>        d_keys_in,
                             BufferVar<KeyType>        d_prev_keys_output,
-                            Int                       num_tiles) noexcept
+                            UInt                      num_tiles) noexcept
                          {
                              set_block_size(BLOCK_SIZE);
 
@@ -65,7 +65,7 @@ namespace details
                              UInt tile_items = UInt(ITEMS_PER_THREAD) * block_size_x();
                              UInt tile_start = tid * tile_items;
 
-                             $if(tid > 0 & tid < num_tiles)
+                             $if(tid > 0u & tid < num_tiles)
                              {
                                  d_prev_keys_output.write(tid, d_keys_in.read(tile_start - 1));
                              };
@@ -74,8 +74,8 @@ namespace details
             return ms_scan_tile_state_init_shader;
         }
 
-        template <bool is_inclusive, typename ScanOp>
-        U<ScanByKeyKernel> compile(Device& device, size_t shared_mem_size, ScanOp scan_op)
+        template <bool is_inclusive, bool use_initial_value, typename ScanOp, typename EqualityOp>
+        U<ScanByKeyKernel> compile(Device& device, size_t shared_mem_size, ScanOp scan_op, EqualityOp equality_op)
         {
             ScanBySegmentOp<ScanOp> pair_scan_op{scan_op};
 
@@ -107,20 +107,30 @@ namespace details
                 }
             };
 
-            Callable AddInitToScan = [&](ArrayVar<ValueType, ITEMS_PER_THREAD>& scan_values,
-                                         const ArrayVar<int, ITEMS_PER_THREAD>& segment_flags,
-                                         const Var<ValueType>&                  init_value) noexcept
+            Callable ApplyInitialValue = [&](ArrayVar<ValueType, ITEMS_PER_THREAD>& scan_values,
+                                             const ArrayVar<int, ITEMS_PER_THREAD>& segment_flags,
+                                             const Var<ValueType>& init_value) noexcept
             {
-                for(auto item = 0; item < ITEMS_PER_THREAD; item++)
+                if constexpr(use_initial_value)
                 {
-                    $if(segment_flags[item] == 1)
+                    for(auto item = 0; item < ITEMS_PER_THREAD; item++)
                     {
-                        scan_values[item] = init_value;
+                        if constexpr(is_inclusive)
+                        {
+                            scan_values[item] = scan_op(init_value, scan_values[item]);
+                        }
+                        else
+                        {
+                            $if(segment_flags[item] == 1)
+                            {
+                                scan_values[item] = init_value;
+                            }
+                            $else
+                            {
+                                scan_values[item] = scan_op(init_value, scan_values[item]);
+                            };
+                        }
                     }
-                    $else
-                    {
-                        scan_values[item] = scan_op(scan_values[item], init_value);
-                    };
                 }
             };
 
@@ -182,7 +192,8 @@ namespace details
                             local_segment_flags,
                             local_prev_keys,
                             local_keys,
-                            [](const Var<KeyType>& a, const Var<KeyType>& b) { return a != b; });
+                            [&](const Var<KeyType>& a, const Var<KeyType>& b)
+                            { return !equality_op(a, b); });
 
                         ZipValueAndFlags(num_remaining, local_values, local_segment_flags, local_scan_items, is_last_tile);
 
@@ -214,7 +225,8 @@ namespace details
                             local_segment_flags,
                             local_prev_keys,
                             local_keys,
-                            [](const Var<KeyType>& a, const Var<KeyType>& b) { return a != b; },
+                            [&](const Var<KeyType>& a, const Var<KeyType>& b)
+                            { return !equality_op(a, b); },
                             tile_pred_key);
 
                         ZipValueAndFlags(num_remaining, local_values, local_segment_flags, local_scan_items, is_last_tile);
@@ -240,7 +252,7 @@ namespace details
                     ArrayVar<ValueType, ITEMS_PER_THREAD> value_output;
                     UnzipValues(value_output, output_scan_items);
 
-                    AddInitToScan(value_output, local_segment_flags, init_value);
+                    ApplyInitialValue(value_output, local_segment_flags, init_value);
 
                     $if(is_last_tile)
                     {

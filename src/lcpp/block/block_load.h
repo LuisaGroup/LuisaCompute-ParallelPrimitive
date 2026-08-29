@@ -12,14 +12,19 @@
 #include <luisa/dsl/resource.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/runtime/core.h>
+#include <lcpp/block/block_exchange.h>
 
 namespace luisa::parallel_primitive
 {
 
 enum class BlockLoadAlgorithm
 {
-    BLOCK_LOAD_DIRECT    = 0,
-    BLOCK_LOAD_TRANSPOSE = 1
+    BLOCK_LOAD_DIRECT,
+    BLOCK_LOAD_STRIPED,
+    BLOCK_LOAD_VECTORIZE,
+    BLOCK_LOAD_TRANSPOSE,
+    BLOCK_LOAD_WARP_TRANSPOSE,
+    BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED,
 };
 
 using namespace luisa::compute;
@@ -62,7 +67,7 @@ void LoadDirectStriped(compute::UInt                         linear_tid,
         $if(src_pos < block_item_end)
         {
             src_pos += tile_offset;
-            dst_items[i] = block_src_it.read(src_pos * (uint)sizeof(T));
+            dst_items[i] = block_src_it.read(src_pos);
         };
     }
 }
@@ -122,8 +127,8 @@ void LoadDirectWarpStriped(compute::UInt                         linear_tid,
                            compute::UInt                         tile_offset,
                            compute::ArrayVar<T, ItemsPerThread>& dst_items)
 {
-    compute::UInt tid         = linear_tid & compute::UInt(WARP_SIZE - 1);
-    compute::UInt wid         = linear_tid >> details::LOG_WARP_SIZE;
+    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
     // Load directly in warp-striped order
@@ -141,8 +146,8 @@ void LoadDirectWarpStriped(compute::UInt                         linear_tid,
                            compute::UInt                         tile_offset,
                            compute::ArrayVar<T, ItemsPerThread>& dst_items)
 {
-    compute::UInt tid         = linear_tid & compute::UInt(WARP_SIZE - 1);
-    compute::UInt wid         = linear_tid >> details::LOG_WARP_SIZE;
+    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
     // Load directly in warp-striped order
@@ -160,8 +165,8 @@ void LoadDirectWarpStriped(compute::UInt                         linear_tid,
                            compute::ArrayVar<T, ItemsPerThread>& dst_items,
                            compute::UInt                         block_item_end)
 {
-    compute::UInt tid         = linear_tid & compute::UInt(WARP_SIZE - 1);
-    compute::UInt wid         = linear_tid >> details::LOG_WARP_SIZE;
+    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
 
@@ -183,8 +188,8 @@ void LoadDirectWarpStriped(compute::UInt                         linear_tid,
                            compute::ArrayVar<T, ItemsPerThread>& dst_items,
                            compute::UInt                         block_item_end)
 {
-    compute::UInt tid         = linear_tid & compute::UInt(WARP_SIZE - 1);
-    compute::UInt wid         = linear_tid >> details::LOG_WARP_SIZE;
+    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
     for(auto i = 0; i < ItemsPerThread; i++)
@@ -233,11 +238,20 @@ template <typename Type4Byte, size_t BlockSize = details::BLOCK_SIZE, size_t ITE
 class BlockLoad : public LuisaModule
 {
   public:
-    BlockLoad(SmemTypePtr<Type4Byte> shared_mem)
+    explicit BlockLoad(SmemTypePtr<Type4Byte> shared_mem)
         : m_shared_mem(shared_mem)
     {
     }
-    BlockLoad() {}
+
+    BlockLoad()
+    {
+        if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_TRANSPOSE
+                     || DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_WARP_TRANSPOSE
+                     || DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED)
+        {
+            m_shared_mem = new SmemType<Type4Byte>{BlockSize * ITEMS_PER_THREAD};
+        }
+    }
 
     ~BlockLoad() = default;
 
@@ -246,7 +260,7 @@ class BlockLoad : public LuisaModule
               compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& thread_data,
               compute::UInt                                   block_item_start)
     {
-        Load(d_in, thread_data, block_item_start, compute::UInt(BlockSize * ITEMS_PER_THREAD), Type4Byte(0));
+        Load(d_in, thread_data, block_item_start, compute::UInt(BlockSize * ITEMS_PER_THREAD), Type4Byte{});
     }
 
     void Load(const compute::BufferVar<Type4Byte>&            d_in,
@@ -254,7 +268,39 @@ class BlockLoad : public LuisaModule
               compute::UInt                                   block_item_start,
               compute::UInt                                   block_item_end)
     {
-        Load(d_in, thread_data, block_item_start, block_item_end, Type4Byte(0));
+        compute::set_block_size(BlockSize);
+        compute::UInt tid = compute::thread_id().x;
+
+        if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_DIRECT
+                     || DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_VECTORIZE)
+        {
+            load_blocked_guarded(d_in, thread_data, block_item_start, block_item_end, tid);
+        }
+        else if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_STRIPED)
+        {
+            load_striped_guarded(d_in, thread_data, block_item_start, block_item_end, tid);
+        }
+        else if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_TRANSPOSE)
+        {
+            compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> striped_items;
+            for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+            {
+                striped_items[item] = thread_data[item];
+            }
+            load_striped_guarded(d_in, striped_items, block_item_start, block_item_end, tid);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).StripedToBlocked(striped_items, thread_data);
+        }
+        else
+        {
+            static_assert(BlockSize % details::WARP_SIZE == 0u);
+            compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> warp_striped_items;
+            for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+            {
+                warp_striped_items[item] = thread_data[item];
+            }
+            load_warp_striped_guarded(d_in, warp_striped_items, block_item_start, block_item_end, tid);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).WarpStripedToBlocked(warp_striped_items, thread_data);
+        }
     }
 
     void Load(const compute::BufferVar<Type4Byte>&            d_in,
@@ -263,38 +309,128 @@ class BlockLoad : public LuisaModule
               compute::UInt                                   block_item_end,
               Var<Type4Byte>                                  default_value)
     {
-        luisa::compute::set_block_size(BlockSize);
-        UInt thid = thread_id().x;
+        compute::set_block_size(BlockSize);
+        compute::UInt tid = compute::thread_id().x;
 
-        if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_DIRECT)
+        if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_DIRECT
+                     || DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_VECTORIZE)
         {
-            LoadDirectedBlocked(thid * UInt(ITEMS_PER_THREAD), d_in, thread_data, block_item_start, block_item_end, default_value);
-        };
+            load_blocked_default(d_in, thread_data, block_item_start, block_item_end, default_value, tid);
+        }
+        else if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_STRIPED)
+        {
+            load_striped_default(d_in, thread_data, block_item_start, block_item_end, default_value, tid);
+        }
+        else if constexpr(DefaultLoadAlgorithm == BlockLoadAlgorithm::BLOCK_LOAD_TRANSPOSE)
+        {
+            compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> striped_items;
+            load_striped_default(d_in, striped_items, block_item_start, block_item_end, default_value, tid);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).StripedToBlocked(striped_items, thread_data);
+        }
+        else
+        {
+            static_assert(BlockSize % details::WARP_SIZE == 0u);
+            compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> warp_striped_items;
+            load_warp_striped_default(d_in, warp_striped_items, block_item_start, block_item_end, default_value, tid);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).WarpStripedToBlocked(warp_striped_items, thread_data);
+        }
     }
 
 
   private:
-    void LoadDirectedBlocked(compute::UInt                                   linear_tid,
-                             const compute::BufferVar<Type4Byte>&            d_in,
-                             compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& thread_data,
-                             compute::UInt                                   block_item_start,
-                             compute::UInt                                   block_item_end,
-                             Var<Type4Byte>                                  default_value)
+    static void load_blocked_guarded(const compute::BufferVar<Type4Byte>&            input,
+                                     compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                     compute::UInt                                   tile_start,
+                                     compute::UInt                                   valid_items,
+                                     compute::UInt                                   tid)
     {
-        for(auto i = 0u; i < ITEMS_PER_THREAD; ++i)
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
         {
-            UInt index = linear_tid + i;
-            $if(index < block_item_end)
+            compute::UInt index = tid * compute::UInt(ITEMS_PER_THREAD) + compute::UInt(item);
+            $if(index < valid_items)
             {
-                thread_data[i] = d_in.read(block_item_start + index);
-            }
-            $else
-            {
-                thread_data[i] = default_value;
+                items[item] = input.read(tile_start + index);
             };
-        };
+        }
     }
 
-    SmemTypePtr<Type4Byte> m_shared_mem;
+    static void load_striped_guarded(const compute::BufferVar<Type4Byte>&            input,
+                                     compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                     compute::UInt                                   tile_start,
+                                     compute::UInt                                   valid_items,
+                                     compute::UInt                                   tid)
+    {
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+        {
+            compute::UInt index = tid + compute::UInt(item * BlockSize);
+            $if(index < valid_items)
+            {
+                items[item] = input.read(tile_start + index);
+            };
+        }
+    }
+
+    static void load_warp_striped_guarded(const compute::BufferVar<Type4Byte>&            input,
+                                          compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                          compute::UInt tile_start,
+                                          compute::UInt valid_items,
+                                          compute::UInt tid)
+    {
+        compute::UInt lane        = tid % compute::UInt(details::WARP_SIZE);
+        compute::UInt warp_offset = tid / compute::UInt(details::WARP_SIZE)
+                                    * compute::UInt(details::WARP_SIZE * ITEMS_PER_THREAD);
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+        {
+            compute::UInt index = warp_offset + lane + compute::UInt(item * details::WARP_SIZE);
+            $if(index < valid_items)
+            {
+                items[item] = input.read(tile_start + index);
+            };
+        }
+    }
+
+    static void load_blocked_default(const compute::BufferVar<Type4Byte>&            input,
+                                     compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                     compute::UInt                                   tile_start,
+                                     compute::UInt                                   valid_items,
+                                     const compute::Var<Type4Byte>&                  default_value,
+                                     compute::UInt                                   tid)
+    {
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+        {
+            items[item] = default_value;
+        }
+        load_blocked_guarded(input, items, tile_start, valid_items, tid);
+    }
+
+    static void load_striped_default(const compute::BufferVar<Type4Byte>&            input,
+                                     compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                     compute::UInt                                   tile_start,
+                                     compute::UInt                                   valid_items,
+                                     const compute::Var<Type4Byte>&                  default_value,
+                                     compute::UInt                                   tid)
+    {
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+        {
+            items[item] = default_value;
+        }
+        load_striped_guarded(input, items, tile_start, valid_items, tid);
+    }
+
+    static void load_warp_striped_default(const compute::BufferVar<Type4Byte>&            input,
+                                          compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& items,
+                                          compute::UInt                  tile_start,
+                                          compute::UInt                  valid_items,
+                                          const compute::Var<Type4Byte>& default_value,
+                                          compute::UInt                  tid)
+    {
+        for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+        {
+            items[item] = default_value;
+        }
+        load_warp_striped_guarded(input, items, tile_start, valid_items, tid);
+    }
+
+    SmemTypePtr<Type4Byte> m_shared_mem = nullptr;
 };
 }  // namespace luisa::parallel_primitive

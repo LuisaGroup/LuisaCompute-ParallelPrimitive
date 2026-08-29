@@ -46,7 +46,7 @@ namespace details
             , m_in_data(d_in)
             , m_reduce_op(reduce_op)
             , m_transform_op(transform_op)
-            , m_land_id(land_id) {};
+            , m_land_id(land_id){};
 
       public:
         Var<Type4Byte> ConsumeRange(UInt block_offset, UInt block_end)
@@ -135,24 +135,26 @@ namespace details
         {
             ConsumeFullTile<true>(thread_aggregate, even_shared.block_offset);
 
-            $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
+            $if(even_shared.block_end - even_shared.block_offset >= even_shared.block_stride)
             {
-                return;
-            };
-            even_shared.block_offset += even_shared.block_stride;
-            $while(even_shared.block_offset <= even_shared.block_end - UInt(BLOCK_SIZE * ITEMS_PER_THREAD))
-            {
-                ConsumeFullTile<false>(thread_aggregate, even_shared.block_offset);
-                $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
-                {
-                    return;
-                };
                 even_shared.block_offset += even_shared.block_stride;
-            };
-            $if(even_shared.block_offset < even_shared.block_end)
-            {
-                UInt valid_items = even_shared.block_end - even_shared.block_offset;
-                ConsumePartialTile<false>(thread_aggregate, even_shared.block_offset, valid_items);
+                $while(even_shared.block_offset <= even_shared.block_end - UInt(TILE_SIZE))
+                {
+                    ConsumeFullTile<false>(thread_aggregate, even_shared.block_offset);
+                    $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
+                    {
+                        even_shared.block_offset = even_shared.block_end;
+                    }
+                    $else
+                    {
+                        even_shared.block_offset += even_shared.block_stride;
+                    };
+                };
+                $if(even_shared.block_offset < even_shared.block_end)
+                {
+                    UInt valid_items = even_shared.block_end - even_shared.block_offset;
+                    ConsumePartialTile<false>(thread_aggregate, even_shared.block_offset, valid_items);
+                };
             };
         }
 
@@ -176,7 +178,7 @@ namespace details
                     BufferVar<Type4Byte>&   in,
                     ReduceOp                reduce_op,
                     TransformOp             transform_op = IdentityOp())
-            : Base(smem_data, in, reduce_op, transform_op, thread_id().x) {};
+            : Base(smem_data, in, reduce_op, transform_op, thread_id().x){};
     };
 
     template <typename Type4Byte, typename ReduceOp, typename TransformOp, size_t ITEMS_PER_THREAD, size_t WARP_SIZE = details::WARP_SIZE, WarpReduceAlgorithm WARP_ALGORITHM = WarpReduceAlgorithm::WARP_SHUFFLE>
@@ -190,7 +192,7 @@ namespace details
                         BufferVar<Type4Byte>&   in,
                         ReduceOp                reduce_op,
                         TransformOp             transform_op = IdentityOp())
-            : Base(smem_data, in, reduce_op, transform_op, thread_id().x % UInt(WARP_SIZE)) {};
+            : Base(smem_data, in, reduce_op, transform_op, thread_id().x % UInt(WARP_SIZE)){};
     };
 }  // namespace details
 

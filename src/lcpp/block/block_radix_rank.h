@@ -16,6 +16,8 @@
 #include <lcpp/thread/thread_scan.h>
 #include <lcpp/block/block_scan.h>
 
+#include <limits>
+
 namespace luisa::parallel_primitive
 {
 enum class RadixRankAlgorithm
@@ -61,6 +63,145 @@ namespace details
         { return MatchAny<Bits>(label); };
     };
 }  // namespace details
+
+template <uint BLOCK_DIM_X, uint RadixBits, bool IsDescending = false, bool MEMOIZE_OUTER_SCAN = true, uint BLOCK_DIM_Y = 1u, uint BLOCK_DIM_Z = 1u>
+class BlockRadixRank : public LuisaModule
+{
+    static constexpr uint BLOCK_THREADS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
+
+  public:
+    static constexpr uint RADIX_DIGITS = 1u << RadixBits;
+    static constexpr uint BINS_TRACKED_PER_THREAD = (RADIX_DIGITS + BLOCK_THREADS - 1u) / BLOCK_THREADS;
+
+    struct tempStorage
+    {
+        SmemTypePtr<uint> thread_digit_counts;
+        SmemTypePtr<uint> digit_prefixes;
+    };
+    using TempStorage = tempStorage;
+
+    BlockRadixRank()
+        : m_thread_digit_counts(new SmemType<uint>{BLOCK_THREADS * RADIX_DIGITS})
+        , m_digit_prefixes(new SmemType<uint>{RADIX_DIGITS})
+    {
+    }
+
+    explicit BlockRadixRank(tempStorage storage)
+        : m_thread_digit_counts(storage.thread_digit_counts)
+        , m_digit_prefixes(storage.digit_prefixes)
+    {
+    }
+
+    template <NumericT UnsignedBits, size_t KEYS_PER_THREAD, typename DigitExtractorT>
+    void RankKeys(const ArrayVar<UnsignedBits, KEYS_PER_THREAD>& keys,
+                  ArrayVar<uint, KEYS_PER_THREAD>&               ranks,
+                  DigitExtractorT                                digit_extractor) const
+    {
+        rank_keys<UnsignedBits, KEYS_PER_THREAD, DigitExtractorT>(keys, ranks, digit_extractor);
+    }
+
+    template <NumericT UnsignedBits, size_t KEYS_PER_THREAD, typename DigitExtractorT, typename PrefixArray>
+    void RankKeys(const ArrayVar<UnsignedBits, KEYS_PER_THREAD>& keys,
+                  ArrayVar<uint, KEYS_PER_THREAD>&               ranks,
+                  DigitExtractorT                                digit_extractor,
+                  PrefixArray&                                   exclusive_digit_prefix) const
+    {
+        rank_keys<UnsignedBits, KEYS_PER_THREAD, DigitExtractorT>(keys, ranks, digit_extractor);
+
+        UInt tid = linear_thread_id();
+        for(uint tracked_bin = 0u; tracked_bin < BINS_TRACKED_PER_THREAD; ++tracked_bin)
+        {
+            UInt bin    = tid * UInt(BINS_TRACKED_PER_THREAD) + tracked_bin;
+            UInt prefix = 0u;
+            $if(bin < UInt(RADIX_DIGITS))
+            {
+                prefix = m_digit_prefixes->read(bin);
+            };
+            exclusive_digit_prefix[tracked_bin] = prefix;
+        }
+    }
+
+  private:
+    static UInt linear_thread_id()
+    {
+        UInt3 tid = thread_id();
+        return tid.x + UInt(BLOCK_DIM_X) * (tid.y + UInt(BLOCK_DIM_Y) * tid.z);
+    }
+
+    static UInt ordered_digit(UInt digit)
+    {
+        if constexpr(IsDescending)
+        {
+            return UInt(RADIX_DIGITS - 1u) - digit;
+        }
+        else
+        {
+            return digit;
+        }
+    }
+
+    template <NumericT UnsignedBits, size_t KEYS_PER_THREAD, typename DigitExtractorT>
+    void rank_keys(const ArrayVar<UnsignedBits, KEYS_PER_THREAD>& keys,
+                   ArrayVar<uint, KEYS_PER_THREAD>&               ranks,
+                   DigitExtractorT                                digit_extractor) const
+    {
+        static_assert(BLOCK_THREADS > 0u);
+        static_assert(RadixBits > 0u && RadixBits < 31u);
+        static_assert(BLOCK_THREADS * KEYS_PER_THREAD <= std::numeric_limits<uint>::max());
+        static_cast<void>(MEMOIZE_OUTER_SCAN);
+
+        UInt tid       = linear_thread_id();
+        UInt row_begin = tid * UInt(RADIX_DIGITS);
+        $for(bin, UInt(RADIX_DIGITS))
+        {
+            m_thread_digit_counts->write(row_begin + bin, 0u);
+        };
+        sync_block();
+
+        ArrayVar<uint, KEYS_PER_THREAD> digits;
+        for(uint item = 0u; item < KEYS_PER_THREAD; ++item)
+        {
+            digits[item]     = ordered_digit(digit_extractor.Digit(keys[item]));
+            UInt count_index = row_begin + digits[item];
+            m_thread_digit_counts->write(count_index, m_thread_digit_counts->read(count_index) + 1u);
+        }
+        sync_block();
+
+        $if(tid == 0u)
+        {
+            UInt running = 0u;
+            $for(bin, UInt(RADIX_DIGITS))
+            {
+                m_digit_prefixes->write(bin, running);
+                $for(source_thread, UInt(BLOCK_THREADS))
+                {
+                    running += m_thread_digit_counts->read(source_thread * UInt(RADIX_DIGITS) + bin);
+                };
+            };
+        };
+        sync_block();
+
+        for(uint item = 0u; item < KEYS_PER_THREAD; ++item)
+        {
+            UInt digit = digits[item];
+            UInt rank  = m_digit_prefixes->read(digit);
+            $for(source_thread, UInt(0u), tid)
+            {
+                rank += m_thread_digit_counts->read(source_thread * UInt(RADIX_DIGITS) + digit);
+            };
+            for(uint previous_item = 0u; previous_item < item; ++previous_item)
+            {
+                rank += cast<uint>(digits[previous_item] == digit);
+            }
+            ranks[item] = rank;
+        }
+        sync_block();
+    }
+
+  private:
+    SmemTypePtr<uint> m_thread_digit_counts;
+    SmemTypePtr<uint> m_digit_prefixes;
+};
 
 
 template <uint BLOCK_THREADS, uint RadixBits, bool IsDescending, WarpMatchAlgorithm MATCH_ALGORITHM = WARP_MATCH_ANY, uint NUM_PARTS = 1, uint ITEMS_PER_THREAD = details::ITEMS_PER_THREAD, uint WARP_SIZE = details::WARP_SIZE>

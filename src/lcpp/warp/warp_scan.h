@@ -9,7 +9,9 @@
 #include <luisa/dsl/var.h>
 #include <luisa/dsl/builtin.h>
 #include <lcpp/common/type_trait.h>
+#include <lcpp/common/utils.h>
 #include <lcpp/runtime/core.h>
+#include <lcpp/warp/details/warp_scan_smem.h>
 #include <lcpp/warp/details/warp_scan_shlf.h>
 
 namespace luisa::parallel_primitive
@@ -25,9 +27,9 @@ class WarpScan : public LuisaModule
   public:
     WarpScan()
     {
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            m_shared_mem = new SmemType<Type4Byte>{WARP_SIZE};
+            m_shared_mem = new SmemType<Type4Byte>{1024u};
         };
     }
     WarpScan(SmemTypePtr<Type4Byte> shared_mem)
@@ -40,8 +42,33 @@ class WarpScan : public LuisaModule
     template <typename ScanOp>
     void ExclusiveScan(const Var<Type4Byte>& thread_data, Var<Type4Byte>& exclusive_output, ScanOp scan_op)
     {
-        Var<Type4Byte> warp_aggregate;
-        ExclusiveScan(thread_data, exclusive_output, warp_aggregate, scan_op);
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        {
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.ExclusiveScan(
+                thread_data, exclusive_output, scan_op);
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.ExclusiveScan(thread_data, exclusive_output, scan_op);
+        }
+    }
+
+    template <typename ScanOp>
+    void ExclusiveScan(const Var<Type4Byte>& thread_data,
+                       Var<Type4Byte>&       exclusive_output,
+                       Var<Type4Byte>&       warp_aggregate,
+                       ScanOp                scan_op)
+    {
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        {
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.ExclusiveScan(
+                thread_data, exclusive_output, warp_aggregate, scan_op);
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.ExclusiveScan(
+                thread_data, exclusive_output, warp_aggregate, scan_op);
+        }
     }
 
     template <typename ScanOp>
@@ -50,15 +77,16 @@ class WarpScan : public LuisaModule
                        ScanOp                scan_op,
                        const Var<Type4Byte>& initial_value)
     {
-        compute::set_warp_size(WARP_SIZE);
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().ExclusiveScan(
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.ExclusiveScan(
                 thread_data, exclusive_output, scan_op, initial_value);
         }
-        else if(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        else
         {
-        };
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.ExclusiveScan(
+                thread_data, exclusive_output, scan_op, initial_value);
+        }
     }
 
     template <typename ScanOp>
@@ -68,22 +96,47 @@ class WarpScan : public LuisaModule
                        ScanOp                scan_op,
                        const Var<Type4Byte>& initial_value)
     {
-        compute::set_warp_size(WARP_SIZE);
-
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().ExclusiveScan(
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.ExclusiveScan(
                 thread_data, exclusive_output, warp_aggregate, scan_op, initial_value);
         }
-        else if(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        else
         {
-        };
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.ExclusiveScan(
+                thread_data, exclusive_output, warp_aggregate, scan_op, initial_value);
+        }
     }
 
     template <typename ScanOp>
     void InclusiveScan(const Var<Type4Byte>& thread_in, Var<Type4Byte>& inclusive_output, ScanOp scan_op)
     {
-        InclusiveScan(thread_in, inclusive_output, scan_op);
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        {
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.InclusiveScan(thread_in, inclusive_output, scan_op);
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.InclusiveScan(thread_in, inclusive_output, scan_op);
+        }
+    }
+
+    template <typename ScanOp>
+    void InclusiveScan(const Var<Type4Byte>& thread_data,
+                       Var<Type4Byte>&       inclusive_output,
+                       Var<Type4Byte>&       warp_aggregate,
+                       ScanOp                scan_op)
+    {
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        {
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.InclusiveScan(
+                thread_data, inclusive_output, warp_aggregate, scan_op);
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.InclusiveScan(
+                thread_data, inclusive_output, warp_aggregate, scan_op);
+        }
     }
 
     template <typename ScanOp>
@@ -92,15 +145,16 @@ class WarpScan : public LuisaModule
                        ScanOp                scan_op,
                        const Var<Type4Byte>& initial_value)
     {
-        compute::set_warp_size(WARP_SIZE);
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().InclusiveScan(
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.InclusiveScan(
                 thread_data, inclusive_output, scan_op, initial_value);
         }
-        else if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        else
         {
-        };
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.InclusiveScan(
+                thread_data, inclusive_output, scan_op, initial_value);
+        }
     }
 
     template <typename ScanOp>
@@ -110,12 +164,16 @@ class WarpScan : public LuisaModule
                        ScanOp                scan_op,
                        const Var<Type4Byte>& initial_value)
     {
-        compute::set_warp_size(WARP_SIZE);
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().InclusiveScan(
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.InclusiveScan(
                 thread_data, inclusive_output, warp_aggregate, scan_op, initial_value);
-        };
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.InclusiveScan(
+                thread_data, inclusive_output, warp_aggregate, scan_op, initial_value);
+        }
     }
 
     // sum
@@ -157,14 +215,32 @@ class WarpScan : public LuisaModule
             Type4Byte(0));
     }
 
+    [[nodiscard]] Var<Type4Byte> Broadcast(const Var<Type4Byte>& input, compute::UInt source_lane)
+    {
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
+        {
+            return details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.Broadcast(input, source_lane);
+        }
+        else
+        {
+            compute::UInt lane_id   = compute::warp_lane_id();
+            compute::UInt warp_base = lane_id / compute::UInt(WARP_SIZE) * compute::UInt(WARP_SIZE);
+            return WarpReadLane(input, warp_base + source_lane);
+        }
+    }
+
     template <typename ScanOp>
     void Scan(const Var<Type4Byte>& thread_data, Var<Type4Byte>& inclusive_output, Var<Type4Byte>& exclusive_output, ScanOp scan_op)
     {
-        compute::set_warp_size(WARP_SIZE);
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().Scan(thread_data, inclusive_output, exclusive_output, scan_op);
-        };
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.Scan(
+                thread_data, inclusive_output, exclusive_output, scan_op);
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.Scan(thread_data, inclusive_output, exclusive_output, scan_op);
+        }
     }
 
     template <typename ScanOp>
@@ -174,12 +250,16 @@ class WarpScan : public LuisaModule
               ScanOp                scan_op,
               const Var<Type4Byte>& initial_value)
     {
-        compute::set_warp_size(WARP_SIZE);
-        if(WarpScanMethod == WarpScanAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpScanMethod == WarpScanAlgorithm::WARP_SHARED_MEMORY)
         {
-            details::WarpScanShfl<Type4Byte, WARP_SIZE>().Scan(
+            details::WarpScanSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.Scan(
                 thread_data, inclusive_output, exclusive_output, scan_op, initial_value);
-        };
+        }
+        else
+        {
+            details::WarpScanShfl<Type4Byte, WARP_SIZE>{}.Scan(
+                thread_data, inclusive_output, exclusive_output, scan_op, initial_value);
+        }
     }
 
   private:

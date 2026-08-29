@@ -50,13 +50,11 @@ namespace details
                             BufferVar<Type4Byte> tile_partial,
                             BufferVar<Type4Byte> tile_inclusive,
                             UInt                 num_tiles) noexcept
-                         {
-                             InitializeWardStatus(num_tiles, tile_status);
-                         });
+                         { InitializeWardStatus(num_tiles, tile_status); });
             return scan_tile_state_init_shader;
         }
 
-        template <bool is_inclusive, typename ScanOp>
+        template <bool is_inclusive, bool use_initial_value, typename ScanOp>
         U<ScanKernel> compile(Device& device, size_t shared_mem_size, ScanOp scan_op)
         {
             U<ScanKernel> scan_shader = nullptr;
@@ -102,13 +100,20 @@ namespace details
                         BlockScan<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD> block_scan;
                         if constexpr(is_inclusive)
                         {
-                            block_scan.InclusiveScan(items, output_items, block_aggregate, scan_op, init_value);
-                            block_aggregate = scan_op(block_aggregate, init_value);
+                            if constexpr(use_initial_value)
+                            {
+                                block_scan.InclusiveScan(items, output_items, block_aggregate, scan_op, init_value);
+                                block_aggregate = scan_op(init_value, block_aggregate);
+                            }
+                            else
+                            {
+                                block_scan.InclusiveScan(items, output_items, block_aggregate, scan_op);
+                            }
                         }
                         else
                         {
                             block_scan.ExclusiveScan(items, output_items, block_aggregate, scan_op, init_value);
-                            block_aggregate = scan_op(block_aggregate, init_value);
+                            block_aggregate = scan_op(init_value, block_aggregate);
                         }
                         $if(!is_last_tile & thread_id().x == 0)
                         {

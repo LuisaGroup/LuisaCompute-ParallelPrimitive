@@ -1,10 +1,6 @@
-/*
- * @Author: Ligo 
- * @Date: 2025-11-06 14:30:13 
- * @Last Modified by: Ligo
- * @Last Modified time: 2025-11-07 00:23:56
- */
-
+// Tests for DeviceScan.
+// Covers ordinary scans, scan-by-key, non-commutative operand ordering, and
+// temporary-storage alignment for wide element types.
 
 #include <luisa/core/basic_traits.h>
 #include <luisa/core/logging.h>
@@ -12,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <lcpp/parallel_primitive.h>
+#include <array>
 #include <numeric>
 #include <random>
 
@@ -23,8 +20,6 @@ using boost::ut::expect;
 using boost::ut::operator""_test;
 int main(int argc, char* argv[])
 {
-    log_level_verbose();
-
     luisa::string_view ctx_dir;
     luisa::string_view backend_name;
 #ifdef _WIN32
@@ -73,26 +68,32 @@ int main(int argc, char* argv[])
             luisa::vector<uint> input_data(array_size, 1);
             auto                in_buffer            = device.create_buffer<uint>(array_size);
             auto                exclusive_out_buffer = device.create_buffer<uint>(array_size);
-            stream << in_buffer.copy_from(input_data.data()) << synchronize();
+            stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
             // CUB-style: get temp storage size
-            size_t temp_bytes = ScannerT::GetTempStorageBytes<uint>(array_size);
-            auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+            size_t temp_bytes  = ScannerT::GetTempStorageBytes<uint>(array_size);
+            auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
-            scanner.ExclusiveSum(
-                cmdlist, temp_buffer.view(), in_buffer.view(), exclusive_out_buffer.view(), in_buffer.size());
+            scanner.ExclusiveSum(cmdlist,
+                                 temp_buffer.view(),
+                                 in_buffer.view(),
+                                 exclusive_out_buffer.view(),
+                                 in_buffer.size());
             stream << cmdlist.commit() << synchronize();
             luisa::vector<uint> exclusive_result(array_size);
-            stream << exclusive_out_buffer.copy_to(exclusive_result.data()) << synchronize();
+            stream << exclusive_out_buffer.copy_to(luisa::span{exclusive_result}) << synchronize();
 
             auto inclusive_out_buffer = device.create_buffer<uint>(array_size);
 
             // Reuse same temp_buffer for inclusive scan (same size requirement)
-            scanner.InclusiveSum(
-                cmdlist, temp_buffer.view(), in_buffer.view(), inclusive_out_buffer.view(), in_buffer.size());
+            scanner.InclusiveSum(cmdlist,
+                                 temp_buffer.view(),
+                                 in_buffer.view(),
+                                 inclusive_out_buffer.view(),
+                                 in_buffer.size());
             stream << cmdlist.commit() << synchronize();
             luisa::vector<uint> inclusive_result(array_size);
-            stream << inclusive_out_buffer.copy_to(inclusive_result.data()) << synchronize();
+            stream << inclusive_out_buffer.copy_to(luisa::span{inclusive_result}) << synchronize();
 
             luisa::vector<uint> exclusive_expected(array_size);
             luisa::vector<uint> inclusive_expected(array_size);
@@ -105,6 +106,55 @@ int main(int argc, char* argv[])
                 std::equal(inclusive_result.begin(), inclusive_result.end(), inclusive_expected.begin());
             expect(exclusive_expected_match && inclusive_expected_match)
                 << "Scan failed for array size " << i << "\n";
+        }
+    };
+
+    "exclusive_scan_preserves_left_to_right_operand_order_across_tiles"_test = [&]
+    {
+        constexpr size_t   array_size = BLOCK_SIZE * ITEMS_PER_THREAD + 1u;
+        luisa::vector<int> input_data(array_size, 7);
+        luisa::vector<int> result(array_size);
+        auto               input  = device.create_buffer<int>(array_size);
+        auto               output = device.create_buffer<int>(array_size);
+        auto               temp =
+            device.create_buffer<uint>(bytes_to_uint_count(ScannerT::GetTempStorageBytes<int>(array_size)));
+
+        CommandList commands;
+        scanner.ExclusiveScan(
+            commands,
+            temp.view(),
+            input.view(),
+            output.view(),
+            array_size,
+            [](const Int& lhs, const Int&) noexcept { return lhs; },
+            42);
+        stream << input.copy_from(luisa::span{input_data}) << commands.commit()
+               << output.copy_to(luisa::span{result}) << synchronize();
+
+        for(auto value : result)
+        {
+            expect(value == 42);
+        }
+    };
+
+    "device_scan_aligns_temporary_storage_for_double_values"_test = [&]
+    {
+        constexpr size_t      array_size = 17u;
+        luisa::vector<double> input_data(array_size, 1.0);
+        luisa::vector<double> result(array_size);
+        auto                  input  = device.create_buffer<double>(array_size);
+        auto                  output = device.create_buffer<double>(array_size);
+        auto                  temp   = device.create_buffer<uint>(
+            bytes_to_uint_count(ScannerT::GetTempStorageBytes<double>(array_size)));
+
+        CommandList commands;
+        scanner.InclusiveSum(commands, temp.view(), input.view(), output.view(), array_size);
+        stream << input.copy_from(luisa::span{input_data}) << commands.commit()
+               << output.copy_to(luisa::span{result}) << synchronize();
+
+        for(size_t index = 0u; index < array_size; ++index)
+        {
+            expect(result[index] == static_cast<double>(index + 1u));
         }
     };
 
@@ -129,14 +179,14 @@ int main(int argc, char* argv[])
 
             LUISA_INFO("Array size: {}, Items per segment: {}, Total segments: {}", array_size, items_per_segment, segments);
 
-            stream << key_buffer.copy_from(input_keys.data()) << synchronize();
-            stream << value_buffer.copy_from(input_data.data()) << synchronize();
+            stream << key_buffer.copy_from(luisa::span{input_keys}) << synchronize();
+            stream << value_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
             auto value_out_buffer = device.create_buffer<int32>(array_size);
 
             // CUB-style: get temp storage size for ScanByKey
-            size_t temp_bytes = ScannerT::GetScanByKeyTempStorageBytes<int32, int32>(array_size);
-            auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+            size_t temp_bytes  = ScannerT::GetScanByKeyTempStorageBytes<int32, int32>(array_size);
+            auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
             scanner.ExclusiveSumByKey(cmdlist,
                                       temp_buffer.view(),
@@ -147,7 +197,7 @@ int main(int argc, char* argv[])
             stream << cmdlist.commit() << synchronize();
 
             luisa::vector<int32> result(array_size);
-            stream << value_out_buffer.copy_to(result.data()) << synchronize();
+            stream << value_out_buffer.copy_to(luisa::span{result}) << synchronize();
             luisa::vector<int32> expected(array_size);
             std::exclusive_scan(input_data.begin(), input_data.end(), expected.begin(), 0);
 
@@ -164,6 +214,73 @@ int main(int argc, char* argv[])
                     expect(expect_segment[j - i * items_per_segment] == result[j]);
                 }
             }
+        }
+    };
+
+    "inclusive_scan_by_key_handles_distinct_types_across_three_tiles"_test = [&]
+    {
+        constexpr size_t            tile_size  = BLOCK_SIZE * ITEMS_PER_THREAD;
+        constexpr size_t            array_size = tile_size * 2u + 2u;
+        luisa::vector<int>          keys(array_size);
+        luisa::vector<luisa::slong> values(array_size, 1);
+        luisa::vector<luisa::slong> expected(array_size);
+        luisa::slong                segment_sum = 0;
+        for(size_t index = 0u; index < array_size; ++index)
+        {
+            keys[index] = index < tile_size + 1u ? 1 : index < tile_size * 2u + 1u ? 2 : 3;
+            if(index == 0u || keys[index] != keys[index - 1u])
+            {
+                segment_sum = 0;
+            }
+            expected[index] = ++segment_sum;
+        }
+
+        auto key_buffer    = device.create_buffer<int>(array_size);
+        auto value_buffer  = device.create_buffer<luisa::slong>(array_size);
+        auto output_buffer = device.create_buffer<luisa::slong>(array_size);
+        auto temp_buffer   = device.create_buffer<uint>(
+            bytes_to_uint_count(ScannerT::GetScanByKeyTempStorageBytes<int, luisa::slong>(array_size)));
+
+        CommandList commands;
+        scanner.InclusiveSumByKey(
+            commands, temp_buffer.view(), key_buffer.view(), value_buffer.view(), output_buffer.view(), array_size);
+        luisa::vector<luisa::slong> result(array_size);
+        stream << key_buffer.copy_from(luisa::span{keys}) << value_buffer.copy_from(luisa::span{values})
+               << commands.commit() << output_buffer.copy_to(luisa::span{result}) << synchronize();
+
+        for(size_t index = 0u; index < array_size; ++index)
+        {
+            expect(result[index] == expected[index]);
+        }
+    };
+
+    "inclusive_scan_by_key_honors_custom_key_equality"_test = [&]
+    {
+        luisa::vector<int> keys{1, 3, 5, 2, 4};
+        luisa::vector<int> values(keys.size(), 1);
+        luisa::vector<int> result(keys.size());
+        auto               key_buffer    = device.create_buffer<int>(keys.size());
+        auto               value_buffer  = device.create_buffer<int>(values.size());
+        auto               output_buffer = device.create_buffer<int>(values.size());
+        auto               temp_buffer   = device.create_buffer<uint>(
+            bytes_to_uint_count(ScannerT::GetScanByKeyTempStorageBytes<int, int>(keys.size())));
+
+        CommandList commands;
+        scanner.InclusiveSumByKey(commands,
+                                  temp_buffer.view(),
+                                  key_buffer.view(),
+                                  value_buffer.view(),
+                                  output_buffer.view(),
+                                  keys.size(),
+                                  [](const Int& lhs, const Int& rhs) noexcept
+                                  { return (lhs & 1) == (rhs & 1); });
+        stream << key_buffer.copy_from(luisa::span{keys}) << value_buffer.copy_from(luisa::span{values})
+               << commands.commit() << output_buffer.copy_to(luisa::span{result}) << synchronize();
+
+        std::array<int, 5u> expected{1, 2, 3, 1, 2};
+        for(size_t index = 0u; index < expected.size(); ++index)
+        {
+            expect(result[index] == expected[index]);
         }
     };
 }

@@ -40,8 +40,8 @@ namespace details
             Var<Type4Byte> warp_prefix =
                 ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
-            UInt lane_id = warp_lane_id();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
+            UInt lane_id = warp_lane_id() % compute::UInt(WARP_SIZE);
             $if(warp_id != 0)
             {
                 exclusive_output = scan_op(warp_prefix, exclusive_output);
@@ -68,12 +68,12 @@ namespace details
             Var<Type4Byte> warp_prefix =
                 ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate, initial_value);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
-            UInt lane_id = warp_lane_id();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
+            UInt lane_id = warp_lane_id() % compute::UInt(WARP_SIZE);
 
             $if(warp_id != 0)
             {
-                exclusive_output = scan_op(exclusive_output, warp_prefix);
+                exclusive_output = scan_op(warp_prefix, exclusive_output);
                 $if(lane_id == 0)
                 {
                     exclusive_output = warp_prefix;
@@ -93,8 +93,8 @@ namespace details
             Var<Type4Byte> block_aggregate;
             ExclusiveScan(m_shared_mem, thread_data, exclusive_output, block_aggregate, scan_op);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
-            UInt lane_id = warp_lane_id();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
+            UInt lane_id = warp_lane_id() % compute::UInt(WARP_SIZE);
             $if(warp_id == 0)
             {
                 Var<Type4Byte> block_prefix = block_prefix_callback_op(block_aggregate);
@@ -127,7 +127,7 @@ namespace details
             Var<Type4Byte> warp_prefix =
                 ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
             $if(warp_id != 0)
             {
                 inclusive_output = scan_op(warp_prefix, inclusive_output);
@@ -147,7 +147,7 @@ namespace details
             Var<Type4Byte> warp_prefix =
                 ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate, initial_value);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
             $if(warp_id != 0)
             {
                 inclusive_output = scan_op(warp_prefix, inclusive_output);
@@ -165,11 +165,11 @@ namespace details
             Var<Type4Byte>         block_aggregate;
             InclusiveScan(m_shared_mem, thread_data, inclusive_output, block_aggregate, scan_op);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
             $if(warp_id == 0)
             {
                 Var<Type4Byte> block_prefix = prefix_op(block_aggregate);
-                UInt           lane_id      = warp_lane_id();
+                UInt           lane_id      = warp_lane_id() % compute::UInt(WARP_SIZE);
                 $if(lane_id == 0)
                 {
                     (*shared_mem_block_prefix)[0] = block_prefix;
@@ -189,11 +189,11 @@ namespace details
                                          const Var<Type4Byte>&   warp_aggregate,
                                          Var<Type4Byte>&         block_aggregate)
         {
-            UInt warp_id = thread_id().x / warp_lane_count();
-            UInt lane_id = warp_lane_id();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
+            UInt lane_id = warp_lane_id() % compute::UInt(WARP_SIZE);
 
             // write warp result to shared memory
-            $if(lane_id == warp_lane_count() - 1)
+            $if(lane_id == compute::UInt(WARP_SIZE - 1u))
             {
                 (*m_shared_mem)[warp_id] = warp_aggregate;
             };
@@ -203,7 +203,7 @@ namespace details
             Var<Type4Byte> warp_prefix;
             block_aggregate = (*m_shared_mem)[0];
 
-            for(auto item = 1u; item < BLOCK_SIZE / WARP_SIZE; ++item)
+            $for(item, compute::UInt(1u), compute::UInt(BLOCK_SIZE / WARP_SIZE))
             {
                 $if(warp_id == item)
                 {
@@ -227,7 +227,7 @@ namespace details
 
             warp_prefix = scan_op(initial_value, warp_prefix);
 
-            UInt warp_id = thread_id().x / warp_lane_count();
+            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
             $if(warp_id == 0)
             {
                 warp_prefix = initial_value;

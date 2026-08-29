@@ -12,6 +12,7 @@
 #include <lcpp/common/type_trait.h>
 #include <lcpp/runtime/core.h>
 #include <luisa/dsl/builtin.h>
+#include <lcpp/warp/details/warp_reduce_smem.h>
 #include <lcpp/warp/details/warp_reduce_shlf.h>
 
 namespace luisa::parallel_primitive
@@ -28,9 +29,9 @@ class WarpReduce : public LuisaModule
   public:
     WarpReduce()
     {
-        if(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
-            m_shared_mem = new SmemType<Type4Byte>{WARP_SIZE};
+            m_shared_mem = new SmemType<Type4Byte>{1024u};
         };
     }
     WarpReduce(SmemTypePtr<Type4Byte> shared_mem)
@@ -45,13 +46,14 @@ class WarpReduce : public LuisaModule
     template <typename ReduceOp>
     Var<Type4Byte> Reduce(const Var<Type4Byte>& d_in, ReduceOp op, compute::UInt valid_item = WARP_SIZE)
     {
-        compute::set_warp_size(WARP_SIZE);
-        Var<Type4Byte> result;
-        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
-            result = details::WarpReduceShfl<Type4Byte, WARP_SIZE>().Reduce(d_in, op, valid_item);
-        };
-        return result;
+            return details::WarpReduceSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.Reduce(d_in, op, valid_item);
+        }
+        else
+        {
+            return details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.Reduce(d_in, op, valid_item);
+        }
     }
 
     Var<Type4Byte> Sum(const Var<Type4Byte>& lane_value, compute::UInt valid_item = WARP_SIZE)
@@ -87,27 +89,26 @@ class WarpReduce : public LuisaModule
                                        ReduceOp              redecu_op,
                                        compute::UInt         valid_item = WARP_SIZE)
     {
-        Var<Type4Byte> result;
-        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
-            result = details::WarpReduceShfl<Type4Byte, WARP_SIZE>().SegmentReduce<true>(d_in, flag, redecu_op, valid_item);
-        };
-        return result;
+            return details::WarpReduceSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.template SegmentReduce<true>(
+                d_in, flag, redecu_op, valid_item);
+        }
+        else
+        {
+            return details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.template SegmentReduce<true>(
+                d_in, flag, redecu_op, valid_item);
+        }
     }
 
     template <typename FlagT>
     Var<Type4Byte> HeadSegmentedSum(const Var<Type4Byte>& d_in, const Var<FlagT>& flag, compute::UInt valid_item = WARP_SIZE)
     {
-        Var<Type4Byte> result;
-        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHUFFLE)
-        {
-            result = details::WarpReduceShfl<Type4Byte, WARP_SIZE>().SegmentReduce<true>(
-                d_in,
-                flag,
-                [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; },
-                valid_item);
-        };
-        return result;
+        return HeadSegmentedReduce(
+            d_in,
+            flag,
+            [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; },
+            valid_item);
     }
 
 
@@ -117,32 +118,30 @@ class WarpReduce : public LuisaModule
                                        ReduceOp              redecu_op,
                                        compute::UInt         valid_item = WARP_SIZE)
     {
-        Var<Type4Byte> result;
-        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHUFFLE)
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
-            result = details::WarpReduceShfl<Type4Byte, WARP_SIZE>().template SegmentReduce<false>(
+            return details::WarpReduceSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.template SegmentReduce<false>(
                 d_in, flag, redecu_op, valid_item);
-        };
-        return result;
+        }
+        else
+        {
+            return details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.template SegmentReduce<false>(
+                d_in, flag, redecu_op, valid_item);
+        }
     }
 
 
     template <typename FlagT>
     Var<Type4Byte> TailSegmentedSum(const Var<Type4Byte>& d_in, const Var<FlagT>& flag, compute::UInt valid_item = WARP_SIZE)
     {
-        Var<Type4Byte> result;
-        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHUFFLE)
-        {
-            result = details::WarpReduceShfl<Type4Byte, WARP_SIZE>().template SegmentReduce<false>(
-                d_in,
-                flag,
-                [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; },
-                valid_item);
-        };
-        return result;
+        return TailSegmentedReduce(
+            d_in,
+            flag,
+            [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; },
+            valid_item);
     }
 
   private:
-    SmemTypePtr<Type4Byte> m_shared_mem;
+    SmemTypePtr<Type4Byte> m_shared_mem = nullptr;
 };
 }  // namespace luisa::parallel_primitive

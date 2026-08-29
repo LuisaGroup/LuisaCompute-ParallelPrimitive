@@ -107,11 +107,14 @@ stream << cmdlist.commit() << synchronize();
 ### ✅ Thread Level
 - [x] **ThreadReduce** - Thread-level reduction operations
 - [x] **ThreadScan** - Thread-level scan (prefix sum) operations
+- [x] **ThreadLoad / ThreadStore** - Cache-modifier-compatible scalar access
 
 ### ✅ Warp Level (32 threads)
 - [x] **WarpReduce** - Warp-level reduction (Sum, Min, Max, custom operators)
 - [x] **WarpScan** - Warp-level inclusive/exclusive scan
 - [x] **WarpExchange** - Data exchange patterns within a warp
+- [x] **WarpLoad / WarpStore** - Blocked, striped, and transpose I/O
+- [x] **WarpMergeSort** - Stable key and key-value merge sort
 
 ### ✅ Block Level (typically 256 threads)
 - [x] **BlockReduce** - Block-level reduction with SHARED_MEMORY and WARP_SHUFFLE algorithms
@@ -120,7 +123,13 @@ stream << cmdlist.commit() << synchronize();
 - [x] **BlockStore** - Efficient block-wide data storing
 - [x] **BlockExchange** - Data rearrangement within a block
 - [x] **BlockRadixRank** - Ranking operations for radix sort
+- [x] **BlockRadixSort** - Ascending/descending key and pair sorting
 - [x] **BlockDiscontinuity** - Flag head/tail discontinuities in sequences
+- [x] **BlockAdjacentDifference** - Left/right differences and flags
+- [x] **BlockHistogram** - Sort and atomic histogram policies
+- [x] **BlockMergeSort** - Stable blocked and striped merge sort
+- [x] **BlockRunLengthDecode** - Block-wide run decoding
+- [x] **BlockShuffle** - Offset, up, and down shuffles
 
 ### ✅ Device Level
 - [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
@@ -129,6 +138,8 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
 - [x] **DeviceHistogram** - Histogram computation
 - [x] **DeviceFor** - Parallel for-loop utilities
+- [x] **DeviceSelect** - Flagged, predicate, unique, and unique-by-key selection
+- [x] **DevicePartition** - Flagged and predicate partitioning
 
 ## TODO List (Compared to CUDA CUB)
 
@@ -137,24 +148,24 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 ### Priority 1: High-Priority Device Operations
 
 #### DeviceSelect
-- [ ] `DeviceSelect::Flagged` - Select items based on selection flags
-- [ ] `DeviceSelect::If` - Select items based on predicate
-- [ ] `DeviceSelect::Unique` - Select unique items from input sequence
-- [ ] `DeviceSelect::UniqueByKey` - Select unique keys from key-value pairs
+- [x] `DeviceSelect::Flagged` - Select items based on selection flags
+- [x] `DeviceSelect::If` - Select items based on predicate
+- [x] `DeviceSelect::Unique` - Select unique items from input sequence
+- [x] `DeviceSelect::UniqueByKey` - Select unique keys from key-value pairs
 
 #### DevicePartition
-- [ ] `DevicePartition::Flagged` - Partition based on selection flags
-- [ ] `DevicePartition::If` - Partition based on predicate
+- [x] `DevicePartition::Flagged` - Partition based on selection flags
+- [x] `DevicePartition::If` - Partition based on predicate
 
 #### DeviceReduce Extensions
-- [ ] `DeviceReduce::ReduceByKey` - Reduce segments defined by keys
-- [ ] `DeviceReduce::ArgMin` - Find minimum value and its index
-- [ ] `DeviceReduce::ArgMax` - Find maximum value and its index
+- [x] `DeviceReduce::ReduceByKey` - Reduce segments defined by keys
+- [x] `DeviceReduce::ArgMin` - Find minimum value and its index
+- [x] `DeviceReduce::ArgMax` - Find maximum value and its index
 
 #### DeviceScan Extensions
-- [ ] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
-- [ ] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
-- [ ] Complete key-based scan implementation (partial implementation exists)
+- [x] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
+- [x] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
+- [x] Custom key equality and distinct key/value types
 
 ### Priority 2: Sorting and Merging
 
@@ -169,8 +180,8 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 - [ ] `DeviceSegmentedSort` - General sorting within segments
 
 #### BlockMergeSort
-- [ ] `BlockMergeSort::Sort` - Block-level stable merge sort
-- [ ] `BlockMergeSort::SortBlockedToStriped` - Sort with layout transformation
+- [x] `BlockMergeSort::Sort` - Block-level stable merge sort
+- [x] `BlockMergeSort::SortBlockedToStriped` - Sort with layout transformation
 
 ### Priority 3: Advanced Operations
 
@@ -193,54 +204,54 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 ### Priority 4: Block-Level Extensions
 
 #### BlockRadixSort
-- [ ] `BlockRadixSort::Sort` - Complete radix sort (not just ranking)
-- [ ] `BlockRadixSort::SortDescending` - Descending radix sort
-- [ ] `BlockRadixSort::SortBlockedToStriped` - Sort with layout change
+- [x] `BlockRadixSort::Sort` - Complete radix sort (not just ranking)
+- [x] `BlockRadixSort::SortDescending` - Descending radix sort
+- [x] `BlockRadixSort::SortBlockedToStriped` - Sort with layout change
 
 #### BlockHistogram
-- [ ] `BlockHistogram::Composite` - Block-level histogram computation
-- [ ] `BlockHistogram::Init` - Initialize histogram bins
+- [x] `BlockHistogram::Composite` - Block-level histogram computation
+- [x] `BlockHistogram::Init` - Initialize histogram bins
 
 #### BlockAdjacentDifference
-- [ ] `BlockAdjacentDifference::SubtractLeft` - Block-level left subtraction
-- [ ] `BlockAdjacentDifference::SubtractRight` - Block-level right subtraction
-- [ ] `BlockAdjacentDifference::FlagHeads` - Flag heads of segments
-- [ ] `BlockAdjacentDifference::FlagTails` - Flag tails of segments
+- [x] `BlockAdjacentDifference::SubtractLeft` - Block-level left subtraction
+- [x] `BlockAdjacentDifference::SubtractRight` - Block-level right subtraction
+- [x] `BlockAdjacentDifference::FlagHeads` - Flag heads of segments
+- [x] `BlockAdjacentDifference::FlagTails` - Flag tails of segments
 
 #### BlockRunLengthDecode
-- [ ] `BlockRunLengthDecode::RunLengthDecode` - Decode run-length encoded data
+- [x] `BlockRunLengthDecode::RunLengthDecode` - Decode run-length encoded data
 
 #### BlockShuffle
-- [ ] `BlockShuffle::Up` - Shuffle data up within block
-- [ ] `BlockShuffle::Down` - Shuffle data down within block
-- [ ] `BlockShuffle::Offset` - Shuffle data by offset
+- [x] `BlockShuffle::Up` - Shuffle data up within block
+- [x] `BlockShuffle::Down` - Shuffle data down within block
+- [x] `BlockShuffle::Offset` - Shuffle data by offset
 
 ### Priority 5: Warp-Level Extensions
 
 #### WarpMergeSort
-- [ ] `WarpMergeSort::Sort` - Warp-level stable merge sort
+- [x] `WarpMergeSort::Sort` - Warp-level stable merge sort
 
 #### WarpLoad/WarpStore
-- [ ] `WarpLoad` - Optimized warp-level data loading
-- [ ] `WarpStore` - Optimized warp-level data storing
+- [x] `WarpLoad` - Optimized warp-level data loading
+- [x] `WarpStore` - Optimized warp-level data storing
 
 #### WarpScan Extensions
-- [ ] `WarpScan::Broadcast` - Broadcast value across warp
+- [x] `WarpScan::Broadcast` - Broadcast value across warp
 
 #### WarpReduce Extensions
-- [ ] `WarpReduce::HeadSegmentedReduce` - Segmented reduce with head flags
-- [ ] `WarpReduce::TailSegmentedReduce` - Segmented reduce with tail flags
+- [x] `WarpReduce::HeadSegmentedReduce` - Segmented reduce with head flags
+- [x] `WarpReduce::TailSegmentedReduce` - Segmented reduce with tail flags
 
 ### Priority 6: Thread-Level Extensions
 
 #### ThreadLoad/ThreadStore
-- [ ] `ThreadLoad` - Thread-level load with cache modifiers (CG, CA, CS, CV)
-- [ ] `ThreadStore` - Thread-level store with cache modifiers (CG, CS, WT, WB)
+- [x] `ThreadLoad` - Thread-level load with cache modifiers (CG, CA, CS, CV)
+- [x] `ThreadStore` - Thread-level store with cache modifiers (CG, CS, WT, WB)
 
 ### Algorithm Improvements
-- [ ] Add SHARED_MEMORY implementations for Warp operations (currently only WARP_SHUFFLE)
-- [ ] Add TRANSPOSE and WARP_TRANSPOSE modes for BlockLoad
-- [ ] Add VECTORIZE mode for BlockLoad/BlockStore
+- [x] Add SHARED_MEMORY implementations for Warp operations
+- [x] Add TRANSPOSE and WARP_TRANSPOSE modes for BlockLoad
+- [x] Add VECTORIZE mode for BlockLoad/BlockStore
 - [ ] Optimize policies for different GPU architectures
 - [ ] Add support for 64-bit indexing for large data
 

@@ -34,20 +34,28 @@ template <typename Type4Byte,
           BlockReduceAlgorithm Algorithm        = BlockReduceAlgorithm::WARP_SHUFFLE>
 class BlockReduce : public LuisaModule
 {
+    static_assert(BLOCK_SIZE > 0u);
+    static_assert(BLOCK_SIZE % details::WARP_SIZE == 0u,
+                  "LuisaCompute block sizes must be a multiple of the physical warp size.");
+    static_assert(WARP_SIZE > 0u);
+    static_assert((WARP_SIZE & (WARP_SIZE - 1u)) == 0u);
+    static_assert(WARP_SIZE <= details::WARP_SIZE);
+    static constexpr bool USE_WARP_SHUFFLE = Algorithm == BlockReduceAlgorithm::WARP_SHUFFLE;
+
   public:
     BlockReduce()
     {
-        if(Algorithm == BlockReduceAlgorithm::SHARED_MEMORY)
+        if constexpr(!USE_WARP_SHUFFLE)
         {
             m_shared_mem = new SmemType<Type4Byte>{BLOCK_SIZE};
         }
-        else if(Algorithm == BlockReduceAlgorithm::WARP_SHUFFLE)
+        else
         {
             m_shared_mem = new SmemType<Type4Byte>{BLOCK_SIZE / WARP_SIZE};
         };
     };
     BlockReduce(SmemTypePtr<Type4Byte>& shared_mem)
-        : m_shared_mem(shared_mem) {};
+        : m_shared_mem(shared_mem){};
     ~BlockReduce() = default;
 
   public:
@@ -55,10 +63,15 @@ class BlockReduce : public LuisaModule
     Var<Type4Byte> Reduce(const Var<Type4Byte>& thread_data, ReduceOp reduce_op)
     {
         Var<Type4Byte> result;
-        if(Algorithm == BlockReduceAlgorithm::WARP_SHUFFLE)
+        if constexpr(USE_WARP_SHUFFLE)
         {
-            result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE>().template Reduce<true>(
+            result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE>().template Reduce<true>(
                 m_shared_mem, thread_data, reduce_op, compute::block_size().x);
+        }
+        else
+        {
+            result = details::BlockReduceMem<Type4Byte, BLOCK_SIZE>().Reduce(
+                m_shared_mem, thread_data, reduce_op, compute::UInt(BLOCK_SIZE));
         }
         return result;
     };
@@ -67,7 +80,7 @@ class BlockReduce : public LuisaModule
     Var<Type4Byte> Reduce(const Var<Type4Byte>& thread_data, ReduceOp reduce_op, compute::UInt num_item)
     {
         Var<Type4Byte> result;
-        if(Algorithm == BlockReduceAlgorithm::WARP_SHUFFLE)
+        if constexpr(USE_WARP_SHUFFLE)
         {
             $if(num_item >= compute::block_size().x)
             {
@@ -80,7 +93,7 @@ class BlockReduce : public LuisaModule
                     m_shared_mem, thread_data, reduce_op, num_item);
             };
         }
-        else if(Algorithm == BlockReduceAlgorithm::SHARED_MEMORY)
+        else
         {
             result = details::BlockReduceMem<Type4Byte, BLOCK_SIZE>().Reduce(
                 m_shared_mem, thread_data, reduce_op, num_item);
@@ -110,6 +123,13 @@ class BlockReduce : public LuisaModule
     }
 
     template <typename ReduceOp = luisa::compute::Callable<Var<Type4Byte>(const Var<Type4Byte>&, const Var<Type4Byte>&)>>
+    Var<Type4Byte> Reduce(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& thread_data, ReduceOp op)
+    {
+        Var<Type4Byte> thread_agg = ThreadReduce<Type4Byte, ITEMS_PER_THREAD>().Reduce(thread_data, op);
+        return Reduce(thread_agg, op);
+    }
+
+    template <typename ReduceOp = luisa::compute::Callable<Var<Type4Byte>(const Var<Type4Byte>&, const Var<Type4Byte>&)>>
     Var<Type4Byte> Reduce(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& thread_data,
                           ReduceOp                                              op,
                           compute::UInt                                         num_item)
@@ -117,6 +137,21 @@ class BlockReduce : public LuisaModule
         Var<Type4Byte> thread_agg = ThreadReduce<Type4Byte, ITEMS_PER_THREAD>().Reduce(thread_data, op);
         return Reduce(thread_agg, op, num_item);
     };
+
+    Var<Type4Byte> Sum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& d_in)
+    {
+        return Reduce(d_in, SumOp());
+    }
+
+    Var<Type4Byte> Max(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& d_in)
+    {
+        return Reduce(d_in, MaxOp());
+    }
+
+    Var<Type4Byte> Min(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& d_in)
+    {
+        return Reduce(d_in, MinOp());
+    }
 
     Var<Type4Byte> Sum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& d_in, compute::UInt num_item)
     {

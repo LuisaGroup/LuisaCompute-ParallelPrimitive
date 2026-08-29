@@ -31,23 +31,22 @@ namespace details
                               ReduceOp                reduce_op,
                               UInt                    valid_item)
         {
-            UInt warp_id     = thread_id().x / warp_lane_count();
-            UInt warp_offset = warp_id * warp_lane_count();
-            uint warp_nums   = ceil(BLOCK_SIZE / WARP_SIZE);
-            UInt lane_id     = warp_lane_id();
-            UInt thid        = thread_id().x;
+            UInt           warp_id     = thread_id().x / compute::UInt(WARP_SIZE);
+            UInt           warp_offset = warp_id * compute::UInt(WARP_SIZE);
+            constexpr uint warp_nums   = (BLOCK_SIZE + WARP_SIZE - 1u) / WARP_SIZE;
+            UInt           lane_id     = warp_lane_id() % compute::UInt(WARP_SIZE);
+            UInt           thid        = thread_id().x;
 
-            UInt warp_valid_num = warp_lane_count();
-            $if(!IS_FULL_TILE & warp_offset + warp_lane_count() > valid_item)
-            {
-                warp_valid_num = valid_item - warp_offset;
-            };
+            UInt tile_valid = IS_FULL_TILE ? compute::UInt(BLOCK_SIZE) :
+                                             compute::min(valid_item, compute::UInt(BLOCK_SIZE));
+            UInt remaining = compute::select(0u, tile_valid - warp_offset, tile_valid > warp_offset);
+            UInt warp_valid_num = compute::min(compute::UInt(WARP_SIZE), remaining);
 
             Var<Type4Byte> warp_aggregate =
                 WarpReduce<Type4Byte, WARP_SIZE>().Reduce(thread_data, reduce_op, warp_valid_num);
 
             // write warp result to shared memory
-            $if(lane_id == 0)
+            $if(lane_id == 0u & warp_valid_num > 0u)
             {
                 (*m_shared_mem)[warp_id] = warp_aggregate;
             };
@@ -56,10 +55,9 @@ namespace details
 
             $if(thid == 0)
             {
-                // $for(warp_idx, 1u, warp_nums)
-                for(int warp_idx = 1u; warp_idx < warp_nums; ++warp_idx)
+                $for(warp_idx, compute::UInt(1u), compute::UInt(warp_nums))
                 {
-                    $if(IS_FULL_TILE | warp_idx * warp_lane_count() < valid_item)
+                    $if(IS_FULL_TILE | warp_idx * compute::UInt(WARP_SIZE) < tile_valid)
                     {
                         Var<Type4Byte> val = (*m_shared_mem)[warp_idx];
                         warp_aggregate     = reduce_op(warp_aggregate, val);
