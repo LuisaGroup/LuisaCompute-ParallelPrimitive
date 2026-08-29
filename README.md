@@ -135,6 +135,9 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
 - [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
 - [x] **DeviceRadixSort** - Radix sort with OneSweep algorithm (SortKeys, SortPairs)
+- [x] **DeviceMergeSort** - Stable key and key-value merge sorting
+- [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
+- [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
 - [x] **DeviceHistogram** - Histogram computation
 - [x] **DeviceFor** - Parallel for-loop utilities
@@ -170,14 +173,14 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 ### Priority 2: Sorting and Merging
 
 #### DeviceMergeSort
-- [ ] `DeviceMergeSort::SortKeys` - Stable merge sort for keys
-- [ ] `DeviceMergeSort::SortPairs` - Stable merge sort for key-value pairs
-- [ ] `DeviceMergeSort::StableSortKeys` - Guaranteed stable sort
-- [ ] `DeviceMergeSort::StableSortPairs` - Guaranteed stable sort for pairs
+- [x] `DeviceMergeSort::SortKeys` - Stable merge sort for keys
+- [x] `DeviceMergeSort::SortPairs` - Stable merge sort for key-value pairs
+- [x] `DeviceMergeSort::StableSortKeys` - Guaranteed stable sort
+- [x] `DeviceMergeSort::StableSortPairs` - Guaranteed stable sort for pairs
 
 #### DeviceSegmentedSort
-- [ ] `DeviceSegmentedRadixSort` - Radix sort within segments
-- [ ] `DeviceSegmentedSort` - General sorting within segments
+- [x] `DeviceSegmentedRadixSort` - Stable radix ordering within non-overlapping segments
+- [x] `DeviceSegmentedSort` - Stable general sorting within non-overlapping segments
 
 #### BlockMergeSort
 - [x] `BlockMergeSort::Sort` - Block-level stable merge sort
