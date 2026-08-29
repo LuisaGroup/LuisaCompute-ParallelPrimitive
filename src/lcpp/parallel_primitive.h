@@ -38,11 +38,14 @@
 #include <lcpp/block/block_radix_rank.h>
 #include <lcpp/block/block_discontinuity.h>
 // device level
+#include <lcpp/device/device_adjacent_difference.h>
+#include <lcpp/device/device_copy.h>
 #include <lcpp/device/device_for.h>
 #include <lcpp/device/device_histogram.h>
 #include <lcpp/device/device_partition.h>
 #include <lcpp/device/device_radix_sort.h>
 #include <lcpp/device/device_reduce.h>
+#include <lcpp/device/device_run_length_encode.h>
 #include <lcpp/device/device_scan.h>
 #include <lcpp/device/device_select.h>
 #include <lcpp/device/device_segment_reduce.h>

@@ -186,20 +186,20 @@ This section tracks missing features compared to the CUDA CUB library. Contribut
 ### Priority 3: Advanced Operations
 
 #### DeviceRunLengthEncode
-- [ ] `DeviceRunLengthEncode::Encode` - Run-length encoding
-- [ ] `DeviceRunLengthEncode::NonTrivialRuns` - Encode runs with length > 1
+- [x] `DeviceRunLengthEncode::Encode` - Run-length encoding
+- [x] `DeviceRunLengthEncode::NonTrivialRuns` - Encode runs with length > 1
 
 #### DeviceAdjacentDifference
-- [ ] `DeviceAdjacentDifference::SubtractLeft` - In-place left subtraction
-- [ ] `DeviceAdjacentDifference::SubtractLeftCopy` - Copy with left subtraction
-- [ ] `DeviceAdjacentDifference::SubtractRight` - In-place right subtraction
-- [ ] `DeviceAdjacentDifference::SubtractRightCopy` - Copy with right subtraction
+- [x] `DeviceAdjacentDifference::SubtractLeft` - In-place left subtraction
+- [x] `DeviceAdjacentDifference::SubtractLeftCopy` - Copy with left subtraction
+- [x] `DeviceAdjacentDifference::SubtractRight` - In-place right subtraction
+- [x] `DeviceAdjacentDifference::SubtractRightCopy` - Copy with right subtraction
 
 #### DeviceSpmv (Sparse Matrix Operations)
 - [ ] `DeviceSpmv::CsrMV` - Sparse matrix-vector multiplication (CSR format)
 
 #### DeviceCopy
-- [ ] `DeviceCopy::Batched` - Batched memory copy operations
+- [x] `DeviceCopy::Batched` - Batched memory copy operations
 
 ### Priority 4: Block-Level Extensions
 
