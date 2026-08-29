@@ -10,15 +10,15 @@ A high-performance GPU parallel primitives library built on [LuisaCompute](https
 LCPP provides a comprehensive set of parallel primitives organized in a hierarchical architecture:
 
 ```
-Device Level  → DeviceReduce, DeviceScan, DeviceRadixSort, DeviceSegmentReduce
+Device Level  → Reduce, Scan, Sort, Select, Partition, RLE, Copy, SpMV
        ↓
 Agent Layer   → Algorithm policy management (e.g., OneSweepSmallKeyTunedPolicy)
        ↓
-Block Level   → BlockReduce, BlockScan, BlockLoad, BlockStore, BlockRadixRank
+Block Level   → Reduce, Scan, Load/Store, Exchange, Sort, Histogram, Shuffle
        ↓
-Warp Level    → WarpReduce, WarpScan, WarpExchange (32 threads)
+Warp Level    → Reduce, Scan, Exchange, Load/Store, MergeSort (32 threads)
        ↓
-Thread Level  → ThreadReduce, ThreadScan
+Thread Level  → Reduce, Scan, Load, Store
 ```
 
 ### Key Features
@@ -83,22 +83,28 @@ ctest
 
 ```cpp
 #include <lcpp/parallel_primitive.h>
+using namespace luisa;
+using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
 
 // Create device and stream
-Context ctx{argv[0]};
-Device device = ctx.create_device("cuda");
+Context context{argv[0]};
+Device device = context.create_device("cuda");
 Stream stream = device.create_stream();
 
 // Device-level reduce example
 DeviceReduce<> device_reduce;
-device_reduce.create(device);
+device_reduce.create(device, &stream);
 
-Buffer<int> input = device.create_buffer<int>(1024);
-Buffer<int> output = device.create_buffer<int>(1);
+constexpr size_t item_count = 4096u;
+Buffer<int> input = device.create_buffer<int>(item_count);
+Buffer<int> output = device.create_buffer<int>(1u);
+size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<int>(item_count);
+Buffer<uint> temp_storage =
+    device.create_buffer<uint>((temp_bytes + sizeof(uint) - 1u) / sizeof(uint));
 
 CommandList cmdlist;
-device_reduce.Sum(cmdlist, stream, input, output, 1024);
+device_reduce.Sum(cmdlist, temp_storage.view(), input.view(), output.view(), item_count);
 stream << cmdlist.commit() << synchronize();
 ```
 
@@ -134,7 +140,7 @@ stream << cmdlist.commit() << synchronize();
 ### ✅ Device Level
 - [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
 - [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
-- [x] **DeviceRadixSort** - Radix sort with OneSweep algorithm (SortKeys, SortPairs)
+- [x] **DeviceRadixSort** - OneSweep key/pair sorting with ascending, descending, and bit-range interfaces
 - [x] **DeviceMergeSort** - Stable key and key-value merge sorting
 - [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
 - [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
@@ -145,9 +151,11 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceSelect** - Flagged, predicate, unique, and unique-by-key selection
 - [x] **DevicePartition** - Flagged and predicate partitioning
 
-## TODO List (Compared to CUDA CUB)
+## CUB Comparison Coverage
 
-This section tracks missing features compared to the CUDA CUB library. Contributions are welcome!
+This repository-scoped matrix is based on the interface families selected from
+CCCL/CUB v3.4.0. It records the portable LuisaCompute surface implemented here;
+it is not a claim of source-level or exhaustive API parity with every CUB release.
 
 ### Priority 1: High-Priority Device Operations
 
