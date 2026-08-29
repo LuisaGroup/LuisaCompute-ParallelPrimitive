@@ -118,7 +118,7 @@ namespace details
             UInt part = warp_lane_id() % UInt(NUM_PARTS);
 
             UInt pass = 0;
-            $for(current_bit, 0u, end_bit, UInt(RADIX_BITS))
+            $for(current_bit, begin_bit, end_bit, UInt(RADIX_BITS))
             {
                 UInt num_bits = compute::min(+UInt(RADIX_BITS), end_bit - current_bit);
 

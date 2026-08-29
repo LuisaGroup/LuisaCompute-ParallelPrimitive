@@ -48,13 +48,14 @@ class DeviceRadixSort : public LuisaModule
 
     uint   m_shared_mem_size = 0;
     Device m_device;
+    bool   m_created = false;
 
   public:
     DeviceRadixSort()  = default;
     ~DeviceRadixSort() = default;
 
 #ifndef NDEBUG
-    Stream* m_debug_stream; // bind debug stream for sync
+    Stream* m_debug_stream;  // bind debug stream for sync
 #endif
     inline Stream* debug_stream() noexcept
     {
@@ -66,13 +67,14 @@ class DeviceRadixSort : public LuisaModule
     }
     void create(Device& device, Stream* debug_stream = nullptr)
     {
-        m_device                   = device;
+        m_device = device;
 #ifndef NDEBUG
         m_debug_stream = debug_stream;
 #endif
         int num_elements_per_block = m_block_size * ITEMS_PER_THREAD;
         int extra_space            = num_elements_per_block / m_warp_nums;
         m_shared_mem_size          = (num_elements_per_block + extra_space);
+        m_created                  = true;
     }
 
     // ============================================================
@@ -83,8 +85,8 @@ class DeviceRadixSort : public LuisaModule
     template <typename KeyType, typename ValueType>
     static size_t GetSortPairsTempStorageBytes(uint num_items)
     {
-        const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
-        const uint RADIX_DIGITS = 1 << RADIX_BITS;
+        const uint RADIX_BITS          = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
+        const uint RADIX_DIGITS        = 1 << RADIX_BITS;
         const uint ONESWEEP_TILE_ITEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
         const auto PORTION_SIZE = ((1u << 28u) - 1u) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
 
@@ -133,23 +135,54 @@ class DeviceRadixSort : public LuisaModule
                    BufferView<KeyType>   d_keys_out,
                    BufferView<ValueType> d_values_in,
                    BufferView<ValueType> d_values_out,
-                   uint                  num_items)
+                   uint                  num_items,
+                   uint                  begin_bit = 0u,
+                   uint                  end_bit   = sizeof(KeyType) * 8u)
     {
+        validate_pair_views(temp_storage, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, begin_bit, end_bit);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            cmdlist << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items))
+                    << d_values_out.subview(0u, num_items).copy_from(d_values_in.subview(0u, num_items));
+            return;
+        }
         DoubleBuffer<KeyType>   d_keys(d_keys_in, d_keys_out);
         DoubleBuffer<ValueType> d_values(d_values_in, d_values_out);
         lcpp_check(onesweep_radix_sort<KeyType, ValueType, false, false>(
-            cmdlist, temp_storage, d_keys, d_values, 0, sizeof(KeyType) * 8, num_items, false),
-            cmdlist, debug_stream());
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, false),
+                   cmdlist,
+                   debug_stream());
     };
 
     template <NumericT KeyType>
-    void SortKeys(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<KeyType> d_keys_in, BufferView<KeyType> d_keys_out, uint num_items)
+    void SortKeys(CommandList&        cmdlist,
+                  BufferView<uint>    temp_storage,
+                  BufferView<KeyType> d_keys_in,
+                  BufferView<KeyType> d_keys_out,
+                  uint                num_items,
+                  uint                begin_bit = 0u,
+                  uint                end_bit   = sizeof(KeyType) * 8u)
     {
+        validate_key_views(temp_storage, d_keys_in, d_keys_out, num_items, begin_bit, end_bit);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            cmdlist << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items));
+            return;
+        }
         DoubleBuffer<KeyType> d_keys(d_keys_in, d_keys_out);
         DoubleBuffer<KeyType> d_values(d_keys_in, d_keys_out);  // dummy
         lcpp_check(onesweep_radix_sort<KeyType, KeyType, true, false>(
-            cmdlist, temp_storage, d_keys, d_values, 0, sizeof(KeyType) * 8, num_items, false),
-            cmdlist, debug_stream());
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, false),
+                   cmdlist,
+                   debug_stream());
     };
 
 
@@ -160,13 +193,27 @@ class DeviceRadixSort : public LuisaModule
                              BufferView<KeyType>   d_keys_out,
                              BufferView<ValueType> d_values_in,
                              BufferView<ValueType> d_values_out,
-                             uint                  num_items)
+                             uint                  num_items,
+                             uint                  begin_bit = 0u,
+                             uint                  end_bit   = sizeof(KeyType) * 8u)
     {
+        validate_pair_views(temp_storage, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, begin_bit, end_bit);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            cmdlist << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items))
+                    << d_values_out.subview(0u, num_items).copy_from(d_values_in.subview(0u, num_items));
+            return;
+        }
         DoubleBuffer<KeyType>   d_keys(d_keys_in, d_keys_out);
         DoubleBuffer<ValueType> d_values(d_values_in, d_values_out);
         lcpp_check(onesweep_radix_sort<KeyType, ValueType, false, true>(
-            cmdlist, temp_storage, d_keys, d_values, 0, sizeof(KeyType) * 8, num_items, false),
-            cmdlist, debug_stream());
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, false),
+                   cmdlist,
+                   debug_stream());
     };
 
     template <NumericT KeyType>
@@ -174,25 +221,80 @@ class DeviceRadixSort : public LuisaModule
                             BufferView<uint>    temp_storage,
                             BufferView<KeyType> d_keys_in,
                             BufferView<KeyType> d_keys_out,
-                            uint                num_items)
+                            uint                num_items,
+                            uint                begin_bit = 0u,
+                            uint                end_bit   = sizeof(KeyType) * 8u)
     {
+        validate_key_views(temp_storage, d_keys_in, d_keys_out, num_items, begin_bit, end_bit);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            cmdlist << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items));
+            return;
+        }
         DoubleBuffer<KeyType> d_keys(d_keys_in, d_keys_out);
         DoubleBuffer<KeyType> d_values(d_keys_in, d_keys_out);  // dummy
         lcpp_check(onesweep_radix_sort<KeyType, KeyType, true, true>(
-            cmdlist, temp_storage, d_keys, d_values, 0, sizeof(KeyType) * 8, num_items, false),
-            cmdlist, debug_stream());
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, false),
+                   cmdlist,
+                   debug_stream());
     };
 
   private:
+    template <NumericT KeyType>
+    void validate_key_views(BufferView<uint>    temp_storage,
+                            BufferView<KeyType> d_keys_in,
+                            BufferView<KeyType> d_keys_out,
+                            uint                num_items,
+                            uint                begin_bit,
+                            uint                end_bit) const
+    {
+        LUISA_ASSERT(m_created, "DeviceRadixSort::create must be called before dispatch.");
+        LUISA_ASSERT(begin_bit <= end_bit, "DeviceRadixSort begin_bit must not exceed end_bit.");
+        LUISA_ASSERT(end_bit <= sizeof(KeyType) * 8u, "DeviceRadixSort end_bit exceeds the key width.");
+        LUISA_ASSERT(d_keys_in.size() >= num_items, "DeviceRadixSort key input view is too small.");
+        LUISA_ASSERT(d_keys_out.size() >= num_items, "DeviceRadixSort key output view is too small.");
+        if(num_items > 0u && begin_bit < end_bit)
+        {
+            LUISA_ASSERT(temp_storage.size()
+                             >= bytes_to_uint_count(GetSortKeysTempStorageBytes<KeyType>(num_items)),
+                         "DeviceRadixSort temporary storage is too small.");
+        }
+    }
+
+    template <NumericT KeyType, NumericT ValueType>
+    void validate_pair_views(BufferView<uint>      temp_storage,
+                             BufferView<KeyType>   d_keys_in,
+                             BufferView<KeyType>   d_keys_out,
+                             BufferView<ValueType> d_values_in,
+                             BufferView<ValueType> d_values_out,
+                             uint                  num_items,
+                             uint                  begin_bit,
+                             uint                  end_bit) const
+    {
+        validate_key_views(temp_storage, d_keys_in, d_keys_out, num_items, begin_bit, end_bit);
+        LUISA_ASSERT(d_values_in.size() >= num_items, "DeviceRadixSort value input view is too small.");
+        LUISA_ASSERT(d_values_out.size() >= num_items, "DeviceRadixSort value output view is too small.");
+        if(num_items > 0u && begin_bit < end_bit)
+        {
+            LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(
+                             GetSortPairsTempStorageBytes<KeyType, ValueType>(num_items)),
+                         "DeviceRadixSort temporary storage is too small.");
+        }
+    }
+
     template <NumericT KeyType, typename ValueType, bool KEY_ONLY, bool IS_DESCENDING>
     [[nodiscard]] int onesweep_radix_sort(CommandList&             cmdlist,
-                             BufferView<uint>         temp_storage,
-                             DoubleBuffer<KeyType>&   d_keys,
-                             DoubleBuffer<ValueType>& d_values,
-                             uint                     begin_bit,
-                             uint                     end_bit,
-                             uint                     num_items,
-                             bool                     is_overwrite_okay)
+                                          BufferView<uint>         temp_storage,
+                                          DoubleBuffer<KeyType>&   d_keys,
+                                          DoubleBuffer<ValueType>& d_values,
+                                          uint                     begin_bit,
+                                          uint                     end_bit,
+                                          uint                     num_items,
+                                          bool                     is_overwrite_okay)
     {
         const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
         const uint RADIX_DIGITS = 1 << RADIX_BITS;
@@ -316,18 +418,25 @@ class DeviceRadixSort : public LuisaModule
             details::RadixSortOneSweepModule<KeyType, ValueType, KEY_ONLY, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS, ONESWEEP_ITMES_PER_THREADS>;
         using RadixSortOneSweepKernel = RadixSortOneSweep::RadixSortOneSweepKernel;
 
-        auto ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(radix_sort_key);
+        auto onesweep_radix_sort_key = radix_sort_key + (KEY_ONLY ? "_keys" : "_pairs");
+        auto ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(onesweep_radix_sort_key);
         if(ms_radix_sort_onesweep_it == ms_radix_sort_one_sweep_map.end())
         {
             auto shader = RadixSortOneSweep().compile(m_device);
             if (!shader) { return -1; }
-            ms_radix_sort_one_sweep_map.try_emplace(radix_sort_key, std::move(shader));
-            ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(radix_sort_key);
+            ms_radix_sort_one_sweep_map.try_emplace(onesweep_radix_sort_key, std::move(shader));
+            ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(onesweep_radix_sort_key);
         }
-        if(ms_radix_sort_onesweep_it == ms_radix_sort_one_sweep_map.end()) { return -1; }
+        if(ms_radix_sort_onesweep_it == ms_radix_sort_one_sweep_map.end())
+        {
+            return -1;
+        }
         auto ms_radix_sort_onesweep_ptr =
             reinterpret_cast<RadixSortOneSweepKernel*>(&(*ms_radix_sort_onesweep_it->second));
-        if(!ms_radix_sort_onesweep_ptr) { return -1; }
+        if(!ms_radix_sort_onesweep_ptr)
+        {
+            return -1;
+        }
 
         for(uint current_bit = begin_bit, pass = 0; current_bit < end_bit; current_bit += RADIX_BITS, ++pass)
         {
@@ -338,8 +447,7 @@ class DeviceRadixSort : public LuisaModule
                 uint portion_num_items = std::min(num_items - portion * PORTION_SIZE, PORTION_SIZE);
                 uint num_blocks        = ceil_div(portion_num_items, ONESWEEP_TILE_ITEMS);
 
-                cmdlist << (*ms_radix_sort_reset_ptr)(d_lookback_view, 0u)
-                               .dispatch(lookback_count);
+                cmdlist << (*ms_radix_sort_reset_ptr)(d_lookback_view, 0u).dispatch(lookback_count);
 
                 // dispatch
                 cmdlist
