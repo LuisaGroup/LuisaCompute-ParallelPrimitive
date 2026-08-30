@@ -46,6 +46,7 @@
 #include <lcpp/device/device_find.h>
 #include <lcpp/device/device_for.h>
 #include <lcpp/device/device_histogram.h>
+#include <lcpp/device/device_memcpy.h>
 #include <lcpp/device/device_merge.h>
 #include <lcpp/device/device_merge_sort.h>
 #include <lcpp/device/device_partition.h>
