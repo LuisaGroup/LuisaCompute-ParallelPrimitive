@@ -162,6 +162,81 @@ int main(int argc, char* argv[])
         }
     };
 
+    "block_sum_prefix_callbacks_cover_scalar_and_array_inputs"_test = [&]
+    {
+        auto scalar_exclusive = device.create_buffer<uint>(block_threads);
+        auto scalar_inclusive = device.create_buffer<uint>(block_threads);
+        auto array_exclusive  = device.create_buffer<uint>(block_items);
+        auto array_inclusive  = device.create_buffer<uint>(block_items);
+
+        Kernel1D kernel = [](BufferVar<uint> scalar_exclusive_buffer,
+                             BufferVar<uint> scalar_inclusive_buffer,
+                             BufferVar<uint> array_exclusive_buffer,
+                             BufferVar<uint> array_inclusive_buffer) noexcept
+        {
+            set_block_size(block_threads);
+            UInt tid    = thread_id().x;
+            UInt scalar = tid + 1u;
+
+            UInt scalar_exclusive_value;
+            UInt scalar_inclusive_value;
+            auto scalar_exclusive_prefix = [](const UInt&) noexcept { return UInt(100u); };
+            auto scalar_inclusive_prefix = [](const UInt&) noexcept { return UInt(200u); };
+            BlockScan<uint, block_threads, items_per_thread> scalar_exclusive_scan;
+            BlockScan<uint, block_threads, items_per_thread> scalar_inclusive_scan;
+            scalar_exclusive_scan.ExclusiveSum(scalar, scalar_exclusive_value, scalar_exclusive_prefix);
+            scalar_inclusive_scan.InclusiveSum(scalar, scalar_inclusive_value, scalar_inclusive_prefix);
+            scalar_exclusive_buffer.write(tid, scalar_exclusive_value);
+            scalar_inclusive_buffer.write(tid, scalar_inclusive_value);
+
+            ArrayVar<uint, items_per_thread> items;
+            for(uint item = 0u; item < items_per_thread; ++item)
+            {
+                items[item] = tid * items_per_thread + item + 1u;
+            }
+            ArrayVar<uint, items_per_thread> array_exclusive_values;
+            ArrayVar<uint, items_per_thread> array_inclusive_values;
+            auto array_exclusive_prefix = [](const UInt&) noexcept { return UInt(300u); };
+            auto array_inclusive_prefix = [](const UInt&) noexcept { return UInt(400u); };
+            BlockScan<uint, block_threads, items_per_thread> array_exclusive_scan;
+            BlockScan<uint, block_threads, items_per_thread> array_inclusive_scan;
+            array_exclusive_scan.ExclusiveSum(items, array_exclusive_values, array_exclusive_prefix);
+            array_inclusive_scan.InclusiveSum(items, array_inclusive_values, array_inclusive_prefix);
+            for(uint item = 0u; item < items_per_thread; ++item)
+            {
+                UInt index = tid * items_per_thread + item;
+                array_exclusive_buffer.write(index, array_exclusive_values[item]);
+                array_inclusive_buffer.write(index, array_inclusive_values[item]);
+            }
+        };
+
+        auto                shader = device.compile(kernel);
+        luisa::vector<uint> scalar_exclusive_result(block_threads);
+        luisa::vector<uint> scalar_inclusive_result(block_threads);
+        luisa::vector<uint> array_exclusive_result(block_items);
+        luisa::vector<uint> array_inclusive_result(block_items);
+        stream << shader(scalar_exclusive, scalar_inclusive, array_exclusive, array_inclusive).dispatch(block_threads)
+               << scalar_exclusive.copy_to(luisa::span{scalar_exclusive_result})
+               << scalar_inclusive.copy_to(luisa::span{scalar_inclusive_result})
+               << array_exclusive.copy_to(luisa::span{array_exclusive_result})
+               << array_inclusive.copy_to(luisa::span{array_inclusive_result}) << synchronize();
+
+        for(uint index = 0u; index < block_threads; ++index)
+        {
+            uint exclusive = index * (index + 1u) / 2u;
+            uint inclusive = (index + 1u) * (index + 2u) / 2u;
+            expect(scalar_exclusive_result[index] == 100u + exclusive);
+            expect(scalar_inclusive_result[index] == 200u + inclusive);
+        }
+        for(uint index = 0u; index < block_items; ++index)
+        {
+            uint exclusive = index * (index + 1u) / 2u;
+            uint inclusive = (index + 1u) * (index + 2u) / 2u;
+            expect(array_exclusive_result[index] == 300u + exclusive);
+            expect(array_inclusive_result[index] == 400u + inclusive);
+        }
+    };
+
     "block_warp_shuffle_handles_logical_warps"_test = [&]
     {
         constexpr uint logical_block_threads = 64u;

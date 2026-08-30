@@ -337,6 +337,12 @@ class BlockScan : public LuisaModule
         ExclusiveScan(input, output, block_aggregate, SumOp(), Var<Type4Byte>{Type4Byte{}});
     }
 
+    template <typename BlockPrefixCallbackOp>
+    void ExclusiveSum(const Var<Type4Byte>& input, Var<Type4Byte>& output, BlockPrefixCallbackOp prefix_op)
+    {
+        ExclusiveScan(input, output, SumOp(), prefix_op);
+    }
+
     void ExclusiveSum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output)
     {
@@ -350,6 +356,14 @@ class BlockScan : public LuisaModule
         ExclusiveScan(input, output, block_aggregate, SumOp(), Var<Type4Byte>{Type4Byte{}});
     }
 
+    template <typename BlockPrefixCallbackOp>
+    void ExclusiveSum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                      compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
+                      BlockPrefixCallbackOp                                 prefix_op)
+    {
+        ExclusiveScan(input, output, SumOp(), prefix_op);
+    }
+
     void InclusiveSum(const Var<Type4Byte>& input, Var<Type4Byte>& output)
     {
         InclusiveScan(input, output, SumOp());
@@ -358,6 +372,12 @@ class BlockScan : public LuisaModule
     void InclusiveSum(const Var<Type4Byte>& input, Var<Type4Byte>& output, Var<Type4Byte>& block_aggregate)
     {
         InclusiveScan(input, output, block_aggregate, SumOp());
+    }
+
+    template <typename BlockPrefixCallbackOp>
+    void InclusiveSum(const Var<Type4Byte>& input, Var<Type4Byte>& output, BlockPrefixCallbackOp prefix_op)
+    {
+        InclusiveScan(input, output, SumOp(), prefix_op);
     }
 
     void InclusiveSum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
@@ -371,6 +391,14 @@ class BlockScan : public LuisaModule
                       Var<Type4Byte>&                                       block_aggregate)
     {
         InclusiveScan(input, output, block_aggregate, SumOp());
+    }
+
+    template <typename BlockPrefixCallbackOp>
+    void InclusiveSum(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                      compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
+                      BlockPrefixCallbackOp                                 prefix_op)
+    {
+        InclusiveScan(input, output, SumOp(), prefix_op);
     }
 
   private:
