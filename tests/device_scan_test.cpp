@@ -158,6 +158,41 @@ int main(int argc, char* argv[])
         }
     };
 
+    "inclusive_scan_init_applies_initial_value_in_place"_test = [&]
+    {
+        const std::array<int, 4u> input_data{1, 2, 3, 4};
+        const std::array<int, 4u> expected{11, 13, 16, 20};
+        auto                      data = device.create_buffer<int>(input_data.size());
+        auto                      temp = device.create_buffer<uint>(
+            bytes_to_uint_count(ScannerT::GetTempStorageBytes<int>(input_data.size())));
+
+        CommandList commands;
+        scanner.InclusiveScanInit(
+            commands,
+            temp.view(),
+            data.view(),
+            data.view(),
+            input_data.size(),
+            [](const Int& lhs, const Int& rhs) noexcept { return lhs + rhs; },
+            10);
+        scanner.InclusiveScanInit(
+            commands,
+            BufferView<uint>{},
+            BufferView<int>{},
+            BufferView<int>{},
+            0u,
+            [](const Int& lhs, const Int& rhs) noexcept { return lhs + rhs; },
+            10);
+
+        std::array<int, 4u> result{};
+        stream << data.copy_from(luisa::span{input_data}) << commands.commit()
+               << data.copy_to(luisa::span{result}) << synchronize();
+        for(size_t index = 0u; index < expected.size(); ++index)
+        {
+            expect(result[index] == expected[index]);
+        }
+    };
+
 
     "exclusive_scan_by_key"_test = [&]
     {

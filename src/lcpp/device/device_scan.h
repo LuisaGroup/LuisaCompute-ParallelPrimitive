@@ -273,6 +273,18 @@ class DeviceScan : public LuisaModule
         dispatch_scan<true, true>(cmdlist, temp_storage, d_in, d_out, num_items, scan_op, initial_value);
     }
 
+    template <NumericT Type4Byte, typename ScanOp>
+    void InclusiveScanInit(CommandList&          cmdlist,
+                           BufferView<uint>      temp_storage,
+                           BufferView<Type4Byte> d_in,
+                           BufferView<Type4Byte> d_out,
+                           size_t                num_items,
+                           ScanOp                scan_op,
+                           Type4Byte             initial_value)
+    {
+        dispatch_scan<true, true>(cmdlist, temp_storage, d_in, d_out, num_items, scan_op, initial_value);
+    }
+
     template <NumericT Type4Byte>
     void ExclusiveSum(CommandList&          cmdlist,
                       BufferView<uint>      temp_storage,
