@@ -157,6 +157,28 @@ This repository-scoped matrix is based on the interface families selected from
 CCCL/CUB v3.4.0. It records the portable LuisaCompute surface implemented here;
 it is not a claim of source-level or exhaustive API parity with every CUB release.
 
+### Completion Status
+
+The repository-selected roadmap below is complete. Exhaustive parity with all
+public headers and overloads at CCCL/CUB v3.4.0
+(`a5630ac57111e1aaef8cfe0069ede566c3d15f60`) is a separate goal and is not yet
+complete:
+
+- [ ] Add the aggregate-header device families that are not represented yet:
+  `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
+  `DeviceTransform`.
+- [ ] Evaluate the public families outside the aggregate header and implement
+  the portable ones, including `thread_search`, `thread_sort`,
+  `WarpReduceBatched`, and `DeviceSegmentedScan`.
+- [ ] Audit and implement remaining overload parity in existing families, such
+  as `DeviceFor::{Bulk,ForEachCopy,ForEachCopyN}`,
+  `DeviceSelect::FlaggedIf`,
+  `DeviceAdjacentDifference::AdjacentDifference`,
+  `DeviceScan::InclusiveScanInit`, and merge-sort copy variants.
+
+APIs introduced by later CCCL/CUB releases are not implicitly included here;
+the comparison baseline must be pinned again before extending this roadmap.
+
 ### Priority 1: High-Priority Device Operations
 
 #### DeviceSelect
