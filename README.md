@@ -113,10 +113,13 @@ stream << cmdlist.commit() << synchronize();
 ### ✅ Thread Level
 - [x] **ThreadReduce** - Thread-level reduction operations
 - [x] **ThreadScan** - Thread-level scan (prefix sum) operations
+- [x] **ThreadSearch** - Lower/upper-bound and merge-path searches
+- [x] **ThreadSort** - Stable key and key-value odd-even sorting
 - [x] **ThreadLoad / ThreadStore** - Cache-modifier-compatible scalar access
 
 ### ✅ Warp Level (32 threads)
 - [x] **WarpReduce** - Warp-level reduction (Sum, Min, Max, custom operators)
+- [x] **WarpReduceBatched** - Independent batched reductions with direct, striped, and blocked layouts
 - [x] **WarpScan** - Warp-level inclusive/exclusive scan
 - [x] **WarpExchange** - Data exchange patterns within a warp
 - [x] **WarpLoad / WarpStore** - Blocked, striped, and transpose I/O
@@ -146,6 +149,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
 - [x] **DeviceSpmv** - CSR sparse-matrix vector multiplication
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
+- [x] **DeviceSegmentedScan** - Inclusive/exclusive scans with shared or independent output offsets
 - [x] **DeviceHistogram** - Histogram computation
 - [x] **DeviceFor** - Parallel for-loop utilities
 - [x] **DeviceSelect** - Flagged, predicate, unique, and unique-by-key selection
@@ -167,7 +171,7 @@ complete:
 - [ ] Add the aggregate-header device families that are not represented yet:
   `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
   `DeviceTransform`.
-- [ ] Evaluate the public families outside the aggregate header and implement
+- [x] Evaluate the public families outside the aggregate header and implement
   the portable ones, including `thread_search`, `thread_sort`,
   `WarpReduceBatched`, and `DeviceSegmentedScan`.
 - [ ] Audit and implement remaining overload parity in existing families, such

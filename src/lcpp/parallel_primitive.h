@@ -53,6 +53,7 @@
 #include <lcpp/device/device_scan.h>
 #include <lcpp/device/device_select.h>
 #include <lcpp/device/device_segment_reduce.h>
+#include <lcpp/device/device_segmented_scan.h>
 #include <lcpp/device/device_segmented_radix_sort.h>
 #include <lcpp/device/device_segmented_sort.h>
 #include <lcpp/device/device_spmv.h>
