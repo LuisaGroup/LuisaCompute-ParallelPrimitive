@@ -146,6 +146,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
 - [x] **DeviceRadixSort** - OneSweep key/pair sorting with ascending, descending, and bit-range interfaces
 - [x] **DeviceMerge** - Sorted key and key-value pair merging with custom ordering
+- [x] **DeviceTransform** - Fill, generate, conditional, tuple-input, and tuple-output transforms
 - [x] **DeviceMergeSort** - Stable key and key-value merge sorting
 - [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
 - [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
