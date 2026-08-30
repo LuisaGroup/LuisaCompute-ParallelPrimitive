@@ -147,6 +147,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceRadixSort** - OneSweep key/pair sorting with ascending, descending, and bit-range interfaces
 - [x] **DeviceMemcpy** - Batched raw-byte copies over bindless source and destination ranges
 - [x] **DeviceMerge** - Sorted key and key-value pair merging with custom ordering
+- [x] **DeviceTopK** - Min/max key and pair selection with decomposed custom keys
 - [x] **DeviceTransform** - Fill, generate, conditional, tuple-input, and tuple-output transforms
 - [x] **DeviceMergeSort** - Stable key and key-value merge sorting
 - [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
@@ -172,7 +173,7 @@ public headers and overloads at CCCL/CUB v3.4.0
 (`a5630ac57111e1aaef8cfe0069ede566c3d15f60`) is a separate goal and is not yet
 complete:
 
-- [ ] Add the aggregate-header device families that are not represented yet:
+- [x] Add the aggregate-header device families that were not represented:
   `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
   `DeviceTransform`.
 - [x] Evaluate the public families outside the aggregate header and implement

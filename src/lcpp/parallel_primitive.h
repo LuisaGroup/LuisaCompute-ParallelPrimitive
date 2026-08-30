@@ -60,4 +60,5 @@
 #include <lcpp/device/device_segmented_radix_sort.h>
 #include <lcpp/device/device_segmented_sort.h>
 #include <lcpp/device/device_spmv.h>
+#include <lcpp/device/device_topk.h>
 #include <lcpp/device/device_transform.h>
