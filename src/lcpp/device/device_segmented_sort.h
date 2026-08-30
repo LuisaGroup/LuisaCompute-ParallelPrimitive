@@ -18,10 +18,16 @@ namespace luisa::parallel_primitive
 {
 using namespace luisa::compute;
 
+template <size_t BLOCK_SIZE>
+class DeviceSegmentedRadixSort;
+
 template <size_t BLOCK_SIZE = details::BLOCK_SIZE>
 class DeviceSegmentedSort : public LuisaModule
 {
   private:
+    template <size_t>
+    friend class DeviceSegmentedRadixSort;
+
     static_assert(BLOCK_SIZE > 0u);
 
     Device m_device;

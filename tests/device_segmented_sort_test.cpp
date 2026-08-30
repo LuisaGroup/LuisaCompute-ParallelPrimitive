@@ -555,6 +555,144 @@ int main(int argc, char* argv[])
         }
     };
 
+    "device_segmented_radix_sort_updates_double_buffer_selectors"_test = [&]
+    {
+        luisa::vector<uint> keys{
+            999u, 44u, 12u, 76u, 998u, 63u, 31u, 95u, 27u, 997u, 84u, 20u, 52u, 16u, 80u, 48u, 24u, 56u, 4u};
+        luisa::vector<uint> values(item_count);
+        std::iota(values.begin(), values.end(), 0u);
+        for(uint i = 0u; i < item_count; ++i)
+        {
+            if(!is_segment_item(i))
+            {
+                keys[i]   = value_sentinel;
+                values[i] = value_sentinel;
+            }
+        }
+        constexpr uint begin_bit   = 2u;
+        constexpr uint end_bit     = 6u;
+        auto           radix_field = [](uint key)
+        { return (key >> begin_bit) & ((1u << (end_bit - begin_bit)) - 1u); };
+        auto ascending_order =
+            segmented_order(keys,
+                            [&](uint lhs, uint rhs) { return radix_field(lhs) < radix_field(rhs); });
+        auto descending_order =
+            segmented_order(keys,
+                            [&](uint lhs, uint rhs) { return radix_field(lhs) > radix_field(rhs); });
+
+        auto begins = device.create_buffer<uint>(segment_count);
+        auto ends   = device.create_buffer<uint>(segment_count);
+
+        auto ascending_key_0         = device.create_buffer<uint>(item_count);
+        auto ascending_key_1         = device.create_buffer<uint>(item_count);
+        auto descending_key_0        = device.create_buffer<uint>(item_count);
+        auto descending_key_1        = device.create_buffer<uint>(item_count);
+        auto ascending_pair_key_0    = device.create_buffer<uint>(item_count);
+        auto ascending_pair_key_1    = device.create_buffer<uint>(item_count);
+        auto ascending_pair_value_0  = device.create_buffer<uint>(item_count);
+        auto ascending_pair_value_1  = device.create_buffer<uint>(item_count);
+        auto descending_pair_key_0   = device.create_buffer<uint>(item_count);
+        auto descending_pair_key_1   = device.create_buffer<uint>(item_count);
+        auto descending_pair_value_0 = device.create_buffer<uint>(item_count);
+        auto descending_pair_value_1 = device.create_buffer<uint>(item_count);
+
+        DoubleBuffer<uint> ascending_keys(ascending_key_0.view(), ascending_key_1.view());
+        DoubleBuffer<uint> descending_keys(descending_key_0.view(), descending_key_1.view());
+        DoubleBuffer<uint> ascending_pair_keys(ascending_pair_key_0.view(), ascending_pair_key_1.view());
+        DoubleBuffer<uint> ascending_pair_values(ascending_pair_value_0.view(),
+                                                 ascending_pair_value_1.view());
+        DoubleBuffer<uint> descending_pair_keys(descending_pair_key_0.view(), descending_pair_key_1.view());
+        DoubleBuffer<uint> descending_pair_values(descending_pair_value_0.view(),
+                                                  descending_pair_value_1.view());
+        descending_keys.selector        = 1;
+        descending_pair_keys.selector   = 1;
+        descending_pair_values.selector = 1;
+
+        auto temp_bytes = DeviceSegmentedRadixSort<>::GetSortPairsTempStorageBytes<uint, uint>(item_count);
+        auto        temp_storage = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        CommandList commands;
+        segmented_radix_sort.SortKeys(
+            commands, temp_storage.view(), ascending_keys, item_count, segment_count, begins.view(), ends.view(), begin_bit, end_bit);
+        segmented_radix_sort.SortKeysDescending(
+            commands, temp_storage.view(), descending_keys, item_count, segment_count, begins.view(), ends.view(), begin_bit, end_bit);
+        segmented_radix_sort.SortPairs(commands,
+                                       temp_storage.view(),
+                                       ascending_pair_keys,
+                                       ascending_pair_values,
+                                       item_count,
+                                       segment_count,
+                                       begins.view(),
+                                       ends.view(),
+                                       begin_bit,
+                                       end_bit);
+        segmented_radix_sort.SortPairsDescending(commands,
+                                                 temp_storage.view(),
+                                                 descending_pair_keys,
+                                                 descending_pair_values,
+                                                 item_count,
+                                                 segment_count,
+                                                 begins.view(),
+                                                 ends.view(),
+                                                 begin_bit,
+                                                 end_bit);
+
+        expect(ascending_keys.selector == 1);
+        expect(descending_keys.selector == 0);
+        expect(ascending_pair_keys.selector == 1);
+        expect(ascending_pair_values.selector == ascending_pair_keys.selector);
+        expect(descending_pair_keys.selector == 0);
+        expect(descending_pair_values.selector == descending_pair_keys.selector);
+
+        luisa::vector<uint> empty(item_count, value_sentinel);
+        stream << begins.copy_from(luisa::span{begin_offsets})
+               << ends.copy_from(luisa::span{end_offsets}) << ascending_key_0.copy_from(luisa::span{keys})
+               << ascending_key_1.copy_from(luisa::span{empty})
+               << descending_key_0.copy_from(luisa::span{empty})
+               << descending_key_1.copy_from(luisa::span{keys})
+               << ascending_pair_key_0.copy_from(luisa::span{keys})
+               << ascending_pair_key_1.copy_from(luisa::span{empty})
+               << ascending_pair_value_0.copy_from(luisa::span{values})
+               << ascending_pair_value_1.copy_from(luisa::span{empty})
+               << descending_pair_key_0.copy_from(luisa::span{empty})
+               << descending_pair_key_1.copy_from(luisa::span{keys})
+               << descending_pair_value_0.copy_from(luisa::span{empty})
+               << descending_pair_value_1.copy_from(luisa::span{values}) << commands.commit();
+
+        luisa::vector<uint> ascending_key_result(item_count);
+        luisa::vector<uint> descending_key_result(item_count);
+        luisa::vector<uint> ascending_pair_key_result(item_count);
+        luisa::vector<uint> ascending_pair_value_result(item_count);
+        luisa::vector<uint> descending_pair_key_result(item_count);
+        luisa::vector<uint> descending_pair_value_result(item_count);
+        stream << ascending_keys.current().copy_to(luisa::span{ascending_key_result})
+               << descending_keys.current().copy_to(luisa::span{descending_key_result})
+               << ascending_pair_keys.current().copy_to(luisa::span{ascending_pair_key_result})
+               << ascending_pair_values.current().copy_to(luisa::span{ascending_pair_value_result})
+               << descending_pair_keys.current().copy_to(luisa::span{descending_pair_key_result})
+               << descending_pair_values.current().copy_to(luisa::span{descending_pair_value_result})
+               << synchronize();
+
+        for(uint i = 0u; i < item_count; ++i)
+        {
+            if(!is_segment_item(i))
+            {
+                expect(ascending_key_result[i] == value_sentinel);
+                expect(descending_key_result[i] == value_sentinel);
+                expect(ascending_pair_key_result[i] == value_sentinel);
+                expect(ascending_pair_value_result[i] == value_sentinel);
+                expect(descending_pair_key_result[i] == value_sentinel);
+                expect(descending_pair_value_result[i] == value_sentinel);
+                continue;
+            }
+            expect(ascending_key_result[i] == keys[ascending_order[i]]);
+            expect(descending_key_result[i] == keys[descending_order[i]]);
+            expect(ascending_pair_key_result[i] == keys[ascending_order[i]]);
+            expect(ascending_pair_value_result[i] == values[ascending_order[i]]);
+            expect(descending_pair_key_result[i] == keys[descending_order[i]]);
+            expect(descending_pair_value_result[i] == values[descending_order[i]]);
+        }
+    };
+
     "device_segmented_sort_handles_empty_work"_test = [&]
     {
         CommandList commands;
@@ -588,13 +726,17 @@ int main(int argc, char* argv[])
         luisa::vector<int> expected_keys = keys;
         std::stable_sort(expected_keys.begin(), expected_keys.end());
 
-        auto keys_input        = device.create_buffer<int>(count);
-        auto values_input      = device.create_buffer<uint>(count);
-        auto sorted_keys       = device.create_buffer<int>(count);
-        auto zero_width_keys   = device.create_buffer<int>(count);
-        auto zero_width_values = device.create_buffer<uint>(count);
-        auto begins            = device.create_buffer<uint>(1u);
-        auto ends              = device.create_buffer<uint>(1u);
+        auto              keys_input        = device.create_buffer<int>(count);
+        auto              values_input      = device.create_buffer<uint>(count);
+        auto              sorted_keys       = device.create_buffer<int>(count);
+        auto              zero_width_keys   = device.create_buffer<int>(count);
+        auto              zero_width_values = device.create_buffer<uint>(count);
+        auto              zero_width_db_0   = device.create_buffer<int>(count);
+        auto              zero_width_db_1   = device.create_buffer<int>(count);
+        auto              begins            = device.create_buffer<uint>(1u);
+        auto              ends              = device.create_buffer<uint>(1u);
+        DoubleBuffer<int> zero_width_db(zero_width_db_0.view(), zero_width_db_1.view());
+        zero_width_db.selector = 1;
         uint begin             = 0u;
         uint end               = count;
         auto temp_bytes = DeviceSegmentedRadixSort<>::GetSortPairsTempStorageBytes<int, uint>(count);
@@ -615,22 +757,30 @@ int main(int argc, char* argv[])
                                        ends.view(),
                                        13u,
                                        13u);
+        segmented_radix_sort.SortKeys(
+            commands, temp_storage.view(), zero_width_db, count, 1u, begins.view(), ends.view(), 13u, 13u);
+        expect(zero_width_db.selector == 1);
+        luisa::vector<int> zero_width_db_empty(count, key_sentinel);
         stream << keys_input.copy_from(luisa::span{keys}) << values_input.copy_from(luisa::span{values})
-               << begins.copy_from(luisa::span{&begin, 1u}) << ends.copy_from(luisa::span{&end, 1u})
-               << commands.commit();
+               << zero_width_db_0.copy_from(luisa::span{zero_width_db_empty})
+               << zero_width_db_1.copy_from(luisa::span{keys}) << begins.copy_from(luisa::span{&begin, 1u})
+               << ends.copy_from(luisa::span{&end, 1u}) << commands.commit();
 
         luisa::vector<int>  sorted_keys_result(count);
         luisa::vector<int>  zero_width_keys_result(count);
         luisa::vector<uint> zero_width_values_result(count);
+        luisa::vector<int>  zero_width_db_result(count);
         stream << sorted_keys.copy_to(luisa::span{sorted_keys_result})
                << zero_width_keys.copy_to(luisa::span{zero_width_keys_result})
-               << zero_width_values.copy_to(luisa::span{zero_width_values_result}) << synchronize();
+               << zero_width_values.copy_to(luisa::span{zero_width_values_result})
+               << zero_width_db.current().copy_to(luisa::span{zero_width_db_result}) << synchronize();
 
         for(uint i = 0u; i < count; ++i)
         {
             expect(sorted_keys_result[i] == expected_keys[i]);
             expect(zero_width_keys_result[i] == keys[i]);
             expect(zero_width_values_result[i] == values[i]);
+            expect(zero_width_db_result[i] == keys[i]);
         }
     };
 }

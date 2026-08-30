@@ -56,6 +56,28 @@ class DeviceSegmentedRadixSort : public LuisaModule
     }
 
     template <NumericT KeyT>
+    void SortKeys(CommandList&        cmdlist,
+                  BufferView<uint>    temp_storage,
+                  DoubleBuffer<KeyT>& keys,
+                  size_t              num_items,
+                  size_t              num_segments,
+                  BufferView<uint>    begin_offsets,
+                  BufferView<uint>    end_offsets,
+                  uint                begin_bit = 0u,
+                  uint                end_bit   = sizeof(KeyT) * 8u)
+    {
+        validate_bit_range<KeyT>(begin_bit, end_bit);
+        if(begin_bit == end_bit)
+        {
+            m_segmented_sort.validate_key_double_buffer(keys, num_items, num_segments, begin_offsets, end_offsets);
+            return;
+        }
+        auto compare = radix_compare<KeyT, false>(begin_bit, end_bit);
+        m_segmented_sort.SortKeys(
+            cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT>
     void SortKeysDescending(CommandList&     cmdlist,
                             BufferView<uint> temp_storage,
                             BufferView<KeyT> keys_input,
@@ -71,6 +93,28 @@ class DeviceSegmentedRadixSort : public LuisaModule
         auto compare = radix_compare<KeyT, true>(begin_bit, end_bit);
         m_segmented_sort.SortKeys(
             cmdlist, temp_storage, keys_input, keys_output, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeysDescending(CommandList&        cmdlist,
+                            BufferView<uint>    temp_storage,
+                            DoubleBuffer<KeyT>& keys,
+                            size_t              num_items,
+                            size_t              num_segments,
+                            BufferView<uint>    begin_offsets,
+                            BufferView<uint>    end_offsets,
+                            uint                begin_bit = 0u,
+                            uint                end_bit   = sizeof(KeyT) * 8u)
+    {
+        validate_bit_range<KeyT>(begin_bit, end_bit);
+        if(begin_bit == end_bit)
+        {
+            m_segmented_sort.validate_key_double_buffer(keys, num_items, num_segments, begin_offsets, end_offsets);
+            return;
+        }
+        auto compare = radix_compare<KeyT, true>(begin_bit, end_bit);
+        m_segmented_sort.SortKeys(
+            cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets, compare);
     }
 
     template <NumericT KeyT, NumericT ValueT>
@@ -94,6 +138,29 @@ class DeviceSegmentedRadixSort : public LuisaModule
     }
 
     template <NumericT KeyT, NumericT ValueT>
+    void SortPairs(CommandList&          cmdlist,
+                   BufferView<uint>      temp_storage,
+                   DoubleBuffer<KeyT>&   keys,
+                   DoubleBuffer<ValueT>& values,
+                   size_t                num_items,
+                   size_t                num_segments,
+                   BufferView<uint>      begin_offsets,
+                   BufferView<uint>      end_offsets,
+                   uint                  begin_bit = 0u,
+                   uint                  end_bit   = sizeof(KeyT) * 8u)
+    {
+        validate_bit_range<KeyT>(begin_bit, end_bit);
+        if(begin_bit == end_bit)
+        {
+            m_segmented_sort.validate_pair_double_buffers(keys, values, num_items, num_segments, begin_offsets, end_offsets);
+            return;
+        }
+        auto compare = radix_compare<KeyT, false>(begin_bit, end_bit);
+        m_segmented_sort.SortPairs(
+            cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
     void SortPairsDescending(CommandList&       cmdlist,
                              BufferView<uint>   temp_storage,
                              BufferView<KeyT>   keys_input,
@@ -111,6 +178,29 @@ class DeviceSegmentedRadixSort : public LuisaModule
         auto compare = radix_compare<KeyT, true>(begin_bit, end_bit);
         m_segmented_sort.SortPairs(
             cmdlist, temp_storage, keys_input, keys_output, values_input, values_output, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairsDescending(CommandList&          cmdlist,
+                             BufferView<uint>      temp_storage,
+                             DoubleBuffer<KeyT>&   keys,
+                             DoubleBuffer<ValueT>& values,
+                             size_t                num_items,
+                             size_t                num_segments,
+                             BufferView<uint>      begin_offsets,
+                             BufferView<uint>      end_offsets,
+                             uint                  begin_bit = 0u,
+                             uint                  end_bit   = sizeof(KeyT) * 8u)
+    {
+        validate_bit_range<KeyT>(begin_bit, end_bit);
+        if(begin_bit == end_bit)
+        {
+            m_segmented_sort.validate_pair_double_buffers(keys, values, num_items, num_segments, begin_offsets, end_offsets);
+            return;
+        }
+        auto compare = radix_compare<KeyT, true>(begin_bit, end_bit);
+        m_segmented_sort.SortPairs(
+            cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets, compare);
     }
 
   private:
