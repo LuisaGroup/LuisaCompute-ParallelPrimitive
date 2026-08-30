@@ -243,7 +243,114 @@ class DeviceRadixSort : public LuisaModule
                    debug_stream());
     };
 
+    template <NumericT KeyType, NumericT ValueType>
+    void SortPairs(CommandList&             cmdlist,
+                   BufferView<uint>         temp_storage,
+                   DoubleBuffer<KeyType>&   d_keys,
+                   DoubleBuffer<ValueType>& d_values,
+                   uint                     num_items,
+                   uint                     begin_bit = 0u,
+                   uint                     end_bit   = sizeof(KeyType) * 8u)
+    {
+        dispatch_double_buffer<KeyType, ValueType, false, false>(
+            cmdlist, temp_storage, d_keys, d_values, num_items, begin_bit, end_bit);
+    }
+
+    template <NumericT KeyType>
+    void SortKeys(CommandList&           cmdlist,
+                  BufferView<uint>       temp_storage,
+                  DoubleBuffer<KeyType>& d_keys,
+                  uint                   num_items,
+                  uint                   begin_bit = 0u,
+                  uint                   end_bit   = sizeof(KeyType) * 8u)
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        auto current   = d_keys.current();
+        auto alternate = d_keys.alternate();
+        validate_key_views(temp_storage, current, alternate, num_items, begin_bit, end_bit);
+        if(num_items == 0u || begin_bit == end_bit)
+        {
+            return;
+        }
+        DoubleBuffer<KeyType> d_values = d_keys;
+        lcpp_check(onesweep_radix_sort<KeyType, KeyType, true, false>(
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, true),
+                   cmdlist,
+                   debug_stream());
+    }
+
+    template <NumericT KeyType, NumericT ValueType>
+    void SortPairsDescending(CommandList&             cmdlist,
+                             BufferView<uint>         temp_storage,
+                             DoubleBuffer<KeyType>&   d_keys,
+                             DoubleBuffer<ValueType>& d_values,
+                             uint                     num_items,
+                             uint                     begin_bit = 0u,
+                             uint                     end_bit   = sizeof(KeyType) * 8u)
+    {
+        dispatch_double_buffer<KeyType, ValueType, false, true>(
+            cmdlist, temp_storage, d_keys, d_values, num_items, begin_bit, end_bit);
+    }
+
+    template <NumericT KeyType>
+    void SortKeysDescending(CommandList&           cmdlist,
+                            BufferView<uint>       temp_storage,
+                            DoubleBuffer<KeyType>& d_keys,
+                            uint                   num_items,
+                            uint                   begin_bit = 0u,
+                            uint                   end_bit   = sizeof(KeyType) * 8u)
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        auto current   = d_keys.current();
+        auto alternate = d_keys.alternate();
+        validate_key_views(temp_storage, current, alternate, num_items, begin_bit, end_bit);
+        if(num_items == 0u || begin_bit == end_bit)
+        {
+            return;
+        }
+        DoubleBuffer<KeyType> d_values = d_keys;
+        lcpp_check(onesweep_radix_sort<KeyType, KeyType, true, true>(
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, true),
+                   cmdlist,
+                   debug_stream());
+    }
+
   private:
+    template <typename T>
+    static void validate_double_buffer(const DoubleBuffer<T>& buffer, uint num_items, luisa::string_view name)
+    {
+        LUISA_ASSERT(buffer.selector == 0 || buffer.selector == 1,
+                     "DeviceRadixSort {} DoubleBuffer selector must be 0 or 1.",
+                     name);
+        LUISA_ASSERT(buffer.d_buffer[0].size() >= num_items, "DeviceRadixSort {} DoubleBuffer slot 0 is too small.", name);
+        LUISA_ASSERT(buffer.d_buffer[1].size() >= num_items, "DeviceRadixSort {} DoubleBuffer slot 1 is too small.", name);
+    }
+
+    template <NumericT KeyType, NumericT ValueType, bool KEY_ONLY, bool IS_DESCENDING>
+    void dispatch_double_buffer(CommandList&             cmdlist,
+                                BufferView<uint>         temp_storage,
+                                DoubleBuffer<KeyType>&   d_keys,
+                                DoubleBuffer<ValueType>& d_values,
+                                uint                     num_items,
+                                uint                     begin_bit,
+                                uint                     end_bit)
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        validate_double_buffer(d_values, num_items, "value");
+        LUISA_ASSERT(d_keys.selector == d_values.selector,
+                     "DeviceRadixSort key and value DoubleBuffer selectors must match.");
+        validate_pair_views(
+            temp_storage, d_keys.current(), d_keys.alternate(), d_values.current(), d_values.alternate(), num_items, begin_bit, end_bit);
+        if(num_items == 0u || begin_bit == end_bit)
+        {
+            return;
+        }
+        lcpp_check(onesweep_radix_sort<KeyType, ValueType, KEY_ONLY, IS_DESCENDING>(
+                       cmdlist, temp_storage, d_keys, d_values, begin_bit, end_bit, num_items, true),
+                   cmdlist,
+                   debug_stream());
+    }
+
     template <NumericT KeyType>
     void validate_key_views(BufferView<uint>    temp_storage,
                             BufferView<KeyType> d_keys_in,
@@ -312,13 +419,13 @@ class DeviceRadixSort : public LuisaModule
         size_t offset_bytes = 0;
 
         // d_bins: num_portions * num_passes * RADIX_DIGITS * uint
-        size_t bins_count = (size_t)num_portions * num_passes * RADIX_DIGITS;
-        auto d_bins_view = temp_storage.subview(offset_bytes / sizeof(uint), bins_count);
+        size_t bins_count  = (size_t)num_portions * num_passes * RADIX_DIGITS;
+        auto   d_bins_view = temp_storage.subview(offset_bytes / sizeof(uint), bins_count);
         offset_bytes += bins_count * sizeof(uint);
 
         // d_lookback: max_num_blocks * RADIX_DIGITS * uint
-        size_t lookback_count = (size_t)max_num_blocks * RADIX_DIGITS;
-        auto d_lookback_view = temp_storage.subview(offset_bytes / sizeof(uint), lookback_count);
+        size_t lookback_count  = (size_t)max_num_blocks * RADIX_DIGITS;
+        auto   d_lookback_view = temp_storage.subview(offset_bytes / sizeof(uint), lookback_count);
         offset_bytes += lookback_count * sizeof(uint);
 
         // extra key/value buffers for multi-pass
@@ -326,20 +433,22 @@ class DeviceRadixSort : public LuisaModule
         BufferView<ValueType> d_values_tmp2_view;
         if(!is_overwrite_okay && num_passes > 1)
         {
-            offset_bytes = align_up_uint(offset_bytes, alignof(KeyType));
+            offset_bytes           = align_up_uint(offset_bytes, alignof(KeyType));
             size_t keys_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(KeyType));
-            d_keys_tmp2_view = temp_storage.subview(offset_bytes / sizeof(uint), keys_uint_count).template as<KeyType>();
+            d_keys_tmp2_view =
+                temp_storage.subview(offset_bytes / sizeof(uint), keys_uint_count).template as<KeyType>();
             offset_bytes += keys_uint_count * sizeof(uint);
 
-            offset_bytes = align_up_uint(offset_bytes, alignof(ValueType));
+            offset_bytes             = align_up_uint(offset_bytes, alignof(ValueType));
             size_t values_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(ValueType));
-            d_values_tmp2_view = temp_storage.subview(offset_bytes / sizeof(uint), values_uint_count).template as<ValueType>();
+            d_values_tmp2_view =
+                temp_storage.subview(offset_bytes / sizeof(uint), values_uint_count).template as<ValueType>();
             offset_bytes += values_uint_count * sizeof(uint);
         }
 
         // d_ctrs: num_portions * num_passes * uint
-        size_t ctrs_count = (size_t)num_portions * num_passes;
-        auto d_ctrs_view = temp_storage.subview(offset_bytes / sizeof(uint), ctrs_count);
+        size_t ctrs_count  = (size_t)num_portions * num_passes;
+        auto   d_ctrs_view = temp_storage.subview(offset_bytes / sizeof(uint), ctrs_count);
 
         auto radix_sort_key = get_type_and_op_desc<KeyType, ValueType>()
                               + luisa::string(IS_DESCENDING ? "_desc" : "_asc");
@@ -352,14 +461,23 @@ class DeviceRadixSort : public LuisaModule
         if(ms_radix_sort_reset_it == ms_radix_sort_reset_map.end())
         {
             auto shader = RadixSortReset().compile(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             auto [it, inserted] = ms_radix_sort_reset_map.try_emplace(radix_sort_key, std::move(shader));
             ms_radix_sort_reset_it = it;
         }
-        if(ms_radix_sort_reset_it == ms_radix_sort_reset_map.end()) { return -1; }
+        if(ms_radix_sort_reset_it == ms_radix_sort_reset_map.end())
+        {
+            return -1;
+        }
         auto ms_radix_sort_reset_ptr =
             reinterpret_cast<RadixSortResetKernel*>(&(*ms_radix_sort_reset_it->second));
-        if(!ms_radix_sort_reset_ptr) { return -1; }
+        if(!ms_radix_sort_reset_ptr)
+        {
+            return -1;
+        }
 
         cmdlist << (*ms_radix_sort_reset_ptr)(d_bins_view, 0u).dispatch(bins_count)
                 << (*ms_radix_sort_reset_ptr)(d_ctrs_view, 0u).dispatch(ctrs_count);
@@ -372,14 +490,23 @@ class DeviceRadixSort : public LuisaModule
         if(ms_radix_sort_histogram_it == ms_radix_sort_histogram_map.end())
         {
             auto shader = RadixSortHistogram().compile(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             auto [it, inserted] = ms_radix_sort_histogram_map.try_emplace(radix_sort_key, std::move(shader));
             ms_radix_sort_histogram_it = it;
         }
-        if(ms_radix_sort_histogram_it == ms_radix_sort_histogram_map.end()) { return -1; }
+        if(ms_radix_sort_histogram_it == ms_radix_sort_histogram_map.end())
+        {
+            return -1;
+        }
         auto ms_radix_sort_histogram_ptr =
             reinterpret_cast<RadixSortHistogramKernel*>(&(*ms_radix_sort_histogram_it->second));
-        if(!ms_radix_sort_histogram_ptr) { return -1; }
+        if(!ms_radix_sort_histogram_ptr)
+        {
+            return -1;
+        }
         const auto num_sms             = BLOCK_SIZE;
         const auto histo_blocks_per_sm = 1;
         cmdlist << (*ms_radix_sort_histogram_ptr)(
@@ -393,15 +520,24 @@ class DeviceRadixSort : public LuisaModule
         if(ms_radix_sort_exclusive_sum_it == ms_radix_sort_exclusive_sum_map.end())
         {
             auto shader = RadixSortExclusiveSum().compile(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             auto [it, inserted] =
                 ms_radix_sort_exclusive_sum_map.try_emplace(radix_sort_key, std::move(shader));
             ms_radix_sort_exclusive_sum_it = it;
         }
-        if(ms_radix_sort_exclusive_sum_it == ms_radix_sort_exclusive_sum_map.end()) { return -1; }
+        if(ms_radix_sort_exclusive_sum_it == ms_radix_sort_exclusive_sum_map.end())
+        {
+            return -1;
+        }
         auto ms_radix_sort_exclusive_sum_ptr =
             reinterpret_cast<RadixSortExclusiveSumKernel*>(&(*ms_radix_sort_exclusive_sum_it->second));
-        if(!ms_radix_sort_exclusive_sum_ptr) { return -1; }
+        if(!ms_radix_sort_exclusive_sum_ptr)
+        {
+            return -1;
+        }
 
         cmdlist << (*ms_radix_sort_exclusive_sum_ptr)(d_bins_view).dispatch(num_passes * m_block_size);
 
@@ -418,12 +554,15 @@ class DeviceRadixSort : public LuisaModule
             details::RadixSortOneSweepModule<KeyType, ValueType, KEY_ONLY, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS, ONESWEEP_ITMES_PER_THREADS>;
         using RadixSortOneSweepKernel = RadixSortOneSweep::RadixSortOneSweepKernel;
 
-        auto onesweep_radix_sort_key = radix_sort_key + (KEY_ONLY ? "_keys" : "_pairs");
+        auto onesweep_radix_sort_key   = radix_sort_key + (KEY_ONLY ? "_keys" : "_pairs");
         auto ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(onesweep_radix_sort_key);
         if(ms_radix_sort_onesweep_it == ms_radix_sort_one_sweep_map.end())
         {
             auto shader = RadixSortOneSweep().compile(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_radix_sort_one_sweep_map.try_emplace(onesweep_radix_sort_key, std::move(shader));
             ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(onesweep_radix_sort_key);
         }
@@ -471,9 +610,8 @@ class DeviceRadixSort : public LuisaModule
             }
             if(!is_overwrite_okay && pass == 0)
             {
-                d_keys   = num_passes % 2 == 0 ?
-                               DoubleBuffer<KeyType>(d_keys_tmp, d_keys_tmp2_view) :
-                               DoubleBuffer<KeyType>(d_keys_tmp2_view, d_keys_tmp);
+                d_keys = num_passes % 2 == 0 ? DoubleBuffer<KeyType>(d_keys_tmp, d_keys_tmp2_view) :
+                                               DoubleBuffer<KeyType>(d_keys_tmp2_view, d_keys_tmp);
                 d_values = num_passes % 2 == 0 ?
                                DoubleBuffer<ValueType>(d_values_tmp, d_values_tmp2_view) :
                                DoubleBuffer<ValueType>(d_values_tmp2_view, d_values_tmp);

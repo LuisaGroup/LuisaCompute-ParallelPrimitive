@@ -58,7 +58,7 @@ template <typename T>
 struct DoubleBuffer
 {
     compute::BufferView<T> d_buffer[2];
-    int                    selector;
+    int                    selector = 0;
 
     DoubleBuffer() = default;
 
