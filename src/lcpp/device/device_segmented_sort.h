@@ -9,6 +9,7 @@
 #include <limits>
 #include <utility>
 #include <lcpp/common/type_trait.h>
+#include <lcpp/common/util_type.h>
 #include <lcpp/common/utils.h>
 #include <lcpp/device/details/scan.h>
 #include <lcpp/runtime/core.h>
@@ -179,6 +180,95 @@ class DeviceSegmentedSort : public LuisaModule
         SortKeysDescending(cmdlist, temp_storage, keys_input, keys_output, num_items, num_segments, begin_offsets, end_offsets);
     }
 
+    template <NumericT KeyT>
+    void SortKeys(CommandList&        cmdlist,
+                  BufferView<uint>    temp_storage,
+                  DoubleBuffer<KeyT>& keys,
+                  size_t              num_items,
+                  size_t              num_segments,
+                  BufferView<uint>    begin_offsets,
+                  BufferView<uint>    end_offsets)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortKeys(cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeysDescending(CommandList&        cmdlist,
+                            BufferView<uint>    temp_storage,
+                            DoubleBuffer<KeyT>& keys,
+                            size_t              num_items,
+                            size_t              num_segments,
+                            BufferView<uint>    begin_offsets,
+                            BufferView<uint>    end_offsets)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs > rhs; };
+        SortKeys(cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeys(CommandList&                      cmdlist,
+                  BufferView<uint>                  temp_storage,
+                  DoubleBuffer<KeyT>&               keys,
+                  size_t                            num_items,
+                  size_t                            num_segments,
+                  BufferView<uint>                  begin_offsets,
+                  BufferView<uint>                  end_offsets,
+                  const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        (void)temp_storage;
+        validate_key_double_buffer(keys, num_items, num_segments, begin_offsets, end_offsets);
+        if(num_items <= 1u || num_segments == 0u)
+        {
+            return;
+        }
+
+        for(size_t width = 1u; width < num_items;)
+        {
+            dispatch_key_merge(cmdlist,
+                               keys.current().subview(0u, num_items),
+                               keys.alternate().subview(0u, num_items),
+                               begin_offsets.subview(0u, num_segments),
+                               end_offsets.subview(0u, num_segments),
+                               num_items,
+                               num_segments,
+                               width,
+                               compare);
+            keys.selector ^= 1;
+            if(width > num_items / 2u)
+            {
+                break;
+            }
+            width *= 2u;
+        }
+    }
+
+    template <NumericT KeyT>
+    void StableSortKeys(CommandList&        cmdlist,
+                        BufferView<uint>    temp_storage,
+                        DoubleBuffer<KeyT>& keys,
+                        size_t              num_items,
+                        size_t              num_segments,
+                        BufferView<uint>    begin_offsets,
+                        BufferView<uint>    end_offsets)
+    {
+        SortKeys(cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets);
+    }
+
+    template <NumericT KeyT>
+    void StableSortKeysDescending(CommandList&        cmdlist,
+                                  BufferView<uint>    temp_storage,
+                                  DoubleBuffer<KeyT>& keys,
+                                  size_t              num_items,
+                                  size_t              num_segments,
+                                  BufferView<uint>    begin_offsets,
+                                  BufferView<uint>    end_offsets)
+    {
+        SortKeysDescending(cmdlist, temp_storage, keys, num_items, num_segments, begin_offsets, end_offsets);
+    }
+
     template <NumericT KeyT, NumericT ValueT>
     void SortPairs(CommandList&       cmdlist,
                    BufferView<uint>   temp_storage,
@@ -310,6 +400,103 @@ class DeviceSegmentedSort : public LuisaModule
             cmdlist, temp_storage, keys_input, keys_output, values_input, values_output, num_items, num_segments, begin_offsets, end_offsets);
     }
 
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairs(CommandList&          cmdlist,
+                   BufferView<uint>      temp_storage,
+                   DoubleBuffer<KeyT>&   keys,
+                   DoubleBuffer<ValueT>& values,
+                   size_t                num_items,
+                   size_t                num_segments,
+                   BufferView<uint>      begin_offsets,
+                   BufferView<uint>      end_offsets)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortPairs(cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairsDescending(CommandList&          cmdlist,
+                             BufferView<uint>      temp_storage,
+                             DoubleBuffer<KeyT>&   keys,
+                             DoubleBuffer<ValueT>& values,
+                             size_t                num_items,
+                             size_t                num_segments,
+                             BufferView<uint>      begin_offsets,
+                             BufferView<uint>      end_offsets)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs > rhs; };
+        SortPairs(cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairs(CommandList&                      cmdlist,
+                   BufferView<uint>                  temp_storage,
+                   DoubleBuffer<KeyT>&               keys,
+                   DoubleBuffer<ValueT>&             values,
+                   size_t                            num_items,
+                   size_t                            num_segments,
+                   BufferView<uint>                  begin_offsets,
+                   BufferView<uint>                  end_offsets,
+                   const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        (void)temp_storage;
+        validate_pair_double_buffers(keys, values, num_items, num_segments, begin_offsets, end_offsets);
+        if(num_items <= 1u || num_segments == 0u)
+        {
+            return;
+        }
+
+        for(size_t width = 1u; width < num_items;)
+        {
+            dispatch_pair_merge(cmdlist,
+                                keys.current().subview(0u, num_items),
+                                values.current().subview(0u, num_items),
+                                keys.alternate().subview(0u, num_items),
+                                values.alternate().subview(0u, num_items),
+                                begin_offsets.subview(0u, num_segments),
+                                end_offsets.subview(0u, num_segments),
+                                num_items,
+                                num_segments,
+                                width,
+                                compare);
+            keys.selector ^= 1;
+            values.selector ^= 1;
+            if(width > num_items / 2u)
+            {
+                break;
+            }
+            width *= 2u;
+        }
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void StableSortPairs(CommandList&          cmdlist,
+                         BufferView<uint>      temp_storage,
+                         DoubleBuffer<KeyT>&   keys,
+                         DoubleBuffer<ValueT>& values,
+                         size_t                num_items,
+                         size_t                num_segments,
+                         BufferView<uint>      begin_offsets,
+                         BufferView<uint>      end_offsets)
+    {
+        SortPairs(cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void StableSortPairsDescending(CommandList&          cmdlist,
+                                   BufferView<uint>      temp_storage,
+                                   DoubleBuffer<KeyT>&   keys,
+                                   DoubleBuffer<ValueT>& values,
+                                   size_t                num_items,
+                                   size_t                num_segments,
+                                   BufferView<uint>      begin_offsets,
+                                   BufferView<uint>      end_offsets)
+    {
+        SortPairsDescending(cmdlist, temp_storage, keys, values, num_items, num_segments, begin_offsets, end_offsets);
+    }
+
   private:
     template <NumericT T>
     static void validate_storage_count(size_t num_items)
@@ -432,6 +619,90 @@ class DeviceSegmentedSort : public LuisaModule
                              >= bytes_to_uint_count(GetSortPairsTempStorageBytes<KeyT, ValueT>(num_items)),
                          "DeviceSegmentedSort temporary storage is too small.");
         }
+    }
+
+    template <typename FirstT, typename SecondT>
+    static void validate_non_overlapping(BufferView<FirstT>  first,
+                                         size_t              first_count,
+                                         BufferView<SecondT> second,
+                                         size_t              second_count,
+                                         luisa::string_view  description)
+    {
+        if(first_count == 0u || second_count == 0u || first.handle() != second.handle())
+        {
+            return;
+        }
+        auto first_bytes  = first_count * sizeof(FirstT);
+        auto second_bytes = second_count * sizeof(SecondT);
+        auto first_begin  = first.offset_bytes();
+        auto second_begin = second.offset_bytes();
+        LUISA_ASSERT(first_begin <= std::numeric_limits<size_t>::max() - first_bytes
+                         && second_begin <= std::numeric_limits<size_t>::max() - second_bytes,
+                     "DeviceSegmentedSort buffer range overflow.");
+        auto first_end  = first_begin + first_bytes;
+        auto second_end = second_begin + second_bytes;
+        LUISA_ASSERT(first_end <= second_begin || second_end <= first_begin,
+                     "DeviceSegmentedSort {} ranges must not overlap.",
+                     description);
+    }
+
+    template <typename T>
+    static void validate_data_offsets(BufferView<T>      data,
+                                      size_t             num_items,
+                                      BufferView<uint>   begin_offsets,
+                                      BufferView<uint>   end_offsets,
+                                      size_t             num_segments,
+                                      luisa::string_view description)
+    {
+        validate_non_overlapping(data, num_items, begin_offsets, num_segments, description);
+        validate_non_overlapping(data, num_items, end_offsets, num_segments, description);
+    }
+
+    template <NumericT KeyT>
+    void validate_key_double_buffer(const DoubleBuffer<KeyT>& keys,
+                                    size_t                    num_items,
+                                    size_t                    num_segments,
+                                    BufferView<uint>          begin_offsets,
+                                    BufferView<uint>          end_offsets) const
+    {
+        validate_common(num_items, num_segments, begin_offsets, end_offsets);
+        validate_storage_count<KeyT>(num_items);
+        LUISA_ASSERT(keys.selector == 0 || keys.selector == 1,
+                     "DeviceSegmentedSort key DoubleBuffer selector must be 0 or 1.");
+        LUISA_ASSERT(keys.d_buffer[0].size() >= num_items,
+                     "DeviceSegmentedSort key DoubleBuffer slot 0 is too small.");
+        LUISA_ASSERT(keys.d_buffer[1].size() >= num_items,
+                     "DeviceSegmentedSort key DoubleBuffer slot 1 is too small.");
+        validate_non_overlapping(keys.d_buffer[0], num_items, keys.d_buffer[1], num_items, "key DoubleBuffer");
+        validate_data_offsets(keys.d_buffer[0], num_items, begin_offsets, end_offsets, num_segments, "key and offset");
+        validate_data_offsets(keys.d_buffer[1], num_items, begin_offsets, end_offsets, num_segments, "key and offset");
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void validate_pair_double_buffers(const DoubleBuffer<KeyT>&   keys,
+                                      const DoubleBuffer<ValueT>& values,
+                                      size_t                      num_items,
+                                      size_t                      num_segments,
+                                      BufferView<uint>            begin_offsets,
+                                      BufferView<uint>            end_offsets) const
+    {
+        validate_key_double_buffer(keys, num_items, num_segments, begin_offsets, end_offsets);
+        validate_storage_count<ValueT>(num_items);
+        LUISA_ASSERT(values.selector == 0 || values.selector == 1,
+                     "DeviceSegmentedSort value DoubleBuffer selector must be 0 or 1.");
+        LUISA_ASSERT(keys.selector == values.selector,
+                     "DeviceSegmentedSort key and value DoubleBuffer selectors must match.");
+        LUISA_ASSERT(values.d_buffer[0].size() >= num_items,
+                     "DeviceSegmentedSort value DoubleBuffer slot 0 is too small.");
+        LUISA_ASSERT(values.d_buffer[1].size() >= num_items,
+                     "DeviceSegmentedSort value DoubleBuffer slot 1 is too small.");
+        validate_non_overlapping(values.d_buffer[0], num_items, values.d_buffer[1], num_items, "value DoubleBuffer");
+        validate_non_overlapping(keys.d_buffer[0], num_items, values.d_buffer[0], num_items, "key and value");
+        validate_non_overlapping(keys.d_buffer[0], num_items, values.d_buffer[1], num_items, "key and value");
+        validate_non_overlapping(keys.d_buffer[1], num_items, values.d_buffer[0], num_items, "key and value");
+        validate_non_overlapping(keys.d_buffer[1], num_items, values.d_buffer[1], num_items, "key and value");
+        validate_data_offsets(values.d_buffer[0], num_items, begin_offsets, end_offsets, num_segments, "value and offset");
+        validate_data_offsets(values.d_buffer[1], num_items, begin_offsets, end_offsets, num_segments, "value and offset");
     }
 
     template <typename... T>

@@ -263,6 +263,178 @@ int main(int argc, char* argv[])
         }
     };
 
+    "device_segmented_sort_covers_all_double_buffer_entry_points"_test = [&]
+    {
+        luisa::vector<int>  keys{91, 3, -2, 3, 92, 8, 1, 8, 4, 93, 5, -1, 5, 2, -1, 7, 2, 5, 0};
+        luisa::vector<uint> values(item_count);
+        std::iota(values.begin(), values.end(), 0u);
+        for(uint i = 0u; i < item_count; ++i)
+        {
+            if(!is_segment_item(i))
+            {
+                keys[i]   = key_sentinel;
+                values[i] = value_sentinel;
+            }
+        }
+        auto ascending_order  = segmented_order(keys, std::less<>{});
+        auto descending_order = segmented_order(keys, std::greater<>{});
+
+        auto begins = device.create_buffer<uint>(segment_count);
+        auto ends   = device.create_buffer<uint>(segment_count);
+        stream << begins.copy_from(luisa::span{begin_offsets}) << ends.copy_from(luisa::span{end_offsets});
+
+        auto temp_bytes = DeviceSegmentedSort<>::GetSortPairsTempStorageBytes<int, uint>(item_count);
+        auto temp_storage = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        luisa::vector<int>  empty_keys(item_count, key_sentinel);
+        luisa::vector<uint> empty_values(item_count, value_sentinel);
+
+        auto run_keys = [&](auto invoke, const luisa::vector<uint>& expected_order)
+        {
+            auto              slot_0 = device.create_buffer<int>(item_count);
+            auto              slot_1 = device.create_buffer<int>(item_count);
+            DoubleBuffer<int> buffers(slot_0.view(), slot_1.view());
+            buffers.selector = 1;
+
+            CommandList commands;
+            invoke(commands, buffers);
+            expect(buffers.selector == 0);
+            stream << slot_0.copy_from(luisa::span{empty_keys})
+                   << slot_1.copy_from(luisa::span{keys}) << commands.commit();
+
+            luisa::vector<int> result(item_count);
+            stream << buffers.current().copy_to(luisa::span{result}) << synchronize();
+            for(uint i = 0u; i < item_count; ++i)
+            {
+                if(is_segment_item(i))
+                {
+                    expect(result[i] == keys[expected_order[i]]);
+                }
+                else
+                {
+                    expect(result[i] == key_sentinel);
+                }
+            }
+        };
+
+        auto run_pairs = [&](auto invoke, const luisa::vector<uint>& expected_order)
+        {
+            auto               key_slot_0   = device.create_buffer<int>(item_count);
+            auto               key_slot_1   = device.create_buffer<int>(item_count);
+            auto               value_slot_0 = device.create_buffer<uint>(item_count);
+            auto               value_slot_1 = device.create_buffer<uint>(item_count);
+            DoubleBuffer<int>  key_buffers(key_slot_0.view(), key_slot_1.view());
+            DoubleBuffer<uint> value_buffers(value_slot_0.view(), value_slot_1.view());
+
+            CommandList commands;
+            invoke(commands, key_buffers, value_buffers);
+            expect(key_buffers.selector == 1);
+            expect(value_buffers.selector == key_buffers.selector);
+            stream << key_slot_0.copy_from(luisa::span{keys})
+                   << key_slot_1.copy_from(luisa::span{empty_keys})
+                   << value_slot_0.copy_from(luisa::span{values})
+                   << value_slot_1.copy_from(luisa::span{empty_values}) << commands.commit();
+
+            luisa::vector<int>  key_result(item_count);
+            luisa::vector<uint> value_result(item_count);
+            stream << key_buffers.current().copy_to(luisa::span{key_result})
+                   << value_buffers.current().copy_to(luisa::span{value_result}) << synchronize();
+            for(uint i = 0u; i < item_count; ++i)
+            {
+                if(is_segment_item(i))
+                {
+                    expect(key_result[i] == keys[expected_order[i]]);
+                    expect(value_result[i] == values[expected_order[i]]);
+                }
+                else
+                {
+                    expect(key_result[i] == key_sentinel);
+                    expect(value_result[i] == value_sentinel);
+                }
+            }
+        };
+
+        run_keys(
+            [&](CommandList& commands, DoubleBuffer<int>& buffers)
+            {
+                segmented_sort.SortKeys(
+                    commands, temp_storage.view(), buffers, item_count, segment_count, begins.view(), ends.view());
+            },
+            ascending_order);
+        run_keys(
+            [&](CommandList& commands, DoubleBuffer<int>& buffers)
+            {
+                segmented_sort.SortKeysDescending(
+                    commands, temp_storage.view(), buffers, item_count, segment_count, begins.view(), ends.view());
+            },
+            descending_order);
+        run_keys(
+            [&](CommandList& commands, DoubleBuffer<int>& buffers)
+            {
+                segmented_sort.StableSortKeys(
+                    commands, temp_storage.view(), buffers, item_count, segment_count, begins.view(), ends.view());
+            },
+            ascending_order);
+        run_keys(
+            [&](CommandList& commands, DoubleBuffer<int>& buffers)
+            {
+                segmented_sort.StableSortKeysDescending(
+                    commands, temp_storage.view(), buffers, item_count, segment_count, begins.view(), ends.view());
+            },
+            descending_order);
+        run_pairs(
+            [&](CommandList& commands, DoubleBuffer<int>& key_buffers, DoubleBuffer<uint>& value_buffers)
+            {
+                segmented_sort.SortPairs(commands,
+                                         temp_storage.view(),
+                                         key_buffers,
+                                         value_buffers,
+                                         item_count,
+                                         segment_count,
+                                         begins.view(),
+                                         ends.view());
+            },
+            ascending_order);
+        run_pairs(
+            [&](CommandList& commands, DoubleBuffer<int>& key_buffers, DoubleBuffer<uint>& value_buffers)
+            {
+                segmented_sort.SortPairsDescending(commands,
+                                                   temp_storage.view(),
+                                                   key_buffers,
+                                                   value_buffers,
+                                                   item_count,
+                                                   segment_count,
+                                                   begins.view(),
+                                                   ends.view());
+            },
+            descending_order);
+        run_pairs(
+            [&](CommandList& commands, DoubleBuffer<int>& key_buffers, DoubleBuffer<uint>& value_buffers)
+            {
+                segmented_sort.StableSortPairs(commands,
+                                               temp_storage.view(),
+                                               key_buffers,
+                                               value_buffers,
+                                               item_count,
+                                               segment_count,
+                                               begins.view(),
+                                               ends.view());
+            },
+            ascending_order);
+        run_pairs(
+            [&](CommandList& commands, DoubleBuffer<int>& key_buffers, DoubleBuffer<uint>& value_buffers)
+            {
+                segmented_sort.StableSortPairsDescending(commands,
+                                                         temp_storage.view(),
+                                                         key_buffers,
+                                                         value_buffers,
+                                                         item_count,
+                                                         segment_count,
+                                                         begins.view(),
+                                                         ends.view());
+            },
+            descending_order);
+    };
+
     "device_segmented_radix_sort_honors_partial_bit_ranges"_test = [&]
     {
         const luisa::vector<uint> keys{
