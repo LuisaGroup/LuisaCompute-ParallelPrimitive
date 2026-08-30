@@ -3,6 +3,7 @@
 
 #include <lcpp/parallel_primitive.h>
 
+#include <array>
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
 #include <luisa/runtime/stream.h>
@@ -119,5 +120,90 @@ int main(int argc, char* argv[])
             expect(flagged_result[i] == expected_flagged[i]);
             expect(predicate_result[i] == expected_predicate[i]);
         }
+    };
+
+    "device_partition_three_way_preserves_category_order"_test = [&]
+    {
+        constexpr uint32_t     item_count = 12u;
+        luisa::vector<int32_t> input(item_count);
+        for(uint32_t i = 0u; i < item_count; ++i)
+        {
+            input[i] = static_cast<int32_t>(i);
+        }
+
+        auto input_buffer      = device.create_buffer<int32_t>(item_count);
+        auto first_output      = device.create_buffer<int32_t>(item_count);
+        auto second_output     = device.create_buffer<int32_t>(item_count);
+        auto unselected_output = device.create_buffer<int32_t>(item_count);
+        auto selected_counts   = device.create_buffer<uint32_t>(2u);
+        auto temp_bytes        = DevicePartition<>::GetThreeWayTempStorageBytes(item_count);
+        auto temp_storage      = device.create_buffer<uint32_t>(bytes_to_uint_count(temp_bytes));
+
+        Callable<bool(int32_t)> divisible_by_three = [](Int value) noexcept
+        { return value % 3 == 0; };
+        Callable<bool(int32_t)> less_than_eight = [](Int value) noexcept { return value < 8; };
+
+        CommandList commands;
+        partition.If(commands,
+                     temp_storage.view(),
+                     input_buffer.view(),
+                     first_output.view(),
+                     second_output.view(),
+                     unselected_output.view(),
+                     selected_counts.view(),
+                     item_count,
+                     divisible_by_three,
+                     less_than_eight);
+        stream << input_buffer.copy_from(luisa::span{input}) << commands.commit();
+
+        luisa::vector<int32_t>   first_result(item_count);
+        luisa::vector<int32_t>   second_result(item_count);
+        luisa::vector<int32_t>   unselected_result(item_count);
+        std::array<uint32_t, 2u> counts{};
+        stream << first_output.copy_to(luisa::span{first_result})
+               << second_output.copy_to(luisa::span{second_result})
+               << unselected_output.copy_to(luisa::span{unselected_result})
+               << selected_counts.copy_to(luisa::span{counts}) << synchronize();
+
+        constexpr std::array<int32_t, 4u> expected_first{0, 3, 6, 9};
+        constexpr std::array<int32_t, 5u> expected_second{1, 2, 4, 5, 7};
+        constexpr std::array<int32_t, 3u> expected_unselected{11, 10, 8};
+        expect(counts[0u] == expected_first.size());
+        expect(counts[1u] == expected_second.size());
+        for(size_t i = 0u; i < expected_first.size(); ++i)
+        {
+            expect(first_result[i] == expected_first[i]);
+        }
+        for(size_t i = 0u; i < expected_second.size(); ++i)
+        {
+            expect(second_result[i] == expected_second[i]);
+        }
+        for(size_t i = 0u; i < expected_unselected.size(); ++i)
+        {
+            expect(unselected_result[i] == expected_unselected[i]);
+        }
+    };
+
+    "device_partition_three_way_zero_input_writes_both_counts"_test = [&]
+    {
+        std::array<uint32_t, 2u> counts{7u, 9u};
+        auto                     count_buffer = device.create_buffer<uint32_t>(counts.size());
+        Callable<bool(int32_t)>  first        = [](Int value) noexcept { return value < 0; };
+        Callable<bool(int32_t)>  second       = [](Int value) noexcept { return value > 0; };
+        CommandList              commands;
+        partition.If(commands,
+                     BufferView<uint>{},
+                     BufferView<int32_t>{},
+                     BufferView<int32_t>{},
+                     BufferView<int32_t>{},
+                     BufferView<int32_t>{},
+                     count_buffer.view(),
+                     0u,
+                     first,
+                     second);
+        stream << count_buffer.copy_from(luisa::span{counts}) << commands.commit()
+               << count_buffer.copy_to(luisa::span{counts}) << synchronize();
+        expect(counts[0u] == 0u);
+        expect(counts[1u] == 0u);
     };
 }
