@@ -4,6 +4,7 @@
 #include <lcpp/parallel_primitive.h>
 
 #include <algorithm>
+#include <array>
 #include <boost/ut.hpp>
 #include <functional>
 #include <luisa/runtime/context.h>
@@ -143,5 +144,118 @@ int main(int argc, char* argv[])
                << output.copy_to(luisa::span{&value, 1u}) << synchronize();
         expect(value == 42);
         expect(DeviceMergeSort<>::GetSortKeysTempStorageBytes<int>(1u) == 0u);
+    };
+
+    "device_merge_sort_copy_entry_points_preserve_inputs"_test = [&]
+    {
+        constexpr uint               item_count = 9u;
+        std::array<int, item_count>  keys{4, 1, 3, 1, 2, 4, 0, 3, 2};
+        std::array<uint, item_count> values{0, 1, 2, 3, 4, 5, 6, 7, 8};
+        auto                         expected_keys = keys;
+        std::stable_sort(expected_keys.begin(), expected_keys.end(), std::greater<>{});
+        auto expected_order = values;
+        std::stable_sort(expected_order.begin(),
+                         expected_order.end(),
+                         [&](uint lhs, uint rhs) { return keys[lhs] < keys[rhs]; });
+
+        auto keys_input       = device.create_buffer<int>(item_count);
+        auto values_input     = device.create_buffer<uint>(item_count);
+        auto sorted_keys      = device.create_buffer<int>(item_count);
+        auto stable_keys      = device.create_buffer<int>(item_count);
+        auto sorted_pair_keys = device.create_buffer<int>(item_count);
+        auto sorted_values    = device.create_buffer<uint>(item_count);
+        auto temp_bytes = DeviceMergeSort<>::GetSortPairsTempStorageBytes<int, uint>(item_count);
+        auto temp       = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        Callable<bool(int, int)> greater = [](Int lhs, Int rhs) noexcept { return lhs > rhs; };
+
+        CommandList commands;
+        merge_sort.SortKeysCopy(commands, temp.view(), keys_input.view(), sorted_keys.view(), item_count, greater);
+        merge_sort.StableSortKeysCopy(commands, temp.view(), keys_input.view(), stable_keys.view(), item_count, greater);
+        merge_sort.SortPairsCopy(commands,
+                                 temp.view(),
+                                 keys_input.view(),
+                                 sorted_pair_keys.view(),
+                                 values_input.view(),
+                                 sorted_values.view(),
+                                 item_count);
+        stream << keys_input.copy_from(luisa::span{keys})
+               << values_input.copy_from(luisa::span{values}) << commands.commit();
+
+        std::array<int, item_count>  keys_after{};
+        std::array<uint, item_count> values_after{};
+        std::array<int, item_count>  sorted_keys_result{};
+        std::array<int, item_count>  stable_keys_result{};
+        std::array<int, item_count>  pair_keys_result{};
+        std::array<uint, item_count> pair_values_result{};
+        stream << keys_input.copy_to(luisa::span{keys_after})
+               << values_input.copy_to(luisa::span{values_after})
+               << sorted_keys.copy_to(luisa::span{sorted_keys_result})
+               << stable_keys.copy_to(luisa::span{stable_keys_result})
+               << sorted_pair_keys.copy_to(luisa::span{pair_keys_result})
+               << sorted_values.copy_to(luisa::span{pair_values_result}) << synchronize();
+
+        for(uint i = 0u; i < item_count; ++i)
+        {
+            expect(keys_after[i] == keys[i]);
+            expect(values_after[i] == values[i]);
+            expect(sorted_keys_result[i] == expected_keys[i]);
+            expect(stable_keys_result[i] == expected_keys[i]);
+            expect(pair_keys_result[i] == keys[expected_order[i]]);
+            expect(pair_values_result[i] == values[expected_order[i]]);
+        }
+    };
+
+    "device_merge_sort_supports_in_place_entry_points"_test = [&]
+    {
+        constexpr uint               item_count = 7u;
+        std::array<int, item_count>  keys{3, 1, 2, 1, 3, 0, 2};
+        std::array<uint, item_count> values{0, 1, 2, 3, 4, 5, 6};
+        auto                         expected_order = values;
+        std::stable_sort(expected_order.begin(),
+                         expected_order.end(),
+                         [&](uint lhs, uint rhs) { return keys[lhs] < keys[rhs]; });
+
+        auto unstable_keys      = device.create_buffer<int>(item_count);
+        auto stable_keys        = device.create_buffer<int>(item_count);
+        auto pair_keys          = device.create_buffer<int>(item_count);
+        auto pair_values        = device.create_buffer<uint>(item_count);
+        auto stable_pair_keys   = device.create_buffer<int>(item_count);
+        auto stable_pair_values = device.create_buffer<uint>(item_count);
+        auto temp_bytes = DeviceMergeSort<>::GetSortPairsTempStorageBytes<int, uint>(item_count);
+        auto temp       = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+
+        CommandList commands;
+        merge_sort.SortKeys(commands, temp.view(), unstable_keys.view(), item_count);
+        merge_sort.StableSortKeys(commands, temp.view(), stable_keys.view(), item_count);
+        merge_sort.SortPairs(commands, temp.view(), pair_keys.view(), pair_values.view(), item_count);
+        merge_sort.StableSortPairs(
+            commands, temp.view(), stable_pair_keys.view(), stable_pair_values.view(), item_count);
+        stream << unstable_keys.copy_from(luisa::span{keys}) << stable_keys.copy_from(luisa::span{keys})
+               << pair_keys.copy_from(luisa::span{keys}) << pair_values.copy_from(luisa::span{values})
+               << stable_pair_keys.copy_from(luisa::span{keys})
+               << stable_pair_values.copy_from(luisa::span{values}) << commands.commit();
+
+        std::array<int, item_count>  unstable_keys_result{};
+        std::array<int, item_count>  stable_keys_result{};
+        std::array<int, item_count>  pair_keys_result{};
+        std::array<uint, item_count> pair_values_result{};
+        std::array<int, item_count>  stable_pair_keys_result{};
+        std::array<uint, item_count> stable_pair_values_result{};
+        stream << unstable_keys.copy_to(luisa::span{unstable_keys_result})
+               << stable_keys.copy_to(luisa::span{stable_keys_result})
+               << pair_keys.copy_to(luisa::span{pair_keys_result})
+               << pair_values.copy_to(luisa::span{pair_values_result})
+               << stable_pair_keys.copy_to(luisa::span{stable_pair_keys_result})
+               << stable_pair_values.copy_to(luisa::span{stable_pair_values_result}) << synchronize();
+
+        for(uint i = 0u; i < item_count; ++i)
+        {
+            expect(unstable_keys_result[i] == keys[expected_order[i]]);
+            expect(stable_keys_result[i] == keys[expected_order[i]]);
+            expect(pair_keys_result[i] == keys[expected_order[i]]);
+            expect(pair_values_result[i] == values[expected_order[i]]);
+            expect(stable_pair_keys_result[i] == keys[expected_order[i]]);
+            expect(stable_pair_values_result[i] == values[expected_order[i]]);
+        }
     };
 }

@@ -68,6 +68,48 @@ class DeviceMergeSort : public LuisaModule
     }
 
     template <NumericT KeyT>
+    void SortKeys(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<KeyT> keys, size_t num_items)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortKeys(cmdlist, temp_storage, keys, num_items, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeys(CommandList&                      cmdlist,
+                  BufferView<uint>                  temp_storage,
+                  BufferView<KeyT>                  keys,
+                  size_t                            num_items,
+                  const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        validate_in_place_key_view(temp_storage, keys, num_items);
+        if(num_items <= 1u)
+        {
+            return;
+        }
+
+        auto scratch        = key_scratch<KeyT>(temp_storage, num_items);
+        auto source         = keys.subview(0u, num_items);
+        bool source_is_keys = true;
+        for(size_t width = 1u; width < num_items;)
+        {
+            auto destination = source_is_keys ? scratch : keys.subview(0u, num_items);
+            dispatch_key_merge(cmdlist, source, destination, num_items, width, compare);
+            source         = destination;
+            source_is_keys = !source_is_keys;
+            if(width > num_items / 2u)
+            {
+                break;
+            }
+            width *= 2u;
+        }
+        if(!source_is_keys)
+        {
+            cmdlist << keys.subview(0u, num_items).copy_from(source);
+        }
+    }
+
+    template <NumericT KeyT>
     void SortKeys(CommandList&     cmdlist,
                   BufferView<uint> temp_storage,
                   BufferView<KeyT> keys_input,
@@ -117,6 +159,22 @@ class DeviceMergeSort : public LuisaModule
     }
 
     template <NumericT KeyT>
+    void StableSortKeys(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<KeyT> keys, size_t num_items)
+    {
+        SortKeys(cmdlist, temp_storage, keys, num_items);
+    }
+
+    template <NumericT KeyT>
+    void StableSortKeys(CommandList&                      cmdlist,
+                        BufferView<uint>                  temp_storage,
+                        BufferView<KeyT>                  keys,
+                        size_t                            num_items,
+                        const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        SortKeys(cmdlist, temp_storage, keys, num_items, compare);
+    }
+
+    template <NumericT KeyT>
     void StableSortKeys(CommandList&     cmdlist,
                         BufferView<uint> temp_storage,
                         BufferView<KeyT> keys_input,
@@ -135,6 +193,58 @@ class DeviceMergeSort : public LuisaModule
                         const Callable<bool(KeyT, KeyT)>& compare)
     {
         SortKeys(cmdlist, temp_storage, keys_input, keys_output, num_items, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairs(CommandList&       cmdlist,
+                   BufferView<uint>   temp_storage,
+                   BufferView<KeyT>   keys,
+                   BufferView<ValueT> values,
+                   size_t             num_items)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortPairs(cmdlist, temp_storage, keys, values, num_items, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairs(CommandList&                      cmdlist,
+                   BufferView<uint>                  temp_storage,
+                   BufferView<KeyT>                  keys,
+                   BufferView<ValueT>                values,
+                   size_t                            num_items,
+                   const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        validate_in_place_pair_views(temp_storage, keys, values, num_items);
+        if(num_items <= 1u)
+        {
+            return;
+        }
+
+        auto [scratch_keys, scratch_values] = pair_scratch<KeyT, ValueT>(temp_storage, num_items);
+        auto source_keys                    = keys.subview(0u, num_items);
+        auto source_values                  = values.subview(0u, num_items);
+        bool source_is_input                = true;
+        for(size_t width = 1u; width < num_items;)
+        {
+            auto destination_keys = source_is_input ? scratch_keys : keys.subview(0u, num_items);
+            auto destination_values = source_is_input ? scratch_values : values.subview(0u, num_items);
+            dispatch_pair_merge(
+                cmdlist, source_keys, source_values, destination_keys, destination_values, num_items, width, compare);
+            source_keys     = destination_keys;
+            source_values   = destination_values;
+            source_is_input = !source_is_input;
+            if(width > num_items / 2u)
+            {
+                break;
+            }
+            width *= 2u;
+        }
+        if(!source_is_input)
+        {
+            cmdlist << keys.subview(0u, num_items).copy_from(source_keys)
+                    << values.subview(0u, num_items).copy_from(source_values);
+        }
     }
 
     template <NumericT KeyT, NumericT ValueT>
@@ -198,6 +308,27 @@ class DeviceMergeSort : public LuisaModule
     template <NumericT KeyT, NumericT ValueT>
     void StableSortPairs(CommandList&       cmdlist,
                          BufferView<uint>   temp_storage,
+                         BufferView<KeyT>   keys,
+                         BufferView<ValueT> values,
+                         size_t             num_items)
+    {
+        SortPairs(cmdlist, temp_storage, keys, values, num_items);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void StableSortPairs(CommandList&                      cmdlist,
+                         BufferView<uint>                  temp_storage,
+                         BufferView<KeyT>                  keys,
+                         BufferView<ValueT>                values,
+                         size_t                            num_items,
+                         const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        SortPairs(cmdlist, temp_storage, keys, values, num_items, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void StableSortPairs(CommandList&       cmdlist,
+                         BufferView<uint>   temp_storage,
                          BufferView<KeyT>   keys_input,
                          BufferView<KeyT>   keys_output,
                          BufferView<ValueT> values_input,
@@ -217,6 +348,85 @@ class DeviceMergeSort : public LuisaModule
                          size_t                            num_items,
                          const Callable<bool(KeyT, KeyT)>& compare)
     {
+        SortPairs(cmdlist, temp_storage, keys_input, keys_output, values_input, values_output, num_items, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeysCopy(CommandList&     cmdlist,
+                      BufferView<uint> temp_storage,
+                      BufferView<KeyT> keys_input,
+                      BufferView<KeyT> keys_output,
+                      size_t           num_items)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortKeysCopy(cmdlist, temp_storage, keys_input, keys_output, num_items, compare);
+    }
+
+    template <NumericT KeyT>
+    void SortKeysCopy(CommandList&                      cmdlist,
+                      BufferView<uint>                  temp_storage,
+                      BufferView<KeyT>                  keys_input,
+                      BufferView<KeyT>                  keys_output,
+                      size_t                            num_items,
+                      const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        validate_copy_range(keys_input, keys_output, num_items, "key");
+        SortKeys(cmdlist, temp_storage, keys_input, keys_output, num_items, compare);
+    }
+
+    template <NumericT KeyT>
+    void StableSortKeysCopy(CommandList&     cmdlist,
+                            BufferView<uint> temp_storage,
+                            BufferView<KeyT> keys_input,
+                            BufferView<KeyT> keys_output,
+                            size_t           num_items)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        StableSortKeysCopy(cmdlist, temp_storage, keys_input, keys_output, num_items, compare);
+    }
+
+    template <NumericT KeyT>
+    void StableSortKeysCopy(CommandList&                      cmdlist,
+                            BufferView<uint>                  temp_storage,
+                            BufferView<KeyT>                  keys_input,
+                            BufferView<KeyT>                  keys_output,
+                            size_t                            num_items,
+                            const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        validate_copy_range(keys_input, keys_output, num_items, "key");
+        StableSortKeys(cmdlist, temp_storage, keys_input, keys_output, num_items, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairsCopy(CommandList&       cmdlist,
+                       BufferView<uint>   temp_storage,
+                       BufferView<KeyT>   keys_input,
+                       BufferView<KeyT>   keys_output,
+                       BufferView<ValueT> values_input,
+                       BufferView<ValueT> values_output,
+                       size_t             num_items)
+    {
+        Callable<bool(KeyT, KeyT)> compare = [](Var<KeyT> lhs, Var<KeyT> rhs) noexcept
+        { return lhs < rhs; };
+        SortPairsCopy(cmdlist, temp_storage, keys_input, keys_output, values_input, values_output, num_items, compare);
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void SortPairsCopy(CommandList&                      cmdlist,
+                       BufferView<uint>                  temp_storage,
+                       BufferView<KeyT>                  keys_input,
+                       BufferView<KeyT>                  keys_output,
+                       BufferView<ValueT>                values_input,
+                       BufferView<ValueT>                values_output,
+                       size_t                            num_items,
+                       const Callable<bool(KeyT, KeyT)>& compare)
+    {
+        validate_copy_range(keys_input, keys_output, num_items, "key");
+        validate_copy_range(keys_input, values_output, num_items, "input-key/output-value");
+        validate_copy_range(values_input, keys_output, num_items, "input-value/output-key");
+        validate_copy_range(values_input, values_output, num_items, "value");
         SortPairs(cmdlist, temp_storage, keys_input, keys_output, values_input, values_output, num_items, compare);
     }
 
@@ -279,6 +489,54 @@ class DeviceMergeSort : public LuisaModule
                                   .template as<ValueT>()
                                   .subview(0u, num_items);
         return {scratch_keys, scratch_values};
+    }
+
+    template <NumericT KeyT>
+    void validate_in_place_key_view(BufferView<uint> temp_storage, BufferView<KeyT> keys, size_t num_items) const
+    {
+        LUISA_ASSERT(m_created, "DeviceMergeSort::create must be called before dispatch.");
+        validate_storage_count<KeyT>(num_items);
+        LUISA_ASSERT(keys.size() >= num_items, "DeviceMergeSort key view is too small.");
+        if(num_items > 1u)
+        {
+            LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(GetSortKeysTempStorageBytes<KeyT>(num_items)),
+                         "DeviceMergeSort temporary storage is too small.");
+        }
+    }
+
+    template <NumericT KeyT, NumericT ValueT>
+    void validate_in_place_pair_views(BufferView<uint>   temp_storage,
+                                      BufferView<KeyT>   keys,
+                                      BufferView<ValueT> values,
+                                      size_t             num_items) const
+    {
+        LUISA_ASSERT(m_created, "DeviceMergeSort::create must be called before dispatch.");
+        validate_storage_count<KeyT>(num_items);
+        validate_storage_count<ValueT>(num_items);
+        LUISA_ASSERT(keys.size() >= num_items, "DeviceMergeSort key view is too small.");
+        LUISA_ASSERT(values.size() >= num_items, "DeviceMergeSort value view is too small.");
+        if(num_items > 1u)
+        {
+            LUISA_ASSERT(temp_storage.size()
+                             >= bytes_to_uint_count(GetSortPairsTempStorageBytes<KeyT, ValueT>(num_items)),
+                         "DeviceMergeSort temporary storage is too small.");
+        }
+    }
+
+    template <typename InputT, typename OutputT>
+    static void validate_copy_range(BufferView<InputT> input, BufferView<OutputT> output, size_t num_items, luisa::string_view name)
+    {
+        if(num_items == 0u || input.handle() != output.handle())
+        {
+            return;
+        }
+        auto input_begin  = input.offset_bytes();
+        auto input_end    = input_begin + num_items * input.stride();
+        auto output_begin = output.offset_bytes();
+        auto output_end   = output_begin + num_items * output.stride();
+        LUISA_ASSERT(input_end <= output_begin || output_end <= input_begin,
+                     "DeviceMergeSort Copy {} input and output ranges must not overlap.",
+                     name);
     }
 
     template <NumericT KeyT>
