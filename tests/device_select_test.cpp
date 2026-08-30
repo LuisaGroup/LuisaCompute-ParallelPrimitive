@@ -157,4 +157,138 @@ int main(int argc, char* argv[])
             expect(unique_values[i] == expected_values[i]);
         }
     };
+
+    "deviceselect_flaggedif_supports_copy_and_in_place_compaction"_test = [&]
+    {
+        constexpr uint         count = 9u;
+        std::array<int, count> input{100, 101, 102, 103, 104, 105, 106, 107, 108};
+        std::array<int, count> flags{-3, -2, -1, 0, 1, 2, 3, 4, 5};
+        auto                   input_buffer   = device.create_buffer<int>(count);
+        auto                   in_place_data  = device.create_buffer<int>(count);
+        auto                   flags_buffer   = device.create_buffer<int>(count);
+        auto                   copy_output    = device.create_buffer<int>(count);
+        auto                   copy_count     = device.create_buffer<uint>(1u);
+        auto                   in_place_count = device.create_buffer<uint>(1u);
+        auto                   temp_bytes     = DeviceSelect<>::GetTempStorageBytes(count);
+        auto temp_storage = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        Callable<bool(int)> positive_odd = [](Int flag) noexcept
+        { return flag > 0 & (flag % 2 != 0); };
+
+        CommandList commands;
+        selector.FlaggedIf(commands,
+                           temp_storage.view(),
+                           input_buffer.view(),
+                           flags_buffer.view(),
+                           copy_output.view(),
+                           copy_count.view(),
+                           count,
+                           positive_odd);
+        selector.FlaggedIf(
+            commands, temp_storage.view(), in_place_data.view(), flags_buffer.view(), in_place_count.view(), count, positive_odd);
+        stream << input_buffer.copy_from(luisa::span{input}) << in_place_data.copy_from(luisa::span{input})
+               << flags_buffer.copy_from(luisa::span{flags}) << commands.commit();
+
+        std::array<int, count> copy_result{};
+        std::array<int, count> in_place_result{};
+        std::array<int, count> input_after{};
+        std::array<int, count> flags_after{};
+        uint                   copy_size     = 0u;
+        uint                   in_place_size = 0u;
+        stream << copy_output.copy_to(luisa::span{copy_result})
+               << in_place_data.copy_to(luisa::span{in_place_result})
+               << input_buffer.copy_to(luisa::span{input_after})
+               << flags_buffer.copy_to(luisa::span{flags_after})
+               << copy_count.copy_to(luisa::span{&copy_size, 1u})
+               << in_place_count.copy_to(luisa::span{&in_place_size, 1u}) << synchronize();
+
+        constexpr std::array<int, 3u> expected{104, 106, 108};
+        expect(copy_size == expected.size());
+        expect(in_place_size == expected.size());
+        for(size_t i = 0u; i < expected.size(); ++i)
+        {
+            expect(copy_result[i] == expected[i]);
+            expect(in_place_result[i] == expected[i]);
+        }
+        for(size_t i = 0u; i < input.size(); ++i)
+        {
+            expect(input_after[i] == input[i]);
+            expect(flags_after[i] == flags[i]);
+        }
+    };
+
+    "deviceselect_in_place_flagged_if_and_unique_are_stable"_test = [&]
+    {
+        constexpr uint         count = 8u;
+        std::array<int, count> aliased_flags{0, 2, 0, 3, 4, 0, 5, 0};
+        std::array<int, count> predicate_data{-3, 4, -1, 6, 0, 2, 7, -8};
+        std::array<int, count> unique_data{1, 3, 2, 4, 5, 7, 8, 10};
+        std::array<int, count> default_unique_data{1, 1, 2, 2, 2, 4, 4, 9};
+        auto                   aliased_buffer        = device.create_buffer<int>(count);
+        auto                   predicate_buffer      = device.create_buffer<int>(count);
+        auto                   unique_buffer         = device.create_buffer<int>(count);
+        auto                   default_unique_buffer = device.create_buffer<int>(count);
+        auto                   flagged_count         = device.create_buffer<uint>(1u);
+        auto                   predicate_count       = device.create_buffer<uint>(1u);
+        auto                   unique_count          = device.create_buffer<uint>(1u);
+        auto                   default_unique_count  = device.create_buffer<uint>(1u);
+        auto                   zero_count            = device.create_buffer<uint>(1u);
+        auto                   temp_bytes            = DeviceSelect<>::GetTempStorageBytes(count);
+        auto temp_storage = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        Callable<bool(int)>      positive    = [](Int value) noexcept { return value > 0; };
+        Callable<bool(int, int)> same_parity = [](Int lhs, Int rhs) noexcept
+        { return lhs % 2 == rhs % 2; };
+
+        CommandList commands;
+        selector.Flagged(commands,
+                         temp_storage.view(),
+                         aliased_buffer.view(),
+                         aliased_buffer.view(),
+                         flagged_count.view(),
+                         count);
+        selector.If(commands, temp_storage.view(), predicate_buffer.view(), predicate_count.view(), count, positive);
+        selector.Unique(commands, temp_storage.view(), unique_buffer.view(), unique_count.view(), count, same_parity);
+        selector.Unique(
+            commands, temp_storage.view(), default_unique_buffer.view(), default_unique_count.view(), count);
+        selector.If(commands, BufferView<uint>{}, BufferView<int>{}, zero_count.view(), 0u, positive);
+        stream << aliased_buffer.copy_from(luisa::span{aliased_flags})
+               << predicate_buffer.copy_from(luisa::span{predicate_data})
+               << unique_buffer.copy_from(luisa::span{unique_data})
+               << default_unique_buffer.copy_from(luisa::span{default_unique_data}) << commands.commit();
+
+        std::array<int, count> flagged_result{};
+        std::array<int, count> predicate_result{};
+        std::array<int, count> unique_result{};
+        std::array<int, count> default_unique_result{};
+        uint                   flagged_size        = 0u;
+        uint                   predicate_size      = 0u;
+        uint                   unique_size         = 0u;
+        uint                   default_unique_size = 0u;
+        uint                   zero_size           = 1u;
+        stream << aliased_buffer.copy_to(luisa::span{flagged_result})
+               << predicate_buffer.copy_to(luisa::span{predicate_result})
+               << unique_buffer.copy_to(luisa::span{unique_result})
+               << default_unique_buffer.copy_to(luisa::span{default_unique_result})
+               << flagged_count.copy_to(luisa::span{&flagged_size, 1u})
+               << predicate_count.copy_to(luisa::span{&predicate_size, 1u})
+               << unique_count.copy_to(luisa::span{&unique_size, 1u})
+               << default_unique_count.copy_to(luisa::span{&default_unique_size, 1u})
+               << zero_count.copy_to(luisa::span{&zero_size, 1u}) << synchronize();
+
+        constexpr std::array<int, 4u> expected_flagged{2, 3, 4, 5};
+        constexpr std::array<int, 4u> expected_predicate{4, 6, 2, 7};
+        constexpr std::array<int, 4u> expected_unique{1, 2, 5, 8};
+        constexpr std::array<int, 4u> expected_default_unique{1, 2, 4, 9};
+        expect(flagged_size == expected_flagged.size());
+        expect(predicate_size == expected_predicate.size());
+        expect(unique_size == expected_unique.size());
+        expect(default_unique_size == expected_default_unique.size());
+        expect(zero_size == 0u);
+        for(size_t i = 0u; i < expected_flagged.size(); ++i)
+        {
+            expect(flagged_result[i] == expected_flagged[i]);
+            expect(predicate_result[i] == expected_predicate[i]);
+            expect(unique_result[i] == expected_unique[i]);
+            expect(default_unique_result[i] == expected_default_unique[i]);
+        }
+    };
 }

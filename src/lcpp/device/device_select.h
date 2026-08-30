@@ -29,6 +29,7 @@ class DeviceSelect : public LuisaModule
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_unique_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_scatter_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_pair_scatter_shaders;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_in_place_shaders;
     luisa::shared_ptr<luisa::compute::Resource> m_zero_count_shader;
 
   public:
@@ -44,6 +45,10 @@ class DeviceSelect : public LuisaModule
 
     [[nodiscard]] static size_t GetTempStorageBytes(size_t num_items)
     {
+        if(num_items == 0u)
+        {
+            return 0u;
+        }
         return 2u * num_items * sizeof(uint) + ScanT::template GetTempStorageBytes<uint>(num_items);
     }
 
@@ -70,6 +75,19 @@ class DeviceSelect : public LuisaModule
         dispatch_scatter(cmdlist, input, output, flags, positions, num_selected_out, num_items);
     }
 
+    template <NumericT T, NumericT FlagT>
+    void Flagged(CommandList&      cmdlist,
+                 BufferView<uint>  temp_storage,
+                 BufferView<T>     data,
+                 BufferView<FlagT> selection_flags,
+                 BufferView<uint>  num_selected_out,
+                 size_t            num_items)
+    {
+        Callable<bool(FlagT)> predicate = [](Var<FlagT> flag) noexcept { return flag != FlagT{}; };
+        dispatch_in_place_flagged(
+            cmdlist, temp_storage, data, selection_flags, num_selected_out, num_items, predicate, "flagged");
+    }
+
     template <NumericT T>
     void If(CommandList&             cmdlist,
             BufferView<uint>         temp_storage,
@@ -93,6 +111,60 @@ class DeviceSelect : public LuisaModule
     }
 
     template <NumericT T>
+    void If(CommandList&             cmdlist,
+            BufferView<uint>         temp_storage,
+            BufferView<T>            data,
+            BufferView<uint>         num_selected_out,
+            size_t                   num_items,
+            const Callable<bool(T)>& predicate)
+    {
+        validate_in_place_views(temp_storage, data, num_selected_out, num_items);
+        if(num_items == 0u)
+        {
+            write_zero_count(cmdlist, num_selected_out);
+            return;
+        }
+        dispatch_in_place_if(cmdlist, data, num_selected_out, num_items, predicate);
+    }
+
+    template <NumericT T, NumericT FlagT>
+    void FlaggedIf(CommandList&                 cmdlist,
+                   BufferView<uint>             temp_storage,
+                   BufferView<T>                input,
+                   BufferView<FlagT>            selection_flags,
+                   BufferView<T>                output,
+                   BufferView<uint>             num_selected_out,
+                   size_t                       num_items,
+                   const Callable<bool(FlagT)>& predicate)
+    {
+        validate_views(temp_storage, input, output, num_selected_out, num_items);
+        LUISA_ASSERT(selection_flags.size() >= num_items, "Selection flag view is too small.");
+        if(num_items == 0u)
+        {
+            write_zero_count(cmdlist, num_selected_out);
+            return;
+        }
+
+        auto [flags, positions, scan_temp] = temp_views(temp_storage, num_items);
+        dispatch_flag_predicate(cmdlist, selection_flags, flags, num_items, predicate);
+        m_scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
+        dispatch_scatter(cmdlist, input, output, flags, positions, num_selected_out, num_items);
+    }
+
+    template <NumericT T, NumericT FlagT>
+    void FlaggedIf(CommandList&                 cmdlist,
+                   BufferView<uint>             temp_storage,
+                   BufferView<T>                data,
+                   BufferView<FlagT>            selection_flags,
+                   BufferView<uint>             num_selected_out,
+                   size_t                       num_items,
+                   const Callable<bool(FlagT)>& predicate)
+    {
+        dispatch_in_place_flagged(
+            cmdlist, temp_storage, data, selection_flags, num_selected_out, num_items, predicate, "flagged_if");
+    }
+
+    template <NumericT T>
     void Unique(CommandList&     cmdlist,
                 BufferView<uint> temp_storage,
                 BufferView<T>    input,
@@ -102,6 +174,30 @@ class DeviceSelect : public LuisaModule
     {
         Callable<bool(T, T)> equality = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs == rhs; };
         Unique(cmdlist, temp_storage, input, output, num_selected_out, num_items, equality);
+    }
+
+    template <NumericT T>
+    void Unique(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<T> data, BufferView<uint> num_selected_out, size_t num_items)
+    {
+        Callable<bool(T, T)> equality = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs == rhs; };
+        Unique(cmdlist, temp_storage, data, num_selected_out, num_items, equality);
+    }
+
+    template <NumericT T>
+    void Unique(CommandList&                cmdlist,
+                BufferView<uint>            temp_storage,
+                BufferView<T>               data,
+                BufferView<uint>            num_selected_out,
+                size_t                      num_items,
+                const Callable<bool(T, T)>& equality)
+    {
+        validate_in_place_views(temp_storage, data, num_selected_out, num_items);
+        if(num_items == 0u)
+        {
+            write_zero_count(cmdlist, num_selected_out);
+            return;
+        }
+        dispatch_in_place_unique(cmdlist, data, num_selected_out, num_items, equality);
     }
 
     template <NumericT T>
@@ -200,6 +296,20 @@ class DeviceSelect : public LuisaModule
                      "DeviceSelect temporary storage is too small.");
     }
 
+    template <NumericT T>
+    void validate_in_place_views(BufferView<uint> temp_storage,
+                                 BufferView<T>    data,
+                                 BufferView<uint> num_selected_out,
+                                 size_t           num_items) const
+    {
+        LUISA_ASSERT(m_created, "DeviceSelect::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(), "Too many items for DeviceSelect.");
+        LUISA_ASSERT(data.size() >= num_items, "In-place data view is too small.");
+        LUISA_ASSERT(num_selected_out.size() >= 1u, "Selected-count output is empty.");
+        LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(GetTempStorageBytes(num_items)),
+                     "DeviceSelect temporary storage is too small.");
+    }
+
     template <typename... T>
     [[nodiscard]] static luisa::string shader_key(luisa::string_view algorithm)
     {
@@ -273,6 +383,192 @@ class DeviceSelect : public LuisaModule
         }
         auto shader = reinterpret_cast<PredicateShader*>(&(*shader_it->second));
         cmdlist << (*shader)(input, flags).dispatch(num_items);
+    }
+
+    template <NumericT FlagT>
+    void dispatch_flag_predicate(CommandList&                 cmdlist,
+                                 BufferView<FlagT>            selection_flags,
+                                 BufferView<uint>             flags,
+                                 size_t                       num_items,
+                                 const Callable<bool(FlagT)>& predicate)
+    {
+        using PredicateShader = Shader<1, Buffer<FlagT>, Buffer<uint>>;
+        auto key              = shader_key<FlagT>("select_flag_predicate");
+        key += luisa::format("+{}", predicate.function().hash());
+        auto shader_it = m_predicate_shaders.find(key);
+        if(shader_it == m_predicate_shaders.end())
+        {
+            U<PredicateShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [predicate](BufferVar<FlagT> input, BufferVar<uint> output) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt index = dispatch_id().x;
+                             output.write(index, select(0u, 1u, predicate(input.read(index))));
+                         });
+            m_predicate_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_predicate_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<PredicateShader*>(&(*shader_it->second));
+        cmdlist << (*shader)(selection_flags, flags).dispatch(num_items);
+    }
+
+    template <NumericT T, NumericT FlagT>
+    void dispatch_in_place_flagged(CommandList&                 cmdlist,
+                                   BufferView<uint>             temp_storage,
+                                   BufferView<T>                data,
+                                   BufferView<FlagT>            selection_flags,
+                                   BufferView<uint>             num_selected_out,
+                                   size_t                       num_items,
+                                   const Callable<bool(FlagT)>& predicate,
+                                   luisa::string_view           algorithm)
+    {
+        validate_in_place_views(temp_storage, data, num_selected_out, num_items);
+        LUISA_ASSERT(selection_flags.size() >= num_items, "Selection flag view is too small.");
+        validate_in_place_flag_overlap(data, selection_flags, num_items);
+        if(num_items == 0u)
+        {
+            write_zero_count(cmdlist, num_selected_out);
+            return;
+        }
+
+        using SelectShader = Shader<1, Buffer<T>, Buffer<FlagT>, Buffer<uint>, uint>;
+        auto key           = shader_key<T, FlagT>(algorithm);
+        key += luisa::format("+{}", predicate.function().hash());
+        auto shader_it = m_in_place_shaders.find(key);
+        if(shader_it == m_in_place_shaders.end())
+        {
+            U<SelectShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [predicate](BufferVar<T>     data_buffer,
+                                     BufferVar<FlagT> flags_buffer,
+                                     BufferVar<uint>  count_output,
+                                     UInt             num_items_var) noexcept
+                         {
+                             set_block_size(details::WARP_SIZE);
+                             $if(dispatch_id().x == 0u)
+                             {
+                                 UInt write_index = 0u;
+                                 $for(index, 0u, num_items_var, 1u)
+                                 {
+                                     Var<T>     value = data_buffer.read(index);
+                                     Var<FlagT> flag  = flags_buffer.read(index);
+                                     $if(predicate(flag))
+                                     {
+                                         data_buffer.write(write_index, value);
+                                         write_index += 1u;
+                                     };
+                                 };
+                                 count_output.write(0u, write_index);
+                             };
+                         });
+            m_in_place_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_in_place_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<SelectShader*>(&(*shader_it->second));
+        cmdlist << (*shader)(data, selection_flags, num_selected_out, static_cast<uint>(num_items)).dispatch(1u);
+    }
+
+    template <NumericT T, NumericT FlagT>
+    static void validate_in_place_flag_overlap(BufferView<T> data, BufferView<FlagT> flags, size_t num_items)
+    {
+        if(num_items == 0u || data.handle() != flags.handle())
+        {
+            return;
+        }
+        auto data_begin  = data.offset_bytes();
+        auto data_end    = data_begin + num_items * data.stride();
+        auto flags_begin = flags.offset_bytes();
+        auto flags_end   = flags_begin + num_items * flags.stride();
+        auto exact_alias = data_begin == flags_begin && data.stride() == flags.stride();
+        LUISA_ASSERT(exact_alias || data_end <= flags_begin || flags_end <= data_begin,
+                     "In-place DeviceSelect data and flag ranges may only overlap by exact aliasing.");
+    }
+
+    template <NumericT T>
+    void dispatch_in_place_if(CommandList&             cmdlist,
+                              BufferView<T>            data,
+                              BufferView<uint>         num_selected_out,
+                              size_t                   num_items,
+                              const Callable<bool(T)>& predicate)
+    {
+        using SelectShader = Shader<1, Buffer<T>, Buffer<uint>, uint>;
+        auto key           = shader_key<T>("select_if_in_place");
+        key += luisa::format("+{}", predicate.function().hash());
+        auto shader_it = m_in_place_shaders.find(key);
+        if(shader_it == m_in_place_shaders.end())
+        {
+            U<SelectShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [predicate](BufferVar<T> data_buffer, BufferVar<uint> count_output, UInt num_items_var) noexcept
+                         {
+                             set_block_size(details::WARP_SIZE);
+                             $if(dispatch_id().x == 0u)
+                             {
+                                 UInt write_index = 0u;
+                                 $for(index, 0u, num_items_var, 1u)
+                                 {
+                                     Var<T> value = data_buffer.read(index);
+                                     $if(predicate(value))
+                                     {
+                                         data_buffer.write(write_index, value);
+                                         write_index += 1u;
+                                     };
+                                 };
+                                 count_output.write(0u, write_index);
+                             };
+                         });
+            m_in_place_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_in_place_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<SelectShader*>(&(*shader_it->second));
+        cmdlist << (*shader)(data, num_selected_out, static_cast<uint>(num_items)).dispatch(1u);
+    }
+
+    template <NumericT T>
+    void dispatch_in_place_unique(CommandList&                cmdlist,
+                                  BufferView<T>               data,
+                                  BufferView<uint>            num_selected_out,
+                                  size_t                      num_items,
+                                  const Callable<bool(T, T)>& equality)
+    {
+        using UniqueShader = Shader<1, Buffer<T>, Buffer<uint>, uint>;
+        auto key           = shader_key<T>("select_unique_in_place");
+        key += luisa::format("+{}", equality.function().hash());
+        auto shader_it = m_in_place_shaders.find(key);
+        if(shader_it == m_in_place_shaders.end())
+        {
+            U<UniqueShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [equality](BufferVar<T> data_buffer, BufferVar<uint> count_output, UInt num_items_var) noexcept
+                         {
+                             set_block_size(details::WARP_SIZE);
+                             $if(dispatch_id().x == 0u)
+                             {
+                                 Var<T> previous    = data_buffer.read(0u);
+                                 UInt   write_index = 1u;
+                                 $for(index, 1u, num_items_var, 1u)
+                                 {
+                                     Var<T> value = data_buffer.read(index);
+                                     $if(!equality(previous, value))
+                                     {
+                                         data_buffer.write(write_index, value);
+                                         write_index += 1u;
+                                     };
+                                     previous = value;
+                                 };
+                                 count_output.write(0u, write_index);
+                             };
+                         });
+            m_in_place_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_in_place_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<UniqueShader*>(&(*shader_it->second));
+        cmdlist << (*shader)(data, num_selected_out, static_cast<uint>(num_items)).dispatch(1u);
     }
 
     template <NumericT T>
