@@ -43,6 +43,7 @@
 // device level
 #include <lcpp/device/device_adjacent_difference.h>
 #include <lcpp/device/device_copy.h>
+#include <lcpp/device/device_find.h>
 #include <lcpp/device/device_for.h>
 #include <lcpp/device/device_histogram.h>
 #include <lcpp/device/device_merge_sort.h>

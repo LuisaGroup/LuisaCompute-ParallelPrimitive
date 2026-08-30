@@ -141,6 +141,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **BlockShuffle** - Offset, up, and down shuffles
 
 ### ✅ Device Level
+- [x] **DeviceFind** - First-match search and batched lower/upper bounds
 - [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
 - [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
 - [x] **DeviceRadixSort** - OneSweep key/pair sorting with ascending, descending, and bit-range interfaces
