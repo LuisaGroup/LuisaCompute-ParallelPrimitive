@@ -46,6 +46,22 @@ class ThreadReduce : public LuisaModule
         };
         return ThreadReduce<Type4Byte, ITEMS_PER_THREAD + 1>().Reduce(temp, op);
     };
+
+    template <typename ReduceOp>
+    Var<Type4Byte> ReducePartial(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                                 ReduceOp                                              op,
+                                 compute::UInt                                         valid_items)
+    {
+        Var<Type4Byte> result = input[0];
+        $for(i, 1u, compute::UInt(ITEMS_PER_THREAD))
+        {
+            $if(i < valid_items)
+            {
+                result = op(result, input[i]);
+            };
+        };
+        return result;
+    };
 };
 
 

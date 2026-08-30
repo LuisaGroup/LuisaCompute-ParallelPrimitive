@@ -421,4 +421,247 @@ int main(int argc, char* argv[])
             expect(tail_segment_result[base + 6u] == 15);
         }
     };
+
+    "warp_partial_scans_and_fixed_range_reductions_match_cub_semantics"_test = [&]
+    {
+        constexpr uint logical_warp_size  = 8u;
+        constexpr uint warp_item_count    = 32u;
+        constexpr uint partial_rows       = 17u;
+        constexpr uint logical_warp_count = warp_item_count / logical_warp_size;
+        auto           partial_buffer = device.create_buffer<int>(partial_rows * warp_item_count);
+        auto           range_reduce_buffer = device.create_buffer<int>(4u * logical_warp_count);
+        luisa::vector<int> partial_result(partial_rows * warp_item_count);
+        luisa::vector<int> range_reduce_result(4u * logical_warp_count);
+
+        Kernel1D kernel = [](BufferVar<int> partial_out, BufferVar<int> range_reduce_out) noexcept
+        {
+            set_block_size(32u);
+            UInt index = dispatch_id().x;
+            UInt lane  = warp_lane_id() % 8u;
+            Int  value = cast<int>(lane + 1u);
+            auto add   = [](const Int& lhs, const Int& rhs) noexcept { return lhs + rhs; };
+
+            Int inclusive                = -99;
+            Int inclusive_init           = -99;
+            Int inclusive_aggregate      = -99;
+            Int inclusive_init_aggregate = -99;
+            Int exclusive                = -99;
+            Int exclusive_init           = -99;
+            Int exclusive_aggregate      = -99;
+            Int exclusive_init_aggregate = -99;
+            Int scan_inclusive           = -99;
+            Int scan_exclusive           = -99;
+            Int scan_init_inclusive      = -99;
+            Int scan_init_exclusive      = -99;
+            Int shared_inclusive         = -99;
+            Int aggregate_0              = -99;
+            Int aggregate_1              = -99;
+            Int aggregate_2              = -99;
+            Int aggregate_3              = -99;
+
+            WarpScan<int, 8u> scan;
+            scan.InclusiveScanPartial(value, inclusive, add, 5u);
+            scan.InclusiveScanPartial(value, inclusive_init, 10, add, 5u);
+            scan.InclusiveScanPartial(value, inclusive_aggregate, add, 5u, aggregate_0);
+            scan.InclusiveScanPartial(value, inclusive_init_aggregate, 10, add, 5u, aggregate_1);
+            scan.ExclusiveScanPartial(value, exclusive, add, 5u);
+            scan.ExclusiveScanPartial(value, exclusive_init, 10, add, 5u);
+            scan.ExclusiveScanPartial(value, exclusive_aggregate, add, 5u, aggregate_2);
+            scan.ExclusiveScanPartial(value, exclusive_init_aggregate, 10, add, 5u, aggregate_3);
+            scan.ScanPartial(value, scan_inclusive, scan_exclusive, add, 5u);
+            scan.ScanPartial(value, scan_init_inclusive, scan_init_exclusive, 10, add, 5u);
+            WarpScan<int, 8u, WarpScanAlgorithm::WARP_SHARED_MEMORY>().InclusiveScanPartial(
+                value, shared_inclusive, add, 5u);
+
+            Int outputs[]{inclusive,
+                          inclusive_init,
+                          inclusive_aggregate,
+                          inclusive_init_aggregate,
+                          exclusive,
+                          exclusive_init,
+                          exclusive_aggregate,
+                          exclusive_init_aggregate,
+                          scan_inclusive,
+                          scan_exclusive,
+                          scan_init_inclusive,
+                          scan_init_exclusive,
+                          shared_inclusive,
+                          aggregate_0,
+                          aggregate_1,
+                          aggregate_2,
+                          aggregate_3};
+            for(uint row = 0u; row < 17u; ++row)
+            {
+                partial_out.write(row * 32u + index, outputs[row]);
+            }
+
+            ArrayVar<int, 3u> lane_items;
+            for(uint item = 0u; item < 3u; ++item)
+            {
+                lane_items[item] = cast<int>(lane * 3u + item + 1u);
+            }
+            WarpReduce<int, 8u> reduce;
+            Int                 range_sum    = reduce.Sum(lane_items);
+            Int                 range_reduce = reduce.Reduce(lane_items, add);
+            Int                 range_min    = reduce.Min(lane_items);
+            Int                 range_max    = reduce.Max(lane_items);
+            $if(lane == 0u)
+            {
+                UInt base = index / 8u * 4u;
+                range_reduce_out.write(base, range_sum);
+                range_reduce_out.write(base + 1u, range_reduce);
+                range_reduce_out.write(base + 2u, range_min);
+                range_reduce_out.write(base + 3u, range_max);
+            };
+        };
+
+        auto shader = device.compile(kernel);
+        stream << shader(partial_buffer, range_reduce_buffer).dispatch(warp_item_count)
+               << partial_buffer.copy_to(luisa::span{partial_result})
+               << range_reduce_buffer.copy_to(luisa::span{range_reduce_result}) << synchronize();
+
+        constexpr int inclusive_expected[]{1, 3, 6, 10, 15};
+        constexpr int inclusive_init_expected[]{11, 13, 16, 20, 25};
+        constexpr int exclusive_expected[]{-99, 1, 3, 6, 10};
+        constexpr int exclusive_init_expected[]{10, 11, 13, 16, 20};
+        for(uint logical_warp = 0u; logical_warp < logical_warp_count; ++logical_warp)
+        {
+            uint base = logical_warp * logical_warp_size;
+            for(uint lane = 0u; lane < logical_warp_size; ++lane)
+            {
+                auto at = [&](uint row) -> int
+                { return partial_result[row * warp_item_count + base + lane]; };
+                if(lane < 5u)
+                {
+                    expect(at(0u) == inclusive_expected[lane]);
+                    expect(at(1u) == inclusive_init_expected[lane]);
+                    expect(at(2u) == inclusive_expected[lane]);
+                    expect(at(3u) == inclusive_init_expected[lane]);
+                    expect(at(4u) == exclusive_expected[lane]);
+                    expect(at(5u) == exclusive_init_expected[lane]);
+                    expect(at(6u) == exclusive_expected[lane]);
+                    expect(at(7u) == exclusive_init_expected[lane]);
+                    expect(at(8u) == inclusive_expected[lane]);
+                    expect(at(9u) == exclusive_expected[lane]);
+                    expect(at(10u) == inclusive_init_expected[lane]);
+                    expect(at(11u) == exclusive_init_expected[lane]);
+                    expect(at(12u) == inclusive_expected[lane]);
+                }
+                else
+                {
+                    for(uint row = 0u; row < 13u; ++row)
+                    {
+                        expect(at(row) == -99);
+                    }
+                }
+                expect(at(13u) == 15);
+                expect(at(14u) == 15);
+                expect(at(15u) == 15);
+                expect(at(16u) == 15);
+            }
+
+            expect(range_reduce_result[logical_warp * 4u] == 300);
+            expect(range_reduce_result[logical_warp * 4u + 1u] == 300);
+            expect(range_reduce_result[logical_warp * 4u + 2u] == 1);
+            expect(range_reduce_result[logical_warp * 4u + 3u] == 24);
+        }
+    };
+
+    "warp_batched_reduce_supports_lane_striped_and_blocked_outputs"_test = [&]
+    {
+        constexpr uint     logical_warp_size = 4u;
+        constexpr uint     warp_item_count   = 32u;
+        constexpr uint     output_rows       = 10u;
+        auto               output_buffer = device.create_buffer<int>(output_rows * warp_item_count);
+        luisa::vector<int> result(output_rows * warp_item_count);
+
+        Kernel1D kernel = [](BufferVar<int> output) noexcept
+        {
+            set_block_size(32u);
+            UInt index   = dispatch_id().x;
+            UInt lane    = warp_lane_id() % 4u;
+            auto add     = [](const Int& lhs, const Int& rhs) noexcept { return lhs + rhs; };
+            auto maximum = [](const Int& lhs, const Int& rhs) noexcept
+            { return compute::max(lhs, rhs); };
+
+            ArrayVar<int, 6u> inputs;
+            for(uint batch = 0u; batch < 6u; ++batch)
+            {
+                inputs[batch] = cast<int>(batch * 10u + lane + 1u);
+            }
+            ArrayVar<int, 2u> striped_sum;
+            ArrayVar<int, 2u> blocked_sum;
+            ArrayVar<int, 2u> striped_max;
+            ArrayVar<int, 2u> blocked_max;
+            for(uint item = 0u; item < 2u; ++item)
+            {
+                striped_sum[item] = -99;
+                blocked_sum[item] = -99;
+                striped_max[item] = -99;
+                blocked_max[item] = -99;
+            }
+
+            WarpReduceBatched<int, 6u, 4u> batched;
+            batched.SumToStriped(inputs, striped_sum);
+            batched.SumToBlocked(inputs, blocked_sum);
+            batched.ReduceToStriped(inputs, striped_max, maximum);
+            batched.ReduceToBlocked(inputs, blocked_max, maximum);
+
+            ArrayVar<int, 3u> direct_inputs;
+            for(uint batch = 0u; batch < 3u; ++batch)
+            {
+                direct_inputs[batch] = cast<int>(batch * 10u + lane + 1u);
+            }
+            WarpReduceBatched<int, 3u, 4u> direct;
+            Int                            direct_sum = direct.Sum(direct_inputs);
+            Int                            direct_max = direct.Reduce(direct_inputs, maximum);
+
+            ArrayVar<int, 0u> empty_inputs;
+            ArrayVar<int, 0u> empty_outputs;
+            WarpReduceBatched<int, 0u, 4u>().SumToStriped(empty_inputs, empty_outputs);
+            WarpReduceBatched<int, 0u, 4u>().SumToBlocked(empty_inputs, empty_outputs);
+
+            Int outputs[]{striped_sum[0],
+                          striped_sum[1],
+                          blocked_sum[0],
+                          blocked_sum[1],
+                          striped_max[0],
+                          striped_max[1],
+                          blocked_max[0],
+                          blocked_max[1],
+                          direct_sum,
+                          direct_max};
+            for(uint row = 0u; row < 10u; ++row)
+            {
+                output.write(row * 32u + index, outputs[row]);
+            }
+        };
+
+        auto shader = device.compile(kernel);
+        stream << shader(output_buffer).dispatch(warp_item_count)
+               << output_buffer.copy_to(luisa::span{result}) << synchronize();
+
+        constexpr int striped_sum_expected[][2]{{10, 170}, {50, 210}, {90, -99}, {130, -99}};
+        constexpr int blocked_sum_expected[][2]{{10, 50}, {90, 130}, {170, 210}, {-99, -99}};
+        constexpr int striped_max_expected[][2]{{4, 44}, {14, 54}, {24, -99}, {34, -99}};
+        constexpr int blocked_max_expected[][2]{{4, 14}, {24, 34}, {44, 54}, {-99, -99}};
+        for(uint index = 0u; index < warp_item_count; ++index)
+        {
+            uint lane = index % logical_warp_size;
+            auto at   = [&](uint row) -> int { return result[row * warp_item_count + index]; };
+            expect(at(0u) == striped_sum_expected[lane][0]);
+            expect(at(1u) == striped_sum_expected[lane][1]);
+            expect(at(2u) == blocked_sum_expected[lane][0]);
+            expect(at(3u) == blocked_sum_expected[lane][1]);
+            expect(at(4u) == striped_max_expected[lane][0]);
+            expect(at(5u) == striped_max_expected[lane][1]);
+            expect(at(6u) == blocked_max_expected[lane][0]);
+            expect(at(7u) == blocked_max_expected[lane][1]);
+            if(lane < 3u)
+            {
+                expect(at(8u) == 10 + static_cast<int>(lane) * 40);
+                expect(at(9u) == 4 + static_cast<int>(lane) * 10);
+            }
+        }
+    };
 };

@@ -15,10 +15,13 @@
 #include <lcpp/thread/thread_load.h>
 #include <lcpp/thread/thread_reduce.h>
 #include <lcpp/thread/thread_scan.h>
+#include <lcpp/thread/thread_search.h>
+#include <lcpp/thread/thread_sort.h>
 #include <lcpp/thread/thread_store.h>
 // warp level
 #include <lcpp/warp/warp_scan.h>
 #include <lcpp/warp/warp_reduce.h>
+#include <lcpp/warp/warp_reduce_batched.h>
 #include <lcpp/warp/warp_exchange.h>
 #include <lcpp/warp/warp_load.h>
 #include <lcpp/warp/warp_merge_sort.h>

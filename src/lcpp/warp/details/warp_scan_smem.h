@@ -124,6 +124,19 @@ class WarpScanSmem : public LuisaModule
         finish();
     }
 
+    template <typename ScanOp>
+    void InclusiveScanPartial(const compute::Var<T>& input,
+                              compute::Var<T>&       inclusive_output,
+                              compute::Var<T>&       warp_aggregate,
+                              ScanOp                 scan_op,
+                              compute::UInt          valid_items) const
+    {
+        prepare(input);
+        inclusive_output = inclusive_partial(scan_op, valid_items);
+        warp_aggregate   = aggregate_partial(scan_op, valid_items);
+        finish();
+    }
+
     compute::Var<T> Broadcast(const compute::Var<T>& input, compute::UInt source_lane) const
     {
         prepare(input);
@@ -163,6 +176,22 @@ class WarpScanSmem : public LuisaModule
         $for(source_lane, compute::UInt(0u), lane + 1u)
         {
             result = scan_op(result, m_shared_mem->read(base + source_lane));
+        };
+        return result;
+    }
+
+    template <typename ScanOp>
+    compute::Var<T> inclusive_partial(ScanOp scan_op, compute::UInt valid_items) const
+    {
+        compute::UInt   base   = logical_warp_base();
+        compute::UInt   lane   = logical_lane();
+        compute::Var<T> result = m_shared_mem->read(base);
+        $if(lane < valid_items)
+        {
+            $for(source_lane, compute::UInt(1u), lane + 1u)
+            {
+                result = scan_op(result, m_shared_mem->read(base + source_lane));
+            };
         };
         return result;
     }
@@ -209,6 +238,19 @@ class WarpScanSmem : public LuisaModule
         compute::UInt   base   = logical_warp_base();
         compute::Var<T> result = m_shared_mem->read(base);
         $for(source_lane, compute::UInt(1u), compute::UInt(LOGICAL_WARP_SIZE))
+        {
+            result = scan_op(result, m_shared_mem->read(base + source_lane));
+        };
+        return result;
+    }
+
+    template <typename ScanOp>
+    compute::Var<T> aggregate_partial(ScanOp scan_op, compute::UInt valid_items) const
+    {
+        compute::UInt   base          = logical_warp_base();
+        compute::Var<T> result        = m_shared_mem->read(base);
+        compute::UInt   clamped_items = compute::min(valid_items, compute::UInt(LOGICAL_WARP_SIZE));
+        $for(source_lane, compute::UInt(1u), clamped_items)
         {
             result = scan_op(result, m_shared_mem->read(base + source_lane));
         };

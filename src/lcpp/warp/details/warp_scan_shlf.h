@@ -137,6 +137,18 @@ namespace details
             exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
         }
 
+        template <typename ScanOp>
+        void InclusiveScanPartial(const Var<Type4Byte>& thread_input,
+                                  Var<Type4Byte>&       inclusive_output,
+                                  Var<Type4Byte>&       warp_aggregate,
+                                  ScanOp                scan_op,
+                                  UInt                  valid_items)
+        {
+            inclusive_output = inclusive_partial_result(thread_input, scan_op, valid_items);
+            UInt last_lane = compute::min(compute::max(valid_items, 1u), UInt(LOGIC_WARP_SIZE)) - 1u;
+            warp_aggregate = WarpReadLane(inclusive_output, logical_warp_base() + last_lane);
+        }
+
       private:
         static UInt logical_warp_base()
         {
@@ -160,6 +172,23 @@ namespace details
                 Var<Type4Byte> candidate = WarpReadLane(result, source_lane);
                 Var<Type4Byte> combined  = scan_op(candidate, result);
                 result                   = compute::select(result, combined, lane >= UInt(offset));
+            }
+            return result;
+        }
+
+        template <typename ScanOp>
+        static Var<Type4Byte> inclusive_partial_result(const Var<Type4Byte>& thread_input, ScanOp scan_op, UInt valid_items)
+        {
+            UInt           warp_base = logical_warp_base();
+            UInt           lane      = logical_lane();
+            Var<Type4Byte> result    = WarpReadLane(thread_input, warp_base);
+            for(size_t source = 1u; source < LOGIC_WARP_SIZE; ++source)
+            {
+                Var<Type4Byte> candidate = WarpReadLane(thread_input, warp_base + UInt(source));
+                $if(lane < valid_items & UInt(source) <= lane)
+                {
+                    result = scan_op(result, candidate);
+                };
             }
             return result;
         }

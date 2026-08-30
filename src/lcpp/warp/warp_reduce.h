@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/var.h>
 #include <lcpp/common/type_trait.h>
@@ -14,6 +16,7 @@
 #include <luisa/dsl/builtin.h>
 #include <lcpp/warp/details/warp_reduce_smem.h>
 #include <lcpp/warp/details/warp_reduce_shlf.h>
+#include <lcpp/thread/thread_reduce.h>
 
 namespace luisa::parallel_primitive
 {
@@ -56,12 +59,26 @@ class WarpReduce : public LuisaModule
         }
     }
 
+    template <size_t ITEMS_PER_THREAD, typename ReduceOp>
+    Var<Type4Byte> Reduce(const compute::Var<std::array<Type4Byte, ITEMS_PER_THREAD>>& input, ReduceOp op)
+    {
+        Var<Type4Byte> thread_reduction = ThreadReduce<Type4Byte, ITEMS_PER_THREAD>().Reduce(input, op);
+        return Reduce(thread_reduction, op);
+    }
+
     Var<Type4Byte> Sum(const Var<Type4Byte>& lane_value, compute::UInt valid_item = WARP_SIZE)
     {
         return Reduce(
             lane_value,
             [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; },
             valid_item);
+    }
+
+    template <size_t ITEMS_PER_THREAD>
+    Var<Type4Byte> Sum(const compute::Var<std::array<Type4Byte, ITEMS_PER_THREAD>>& input)
+    {
+        return Reduce(input,
+                      [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept { return a + b; });
     }
 
     Var<Type4Byte> Min(const Var<Type4Byte>& lane_value, compute::UInt valid_item = WARP_SIZE)
@@ -73,6 +90,14 @@ class WarpReduce : public LuisaModule
             valid_item);
     }
 
+    template <size_t ITEMS_PER_THREAD>
+    Var<Type4Byte> Min(const compute::Var<std::array<Type4Byte, ITEMS_PER_THREAD>>& input)
+    {
+        return Reduce(input,
+                      [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept
+                      { return compute::min(a, b); });
+    }
+
     Var<Type4Byte> Max(const Var<Type4Byte>& lane_value, compute::UInt valid_item = WARP_SIZE)
     {
         return Reduce(
@@ -80,6 +105,14 @@ class WarpReduce : public LuisaModule
             [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept
             { return compute::max(a, b); },
             valid_item);
+    }
+
+    template <size_t ITEMS_PER_THREAD>
+    Var<Type4Byte> Max(const compute::Var<std::array<Type4Byte, ITEMS_PER_THREAD>>& input)
+    {
+        return Reduce(input,
+                      [](const Var<Type4Byte>& a, const Var<Type4Byte>& b) noexcept
+                      { return compute::max(a, b); });
     }
 
     // head segment reduce

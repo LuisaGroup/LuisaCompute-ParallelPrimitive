@@ -24,7 +24,7 @@ class ThreadScan : public LuisaModule
 
     template <typename ScanOp>
     Var<Type4Byte> ThreadScanExclusive(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
                                        ScanOp         scan_op,
                                        Var<Type4Byte> prefix,
                                        compute::Bool  apply_prefix = true)
@@ -44,30 +44,31 @@ class ThreadScan : public LuisaModule
 
 
     template <typename ScanOp>
-    Var<Type4Byte> ThreadScanExclusivePartial(
-        const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-        compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
-        ScanOp                                                scan_op,
-        compute::UInt                                         valid_items,
-        Var<Type4Byte>                                        prefix,
-        compute::Bool apply_prefix = true)
+    Var<Type4Byte> ThreadScanExclusivePartial(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                                              compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                              ScanOp         scan_op,
+                                              compute::UInt  valid_items,
+                                              Var<Type4Byte> prefix,
+                                              compute::Bool  apply_prefix = true)
     {
         Var<Type4Byte> inclusive = input[0];
-        $if(valid_items > 0 & apply_prefix)
+        $if(valid_items > 0u)
         {
-            inclusive = scan_op(prefix, input[0]);
+            $if(apply_prefix)
+            {
+                inclusive = scan_op(prefix, input[0]);
+            };
+            output[0] = prefix;
         };
-
-        output[0] = prefix;
 
         Var<Type4Byte> exclusive = inclusive;
 
-        return ThreadScanExclusive(input, output, inclusive, exclusive, scan_op, 1u);
+        return thread_scan_exclusive_partial(input, output, inclusive, exclusive, scan_op, valid_items, 1u);
     };
 
     template <typename ScanOp>
     Var<Type4Byte> ThreadScanInclusive(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
                                        ScanOp         scan_op,
                                        Var<Type4Byte> prefix,
                                        compute::Bool  apply_prefix = true)
@@ -82,10 +83,31 @@ class ThreadScan : public LuisaModule
         return ThreadScanInclusive(input, output, inclusive, scan_op, 1u);
     };
 
+    template <typename ScanOp>
+    Var<Type4Byte> ThreadScanInclusivePartial(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                                              compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                              ScanOp         scan_op,
+                                              compute::UInt  valid_items,
+                                              Var<Type4Byte> prefix,
+                                              compute::Bool  apply_prefix = true)
+    {
+        Var<Type4Byte> inclusive = input[0];
+        $if(valid_items > 0u)
+        {
+            $if(apply_prefix)
+            {
+                inclusive = scan_op(prefix, inclusive);
+            };
+            output[0] = inclusive;
+        };
+
+        return thread_scan_inclusive_partial(input, output, inclusive, scan_op, valid_items, 1u);
+    };
+
   private:
     template <typename ScanOp>
     Var<Type4Byte> ThreadScanExclusive(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
                                        Var<Type4Byte> inclusive,
                                        Var<Type4Byte> exclusive,
                                        ScanOp         scan_op,
@@ -103,14 +125,13 @@ class ThreadScan : public LuisaModule
     };
 
     template <typename ScanOp>
-    Var<Type4Byte> ThreadScanExclusivePartial(
-        const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-        compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
-        Var<Type4Byte>                                        inclusive,
-        Var<Type4Byte>                                        exclusive,
-        ScanOp                                                scan_op,
-        compute::UInt                                         valid_items,
-        compute::UInt                                         start_index = 1u)
+    Var<Type4Byte> thread_scan_exclusive_partial(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                                                 compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                                 Var<Type4Byte> inclusive,
+                                                 Var<Type4Byte> exclusive,
+                                                 ScanOp         scan_op,
+                                                 compute::UInt  valid_items,
+                                                 compute::UInt  start_index = 1u)
     {
         $for(i, start_index, compute::UInt(ITEMS_PER_THREAD))
         {
@@ -128,7 +149,7 @@ class ThreadScan : public LuisaModule
 
     template <typename ScanOp>
     Var<Type4Byte> ThreadScanInclusive(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
-                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                       compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>&       output,
                                        Var<Type4Byte> inclusive,
                                        ScanOp         scan_op,
                                        compute::UInt  start_index = 1u)
@@ -138,6 +159,25 @@ class ThreadScan : public LuisaModule
             inclusive = scan_op(inclusive, input[i]);
 
             output[i] = inclusive;
+        };
+        return inclusive;
+    };
+
+    template <typename ScanOp>
+    Var<Type4Byte> thread_scan_inclusive_partial(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& input,
+                                                 compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& output,
+                                                 Var<Type4Byte> inclusive,
+                                                 ScanOp         scan_op,
+                                                 compute::UInt  valid_items,
+                                                 compute::UInt  start_index = 1u)
+    {
+        $for(i, start_index, compute::UInt(ITEMS_PER_THREAD))
+        {
+            $if(i < valid_items)
+            {
+                inclusive = scan_op(inclusive, input[i]);
+                output[i] = inclusive;
+            };
         };
         return inclusive;
     };
