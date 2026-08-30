@@ -10,7 +10,7 @@ A high-performance GPU parallel primitives library built on [LuisaCompute](https
 LCPP provides a comprehensive set of parallel primitives organized in a hierarchical architecture:
 
 ```
-Device Level  → Reduce, Scan, Sort, Select, Partition, RLE, Copy, SpMV
+Device Level  → Reduce, Scan, Sort, Select, Partition, Find, Transform, Copy, RLE, SpMV
        ↓
 Agent Layer   → Algorithm policy management (e.g., OneSweepSmallKeyTunedPolicy)
        ↓
@@ -18,7 +18,7 @@ Block Level   → Reduce, Scan, Load/Store, Exchange, Sort, Histogram, Shuffle
        ↓
 Warp Level    → Reduce, Scan, Exchange, Load/Store, MergeSort (32 threads)
        ↓
-Thread Level  → Reduce, Scan, Load, Store
+Thread Level  → Reduce, Scan, Search, Sort, Load, Store
 ```
 
 ### Key Features
@@ -28,7 +28,7 @@ Thread Level  → Reduce, Scan, Load, Store
 - **Lazy compilation** - Shaders are compiled on-demand using the `lazy_compile` macro
 - **Flexible algorithms** - Multiple algorithm implementations (SHARED_MEMORY, WARP_SHUFFLE)
 - **Type-safe** - Modern C++20 with strong type checking
-- **Performance-focused** - Optimized policies and tuning parameters
+- **Portable semantics first** - Optimized policies where available, with portable fallbacks
 
 ## Build
 
@@ -111,28 +111,28 @@ stream << cmdlist.commit() << synchronize();
 ## Implemented Features
 
 ### ✅ Thread Level
-- [x] **ThreadReduce** - Thread-level reduction operations
-- [x] **ThreadScan** - Thread-level scan (prefix sum) operations
+- [x] **ThreadReduce** - Full and partial fixed-array reductions
+- [x] **ThreadScan** - Full and partial inclusive/exclusive fixed-array scans
 - [x] **ThreadSearch** - Lower/upper-bound and merge-path searches
 - [x] **ThreadSort** - Stable key and key-value odd-even sorting
 - [x] **ThreadLoad / ThreadStore** - Cache-modifier-compatible scalar access
 
 ### ✅ Warp Level (32 threads)
-- [x] **WarpReduce** - Warp-level reduction (Sum, Min, Max, custom operators)
+- [x] **WarpReduce** - Scalar/array, valid-item, and head/tail-segmented reductions
 - [x] **WarpReduceBatched** - Independent batched reductions with direct, striped, and blocked layouts
-- [x] **WarpScan** - Warp-level inclusive/exclusive scan
+- [x] **WarpScan** - Full and partial inclusive/exclusive scans and broadcast
 - [x] **WarpExchange** - Data exchange patterns within a warp
 - [x] **WarpLoad / WarpStore** - Blocked, striped, and transpose I/O
 - [x] **WarpMergeSort** - Stable key and key-value merge sort
 
 ### ✅ Block Level (typically 256 threads)
 - [x] **BlockReduce** - Block-level reduction with SHARED_MEMORY and WARP_SHUFFLE algorithms
-- [x] **BlockScan** - Block-level inclusive/exclusive scan with prefix callback support
+- [x] **BlockScan** - Inclusive/exclusive scans, aggregates, initial values, and prefix callbacks
 - [x] **BlockLoad** - Efficient block-wide data loading (DIRECT, STRIPED modes)
 - [x] **BlockStore** - Efficient block-wide data storing
 - [x] **BlockExchange** - Data rearrangement within a block
 - [x] **BlockRadixRank** - Ranking operations for radix sort
-- [x] **BlockRadixSort** - Ascending/descending key and pair sorting
+- [x] **BlockRadixSort** - Numeric/decomposed key and pair sorting with bit ranges and layout conversion
 - [x] **BlockDiscontinuity** - Flag head/tail discontinuities in sequences
 - [x] **BlockAdjacentDifference** - Left/right differences and flags
 - [x] **BlockHistogram** - Sort and atomic histogram policies
@@ -141,37 +141,38 @@ stream << cmdlist.commit() << synchronize();
 - [x] **BlockShuffle** - Offset, up, and down shuffles
 
 ### ✅ Device Level
+- [x] **DeviceAdjacentDifference** - In-place/copy left and right adjacent differences
+- [x] **DeviceCopy** - Typed batched copies and multidimensional layout conversion
 - [x] **DeviceFind** - First-match search and batched lower/upper bounds
-- [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
-- [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
-- [x] **DeviceRadixSort** - OneSweep key/pair sorting with ascending, descending, and bit-range interfaces
+- [x] **DeviceFor** - Mutable/copy iteration, bulk dispatch, and multidimensional layouts
+- [x] **DeviceHistogram** - Even/range histogram computation
 - [x] **DeviceMemcpy** - Batched raw-byte copies over bindless source and destination ranges
 - [x] **DeviceMerge** - Sorted key and key-value pair merging with custom ordering
-- [x] **DeviceTopK** - Min/max key and pair selection with decomposed custom keys
-- [x] **DeviceTransform** - Fill, generate, conditional, tuple-input, and tuple-output transforms
-- [x] **DeviceMergeSort** - Stable key and key-value merge sorting
-- [x] **DeviceSegmentedSort** - Stable sorting within non-overlapping segments
-- [x] **DeviceSegmentedRadixSort** - Bit-range radix ordering within segments
-- [x] **DeviceSpmv** - CSR sparse-matrix vector multiplication
+- [x] **DeviceMergeSort** - Copy/in-place key and pair sorting with stable variants
+- [x] **DevicePartition** - Flagged, two-way predicate, and three-way predicate partitioning
+- [x] **DeviceRadixSort** - Numeric/decomposed key and pair sorting with copy and DoubleBuffer flows
+- [x] **DeviceReduce** - Reductions, custom arg comparison, transform-reduce, and reduce-by-key
+- [x] **DeviceRunLengthEncode** - Full and non-trivial run encoding
+- [x] **DeviceScan** - Inclusive/exclusive, initialized-inclusive, and by-key scans
+- [x] **DeviceSelect** - Flagged/FlaggedIf, predicate, unique, and unique-by-key copy/in-place selection
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
 - [x] **DeviceSegmentedScan** - Inclusive/exclusive scans with shared or independent output offsets
-- [x] **DeviceHistogram** - Histogram computation
-- [x] **DeviceFor** - Parallel for-loop utilities
-- [x] **DeviceSelect** - Flagged, predicate, unique, and unique-by-key selection
-- [x] **DevicePartition** - Flagged and predicate partitioning
+- [x] **DeviceSegmentedRadixSort** - Numeric bit-range copy and DoubleBuffer sorting within segments
+- [x] **DeviceSegmentedSort** - Ordered/stable copy and DoubleBuffer sorting within segments
+- [x] **DeviceTopK** - Min/max key and pair selection with numeric or decomposed keys
+- [x] **DeviceTransform** - Fill, generate, conditional, tuple-input, and tuple-output transforms
+- [x] **DeviceSpmv** - CSR sparse-matrix vector multiplication (retained LCPP extension)
 
 ## CUB Comparison Coverage
 
-This repository-scoped matrix is based on the interface families selected from
-CCCL/CUB v3.4.0. It records the portable LuisaCompute surface implemented here;
-it is not a claim of source-level or exhaustive API parity with every CUB release.
+This matrix is derived from the public semantic method and data-flow families in
+CCCL/CUB v3.4.0 at commit
+`a5630ac57111e1aaef8cfe0069ede566c3d15f60`. It records the portable
+LuisaCompute surface implemented here.
 
 ### Completion Status
 
-The repository-selected roadmap below is complete. Exhaustive parity with all
-public headers and overloads at CCCL/CUB v3.4.0
-(`a5630ac57111e1aaef8cfe0069ede566c3d15f60`) is a separate goal and is not yet
-complete:
+Portable semantic coverage of the pinned public surface is complete:
 
 - [x] Add the aggregate-header device families that were not represented:
   `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
@@ -179,47 +180,77 @@ complete:
 - [x] Evaluate the public families outside the aggregate header and implement
   the portable ones, including `thread_search`, `thread_sort`,
   `WarpReduceBatched`, and `DeviceSegmentedScan`.
-- [ ] Audit and implement remaining overload parity in existing families, such
-  as `DeviceFor::{Bulk,ForEachCopy,ForEachCopyN}`,
-  `DeviceSelect::FlaggedIf`,
-  `DeviceScan::InclusiveScanInit`, and merge-sort copy variants.
+- [x] Audit existing families overload-by-overload and implement every distinct
+  portable method/data-flow group, including copy/in-place and DoubleBuffer
+  forms, decomposed radix keys, multidimensional layouts, initialized scans,
+  partial collectives, custom comparators, and three-way partitioning.
+- [x] Cover temporary-storage queries, empty inputs, aliasing, range boundaries,
+  stability, selector updates, and custom comparison behavior where applicable.
+- [x] Export every implemented family through `lcpp/parallel_primitive.h` and
+  register all 39 GPU behavior tests in both XMake and CMake.
+
+This is semantic portability, not CUDA source compatibility. LCPP deliberately
+collapses CUB's legacy/environment/stream wrappers and two-call scratch-query
+protocol into LuisaCompute modules, `CommandList`, and explicit storage queries.
+It does not claim arbitrary CUDA iterator compatibility, 64-bit dispatch,
+architecture-specific performance parity, or identical overload signatures.
+Some portable fallback algorithms favor clarity and correctness over CUB-level
+asymptotic performance.
 
 APIs introduced by later CCCL/CUB releases are not implicitly included here;
 the comparison baseline must be pinned again before extending this roadmap.
+
+### Verification
+
+- Public aggregate: 6 thread, 7 warp, 13 block, and 21 device headers. The
+  device set contains the 19 pinned aggregate families, public
+  `DeviceSegmentedScan`, and the retained `DeviceSpmv` extension.
+- Forced XMake SAFE Release: 39/39 executables, 136 tests, 16,809,342 assertions.
+- Forced XMake ordinary Release: 39/39 executables, 136 tests, 16,809,342 assertions.
+- Independent CMake Release build and CTest: 39/39 tests passed.
 
 ### Priority 1: High-Priority Device Operations
 
 #### DeviceSelect
 - [x] `DeviceSelect::Flagged` - Select items based on selection flags
+- [x] `DeviceSelect::FlaggedIf` - Select items by applying a predicate to flags
 - [x] `DeviceSelect::If` - Select items based on predicate
 - [x] `DeviceSelect::Unique` - Select unique items from input sequence
 - [x] `DeviceSelect::UniqueByKey` - Select unique keys from key-value pairs
+- [x] Copy and exact in-place data flows where provided by the pinned contract
 
 #### DevicePartition
 - [x] `DevicePartition::Flagged` - Partition based on selection flags
-- [x] `DevicePartition::If` - Partition based on predicate
+- [x] `DevicePartition::If` - Two-way and three-way predicate partitioning
 
 #### DeviceReduce Extensions
 - [x] `DeviceReduce::ReduceByKey` - Reduce segments defined by keys
 - [x] `DeviceReduce::ArgMin` - Find minimum value and its index
 - [x] `DeviceReduce::ArgMax` - Find maximum value and its index
+- [x] Custom strict-order comparators for argument reductions
 
 #### DeviceScan Extensions
 - [x] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
 - [x] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
+- [x] `DeviceScan::InclusiveScanInit` - Inclusive scan with an explicit initial value
 - [x] Custom key equality and distinct key/value types
 
 ### Priority 2: Sorting and Merging
+
+#### DeviceRadixSort
+- [x] Numeric and decomposed key/pair sorting in ascending and descending order
+- [x] Copy and DoubleBuffer data flows with full/partial bit ranges and selector updates
 
 #### DeviceMergeSort
 - [x] `DeviceMergeSort::SortKeys` - Stable merge sort for keys
 - [x] `DeviceMergeSort::SortPairs` - Stable merge sort for key-value pairs
 - [x] `DeviceMergeSort::StableSortKeys` - Guaranteed stable sort
 - [x] `DeviceMergeSort::StableSortPairs` - Guaranteed stable sort for pairs
+- [x] `SortKeysCopy`, `StableSortKeysCopy`, and `SortPairsCopy` data flows
 
 #### DeviceSegmentedSort
-- [x] `DeviceSegmentedRadixSort` - Stable radix ordering within non-overlapping segments
-- [x] `DeviceSegmentedSort` - Stable general sorting within non-overlapping segments
+- [x] `DeviceSegmentedRadixSort` - Copy/DoubleBuffer radix ordering within segments
+- [x] `DeviceSegmentedSort` - Copy/DoubleBuffer ordered and stable sorting within segments
 
 #### BlockMergeSort
 - [x] `BlockMergeSort::Sort` - Block-level stable merge sort
@@ -242,6 +273,10 @@ the comparison baseline must be pinned again before extending this roadmap.
 
 #### DeviceCopy
 - [x] `DeviceCopy::Batched` - Batched memory copy operations
+- [x] `DeviceCopy::Copy` - Multidimensional row/column-major layout conversion
+
+#### DeviceMemcpy
+- [x] `DeviceMemcpy::Batched` - Bindless raw-byte range copies
 
 ### Priority 4: Block-Level Extensions
 
@@ -249,6 +284,7 @@ the comparison baseline must be pinned again before extending this roadmap.
 - [x] `BlockRadixSort::Sort` - Complete radix sort (not just ranking)
 - [x] `BlockRadixSort::SortDescending` - Descending radix sort
 - [x] `BlockRadixSort::SortBlockedToStriped` - Sort with layout change
+- [x] Numeric and decomposed custom keys with full and partial bit ranges
 
 #### BlockHistogram
 - [x] `BlockHistogram::Composite` - Block-level histogram computation
@@ -279,12 +315,21 @@ the comparison baseline must be pinned again before extending this roadmap.
 
 #### WarpScan Extensions
 - [x] `WarpScan::Broadcast` - Broadcast value across warp
+- [x] Full and partial fixed-array inclusive/exclusive scan groups
 
 #### WarpReduce Extensions
 - [x] `WarpReduce::HeadSegmentedReduce` - Segmented reduce with head flags
 - [x] `WarpReduce::TailSegmentedReduce` - Segmented reduce with tail flags
+- [x] Fixed-array full and partial reduction groups
 
 ### Priority 6: Thread-Level Extensions
+
+#### ThreadReduce / ThreadScan
+- [x] Fixed-array full and partial reduction and scan groups
+
+#### ThreadSearch / ThreadSort
+- [x] Lower/upper-bound and merge-path search utilities
+- [x] Stable odd-even key and key/value sorting
 
 #### ThreadLoad/ThreadStore
 - [x] `ThreadLoad` - Thread-level load with cache modifiers (CG, CA, CS, CV)
