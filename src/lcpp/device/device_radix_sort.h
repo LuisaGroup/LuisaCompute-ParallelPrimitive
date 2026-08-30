@@ -9,6 +9,9 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
+#include <tuple>
+#include <type_traits>
 #include <luisa/core/mathematics.h>
 #include <luisa/dsl/local.h>
 #include <luisa/core/basic_traits.h>
@@ -49,6 +52,91 @@ class DeviceRadixSort : public LuisaModule
     uint   m_shared_mem_size = 0;
     Device m_device;
     bool   m_created = false;
+
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_decomposed_key_shaders;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_decomposed_pair_shaders;
+
+    template <typename KeyType, typename Decomposer>
+    using DecomposedTuple =
+        std::remove_cvref_t<decltype(std::declval<Decomposer&>()(std::declval<Var<KeyType>&>()))>;
+
+    template <typename Tuple, size_t... I>
+    [[nodiscard]] static consteval uint decomposed_bit_count_impl(std::index_sequence<I...>)
+    {
+        static_assert((NumericT<expr_value_t<std::tuple_element_t<I, Tuple>>> && ...),
+                      "DeviceRadixSort decomposer components must be arithmetic DSL values.");
+        return (0u + ... + static_cast<uint>(sizeof(expr_value_t<std::tuple_element_t<I, Tuple>>) * 8u));
+    }
+
+    template <typename KeyType, typename Decomposer>
+    [[nodiscard]] static consteval uint decomposed_bit_count()
+    {
+        using Tuple = DecomposedTuple<KeyType, Decomposer>;
+        static_assert(std::tuple_size_v<Tuple> > 0u, "DeviceRadixSort decomposer result must not be empty.");
+        return decomposed_bit_count_impl<Tuple>(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
+    }
+
+    template <size_t INDEX, typename Tuple>
+    [[nodiscard]] static consteval uint decomposed_suffix_bits()
+    {
+        if constexpr(INDEX + 1u == std::tuple_size_v<Tuple>)
+        {
+            return 0u;
+        }
+        else
+        {
+            using NextT = expr_value_t<std::tuple_element_t<INDEX + 1u, Tuple>>;
+            return static_cast<uint>(sizeof(NextT) * 8u) + decomposed_suffix_bits<INDEX + 1u, Tuple>();
+        }
+    }
+
+    template <typename Value>
+    [[nodiscard]] static auto decomposed_ordered_bits(const Value& value)
+    {
+        using ValueT           = expr_value_t<Value>;
+        using UnsignedBits     = typename Traits<ValueT>::UnsignedBits;
+        Var<UnsignedBits> bits = as<UnsignedBits>(value);
+        bits                   = Traits<ValueT>::TwiddleIn(bits);
+        return BaseDigitExtractor<ValueT>::ProcessFloatMinusZero(bits);
+    }
+
+    template <size_t INDEX, typename Tuple>
+    static void compare_decomposed_component(
+        const Tuple& lhs, const Tuple& rhs, uint begin_bit, uint end_bit, Bool& less, Bool& equal)
+    {
+        using ValueT                   = expr_value_t<std::tuple_element_t<INDEX, Tuple>>;
+        using UnsignedBits             = typename Traits<ValueT>::UnsignedBits;
+        constexpr uint component_bits  = static_cast<uint>(sizeof(ValueT) * 8u);
+        constexpr uint component_begin = decomposed_suffix_bits<INDEX, Tuple>();
+        constexpr uint component_end   = component_begin + component_bits;
+        auto           overlap_begin   = std::max(begin_bit, component_begin);
+        auto           overlap_end     = std::min(end_bit, component_end);
+        if(overlap_begin < overlap_end)
+        {
+            auto local_begin = overlap_begin - component_begin;
+            auto width       = overlap_end - overlap_begin;
+            auto mask        = width == component_bits ?
+                                   std::numeric_limits<UnsignedBits>::max() :
+                                   static_cast<UnsignedBits>((UnsignedBits{1} << width) - 1u);
+            auto lhs_bits = (decomposed_ordered_bits(std::get<INDEX>(lhs)) >> local_begin) & mask;
+            auto rhs_bits = (decomposed_ordered_bits(std::get<INDEX>(rhs)) >> local_begin) & mask;
+            less          = less | (equal & (lhs_bits < rhs_bits));
+            equal         = equal & (lhs_bits == rhs_bits);
+        }
+        if constexpr(INDEX + 1u < std::tuple_size_v<Tuple>)
+        {
+            compare_decomposed_component<INDEX + 1u>(lhs, rhs, begin_bit, end_bit, less, equal);
+        }
+    }
+
+    template <typename Tuple>
+    [[nodiscard]] static Bool decomposed_less(const Tuple& lhs, const Tuple& rhs, uint begin_bit, uint end_bit)
+    {
+        Bool less  = false;
+        Bool equal = true;
+        compare_decomposed_component<0u>(lhs, rhs, begin_bit, end_bit, less, equal);
+        return less;
+    }
 
   public:
     DeviceRadixSort()  = default;
@@ -315,7 +403,391 @@ class DeviceRadixSort : public LuisaModule
                    debug_stream());
     }
 
+    template <typename KeyType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortKeys(CommandList&        cmdlist,
+                  BufferView<uint>    temp_storage,
+                  BufferView<KeyType> d_keys_in,
+                  BufferView<KeyType> d_keys_out,
+                  uint                num_items,
+                  Decomposer          decomposer,
+                  uint                begin_bit = 0u,
+                  uint                end_bit   = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        dispatch_decomposed_keys<false, false>(
+            cmdlist, temp_storage, d_keys_in, d_keys_out, num_items, decomposer, begin_bit, end_bit, nullptr);
+    }
+
+    template <typename KeyType, typename ValueType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortPairs(CommandList&          cmdlist,
+                   BufferView<uint>      temp_storage,
+                   BufferView<KeyType>   d_keys_in,
+                   BufferView<KeyType>   d_keys_out,
+                   BufferView<ValueType> d_values_in,
+                   BufferView<ValueType> d_values_out,
+                   uint                  num_items,
+                   Decomposer            decomposer,
+                   uint                  begin_bit = 0u,
+                   uint                  end_bit   = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        dispatch_decomposed_pairs<false, false>(
+            cmdlist, temp_storage, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, decomposer, begin_bit, end_bit, nullptr, nullptr);
+    }
+
+    template <typename KeyType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortKeysDescending(CommandList&        cmdlist,
+                            BufferView<uint>    temp_storage,
+                            BufferView<KeyType> d_keys_in,
+                            BufferView<KeyType> d_keys_out,
+                            uint                num_items,
+                            Decomposer          decomposer,
+                            uint                begin_bit = 0u,
+                            uint end_bit = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        dispatch_decomposed_keys<true, false>(
+            cmdlist, temp_storage, d_keys_in, d_keys_out, num_items, decomposer, begin_bit, end_bit, nullptr);
+    }
+
+    template <typename KeyType, typename ValueType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortPairsDescending(CommandList&          cmdlist,
+                             BufferView<uint>      temp_storage,
+                             BufferView<KeyType>   d_keys_in,
+                             BufferView<KeyType>   d_keys_out,
+                             BufferView<ValueType> d_values_in,
+                             BufferView<ValueType> d_values_out,
+                             uint                  num_items,
+                             Decomposer            decomposer,
+                             uint                  begin_bit = 0u,
+                             uint end_bit = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        dispatch_decomposed_pairs<true, false>(
+            cmdlist, temp_storage, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, decomposer, begin_bit, end_bit, nullptr, nullptr);
+    }
+
+    template <typename KeyType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortKeys(CommandList&           cmdlist,
+                  BufferView<uint>       temp_storage,
+                  DoubleBuffer<KeyType>& d_keys,
+                  uint                   num_items,
+                  Decomposer             decomposer,
+                  uint                   begin_bit = 0u,
+                  uint                   end_bit   = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        dispatch_decomposed_keys<false, true>(cmdlist,
+                                              temp_storage,
+                                              d_keys.current(),
+                                              d_keys.alternate(),
+                                              num_items,
+                                              decomposer,
+                                              begin_bit,
+                                              end_bit,
+                                              &d_keys.selector);
+    }
+
+    template <typename KeyType, typename ValueType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortPairs(CommandList&             cmdlist,
+                   BufferView<uint>         temp_storage,
+                   DoubleBuffer<KeyType>&   d_keys,
+                   DoubleBuffer<ValueType>& d_values,
+                   uint                     num_items,
+                   Decomposer               decomposer,
+                   uint                     begin_bit = 0u,
+                   uint                     end_bit   = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        validate_decomposed_pair_buffers(d_keys, d_values, num_items);
+        dispatch_decomposed_pairs<false, true>(cmdlist,
+                                               temp_storage,
+                                               d_keys.current(),
+                                               d_keys.alternate(),
+                                               d_values.current(),
+                                               d_values.alternate(),
+                                               num_items,
+                                               decomposer,
+                                               begin_bit,
+                                               end_bit,
+                                               &d_keys.selector,
+                                               &d_values.selector);
+    }
+
+    template <typename KeyType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortKeysDescending(CommandList&           cmdlist,
+                            BufferView<uint>       temp_storage,
+                            DoubleBuffer<KeyType>& d_keys,
+                            uint                   num_items,
+                            Decomposer             decomposer,
+                            uint                   begin_bit = 0u,
+                            uint end_bit = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        dispatch_decomposed_keys<true, true>(cmdlist,
+                                             temp_storage,
+                                             d_keys.current(),
+                                             d_keys.alternate(),
+                                             num_items,
+                                             decomposer,
+                                             begin_bit,
+                                             end_bit,
+                                             &d_keys.selector);
+    }
+
+    template <typename KeyType, typename ValueType, typename Decomposer>
+        requires requires(Decomposer& decomposer, Var<KeyType>& key) { decomposer(key); }
+    void SortPairsDescending(CommandList&             cmdlist,
+                             BufferView<uint>         temp_storage,
+                             DoubleBuffer<KeyType>&   d_keys,
+                             DoubleBuffer<ValueType>& d_values,
+                             uint                     num_items,
+                             Decomposer               decomposer,
+                             uint                     begin_bit = 0u,
+                             uint end_bit = decomposed_bit_count<KeyType, Decomposer>())
+    {
+        validate_decomposed_pair_buffers(d_keys, d_values, num_items);
+        dispatch_decomposed_pairs<true, true>(cmdlist,
+                                              temp_storage,
+                                              d_keys.current(),
+                                              d_keys.alternate(),
+                                              d_values.current(),
+                                              d_values.alternate(),
+                                              num_items,
+                                              decomposer,
+                                              begin_bit,
+                                              end_bit,
+                                              &d_keys.selector,
+                                              &d_values.selector);
+    }
+
   private:
+    template <typename FirstT, typename SecondT>
+    static void validate_decomposed_non_overlap(BufferView<FirstT> first, BufferView<SecondT> second, uint num_items)
+    {
+        if(num_items == 0u || first.handle() != second.handle())
+        {
+            return;
+        }
+        auto first_begin  = first.offset_bytes();
+        auto first_end    = first_begin + static_cast<size_t>(num_items) * first.stride();
+        auto second_begin = second.offset_bytes();
+        auto second_end   = second_begin + static_cast<size_t>(num_items) * second.stride();
+        LUISA_ASSERT(first_end <= second_begin || second_end <= first_begin,
+                     "DeviceRadixSort decomposer input and output ranges must not overlap.");
+    }
+
+    template <typename KeyType, typename Decomposer>
+    void validate_decomposed_key_views(BufferView<KeyType> d_keys_in,
+                                       BufferView<KeyType> d_keys_out,
+                                       uint                num_items,
+                                       uint                begin_bit,
+                                       uint                end_bit) const
+    {
+        constexpr auto total_bits = decomposed_bit_count<KeyType, Decomposer>();
+        LUISA_ASSERT(m_created, "DeviceRadixSort::create must be called before dispatch.");
+        LUISA_ASSERT(begin_bit <= end_bit, "DeviceRadixSort begin_bit must not exceed end_bit.");
+        LUISA_ASSERT(end_bit <= total_bits,
+                     "DeviceRadixSort decomposed end_bit {} exceeds the {}-bit key width.",
+                     end_bit,
+                     total_bits);
+        LUISA_ASSERT(d_keys_in.size() >= num_items, "DeviceRadixSort decomposed key input view is too small.");
+        LUISA_ASSERT(d_keys_out.size() >= num_items, "DeviceRadixSort decomposed key output view is too small.");
+        validate_decomposed_non_overlap(d_keys_in, d_keys_out, num_items);
+    }
+
+    template <typename KeyType, typename ValueType>
+    void validate_decomposed_pair_buffers(const DoubleBuffer<KeyType>&   d_keys,
+                                          const DoubleBuffer<ValueType>& d_values,
+                                          uint                           num_items) const
+    {
+        validate_double_buffer(d_keys, num_items, "key");
+        validate_double_buffer(d_values, num_items, "value");
+        LUISA_ASSERT(d_keys.selector == d_values.selector,
+                     "DeviceRadixSort key and value DoubleBuffer selectors must match.");
+    }
+
+    template <bool IS_DESCENDING, bool DOUBLE_BUFFER, typename KeyType, typename Decomposer>
+    void dispatch_decomposed_keys(CommandList&        cmdlist,
+                                  BufferView<uint>    temp_storage,
+                                  BufferView<KeyType> d_keys_in,
+                                  BufferView<KeyType> d_keys_out,
+                                  uint                num_items,
+                                  Decomposer          decomposer,
+                                  uint                begin_bit,
+                                  uint                end_bit,
+                                  int*                selector)
+    {
+        static_cast<void>(temp_storage);
+        validate_decomposed_key_views<KeyType, Decomposer>(d_keys_in, d_keys_out, num_items, begin_bit, end_bit);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            if constexpr(!DOUBLE_BUFFER)
+            {
+                cmdlist << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items));
+            }
+            return;
+        }
+
+        auto better = [decomposer, begin_bit, end_bit](Var<KeyType> lhs, Var<KeyType> rhs) noexcept
+        {
+            auto lhs_tuple = decomposer(lhs);
+            auto rhs_tuple = decomposer(rhs);
+            if constexpr(IS_DESCENDING)
+            {
+                return decomposed_less(rhs_tuple, lhs_tuple, begin_bit, end_bit);
+            }
+            else
+            {
+                return decomposed_less(lhs_tuple, rhs_tuple, begin_bit, end_bit);
+            }
+        };
+        using SortShader = Shader<1, Buffer<KeyType>, Buffer<KeyType>, uint>;
+        auto key         = luisa::format("device_radix_sort_decomposed_keys+{}+{}+{}",
+                                 IS_DESCENDING ? "desc" : "asc",
+                                 DOUBLE_BUFFER ? "double" : "copy",
+                                 Type::of<KeyType>()->description());
+        key += luisa::format("+{}", get_binary_op_hash<KeyType>(better));
+        auto shader_it = m_decomposed_key_shaders.find(key);
+        if(shader_it == m_decomposed_key_shaders.end())
+        {
+            U<SortShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [better](BufferVar<KeyType> input, BufferVar<KeyType> output, UInt num_items_var) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt         candidate     = dispatch_id().x;
+                             Var<KeyType> candidate_key = input.read(candidate);
+                             UInt         rank          = 0u;
+                             $for(other, 0u, num_items_var, 1u)
+                             {
+                                 Var<KeyType> other_key        = input.read(other);
+                                 Bool         other_better     = better(other_key, candidate_key);
+                                 Bool         candidate_better = better(candidate_key, other_key);
+                                 Bool         equivalent       = !other_better & !candidate_better;
+                                 rank += select(0u, 1u, other_better | (equivalent & (other < candidate)));
+                             };
+                             output.write(rank, candidate_key);
+                         });
+            m_decomposed_key_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_decomposed_key_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<SortShader*>(&(*shader_it->second));
+        LUISA_ASSERT(shader != nullptr, "Failed to compile decomposed DeviceRadixSort key shader.");
+        cmdlist << (*shader)(d_keys_in, d_keys_out, num_items).dispatch(num_items);
+        if constexpr(DOUBLE_BUFFER)
+        {
+            LUISA_ASSERT(selector != nullptr, "Missing DeviceRadixSort DoubleBuffer selector.");
+            *selector ^= 1;
+        }
+    }
+
+    template <bool IS_DESCENDING, bool DOUBLE_BUFFER, typename KeyType, typename ValueType, typename Decomposer>
+    void dispatch_decomposed_pairs(CommandList&          cmdlist,
+                                   BufferView<uint>      temp_storage,
+                                   BufferView<KeyType>   d_keys_in,
+                                   BufferView<KeyType>   d_keys_out,
+                                   BufferView<ValueType> d_values_in,
+                                   BufferView<ValueType> d_values_out,
+                                   uint                  num_items,
+                                   Decomposer            decomposer,
+                                   uint                  begin_bit,
+                                   uint                  end_bit,
+                                   int*                  key_selector,
+                                   int*                  value_selector)
+    {
+        static_cast<void>(temp_storage);
+        validate_decomposed_key_views<KeyType, Decomposer>(d_keys_in, d_keys_out, num_items, begin_bit, end_bit);
+        LUISA_ASSERT(d_values_in.size() >= num_items, "DeviceRadixSort decomposed value input view is too small.");
+        LUISA_ASSERT(d_values_out.size() >= num_items, "DeviceRadixSort decomposed value output view is too small.");
+        validate_decomposed_non_overlap(d_keys_in, d_values_out, num_items);
+        validate_decomposed_non_overlap(d_values_in, d_keys_out, num_items);
+        validate_decomposed_non_overlap(d_values_in, d_values_out, num_items);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        if(begin_bit == end_bit)
+        {
+            if constexpr(!DOUBLE_BUFFER)
+            {
+                cmdlist
+                    << d_keys_out.subview(0u, num_items).copy_from(d_keys_in.subview(0u, num_items))
+                    << d_values_out.subview(0u, num_items).copy_from(d_values_in.subview(0u, num_items));
+            }
+            return;
+        }
+
+        auto better = [decomposer, begin_bit, end_bit](Var<KeyType> lhs, Var<KeyType> rhs) noexcept
+        {
+            auto lhs_tuple = decomposer(lhs);
+            auto rhs_tuple = decomposer(rhs);
+            if constexpr(IS_DESCENDING)
+            {
+                return decomposed_less(rhs_tuple, lhs_tuple, begin_bit, end_bit);
+            }
+            else
+            {
+                return decomposed_less(lhs_tuple, rhs_tuple, begin_bit, end_bit);
+            }
+        };
+        using SortShader =
+            Shader<1, Buffer<KeyType>, Buffer<KeyType>, Buffer<ValueType>, Buffer<ValueType>, uint>;
+        auto key = luisa::format("device_radix_sort_decomposed_pairs+{}+{}+{}+{}",
+                                 IS_DESCENDING ? "desc" : "asc",
+                                 DOUBLE_BUFFER ? "double" : "copy",
+                                 Type::of<KeyType>()->description(),
+                                 Type::of<ValueType>()->description());
+        key += luisa::format("+{}", get_binary_op_hash<KeyType>(better));
+        auto shader_it = m_decomposed_pair_shaders.find(key);
+        if(shader_it == m_decomposed_pair_shaders.end())
+        {
+            U<SortShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [better](BufferVar<KeyType>   keys_input,
+                                  BufferVar<KeyType>   keys_output,
+                                  BufferVar<ValueType> values_input,
+                                  BufferVar<ValueType> values_output,
+                                  UInt                 num_items_var) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt         candidate     = dispatch_id().x;
+                             Var<KeyType> candidate_key = keys_input.read(candidate);
+                             UInt         rank          = 0u;
+                             $for(other, 0u, num_items_var, 1u)
+                             {
+                                 Var<KeyType> other_key        = keys_input.read(other);
+                                 Bool         other_better     = better(other_key, candidate_key);
+                                 Bool         candidate_better = better(candidate_key, other_key);
+                                 Bool         equivalent       = !other_better & !candidate_better;
+                                 rank += select(0u, 1u, other_better | (equivalent & (other < candidate)));
+                             };
+                             keys_output.write(rank, candidate_key);
+                             values_output.write(rank, values_input.read(candidate));
+                         });
+            m_decomposed_pair_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_decomposed_pair_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<SortShader*>(&(*shader_it->second));
+        LUISA_ASSERT(shader != nullptr, "Failed to compile decomposed DeviceRadixSort pair shader.");
+        cmdlist << (*shader)(d_keys_in, d_keys_out, d_values_in, d_values_out, num_items).dispatch(num_items);
+        if constexpr(DOUBLE_BUFFER)
+        {
+            LUISA_ASSERT(key_selector != nullptr && value_selector != nullptr,
+                         "Missing DeviceRadixSort pair DoubleBuffer selectors.");
+            *key_selector ^= 1;
+            *value_selector ^= 1;
+        }
+    }
+
     template <typename T>
     static void validate_double_buffer(const DoubleBuffer<T>& buffer, uint num_items, luisa::string_view name)
     {
