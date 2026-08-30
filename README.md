@@ -173,7 +173,6 @@ complete:
 - [ ] Audit and implement remaining overload parity in existing families, such
   as `DeviceFor::{Bulk,ForEachCopy,ForEachCopyN}`,
   `DeviceSelect::FlaggedIf`,
-  `DeviceAdjacentDifference::AdjacentDifference`,
   `DeviceScan::InclusiveScanInit`, and merge-sort copy variants.
 
 APIs introduced by later CCCL/CUB releases are not implicitly included here;
