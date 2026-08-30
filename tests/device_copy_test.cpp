@@ -121,4 +121,83 @@ int main(int argc, char* argv[])
             expect(destination[i] == source[i]);
         }
     };
+
+    "device_copy_converts_multidimensional_layouts"_test = [&]
+    {
+        constexpr std::array<size_t, 2u> extents{2u, 3u};
+        std::array<int, 6u>              row_major{0, 1, 2, 10, 11, 12};
+        std::array<int, 6u>              column_major{0, 10, 1, 11, 2, 12};
+        std::array<int, 6u>              row_to_column{};
+        std::array<int, 6u>              column_to_row{};
+
+        auto row_buffer           = device.create_buffer<int>(row_major.size());
+        auto column_buffer        = device.create_buffer<int>(column_major.size());
+        auto row_to_column_buffer = device.create_buffer<int>(row_to_column.size());
+        auto column_to_row_buffer = device.create_buffer<int>(column_to_row.size());
+
+        CommandList commands;
+        device_copy.Copy(commands,
+                         BufferView<uint>{},
+                         row_buffer.view(),
+                         row_to_column_buffer.view(),
+                         extents,
+                         DeviceCopyLayout::ROW_MAJOR,
+                         DeviceCopyLayout::COLUMN_MAJOR);
+        device_copy.Copy(commands,
+                         BufferView<uint>{},
+                         column_buffer.view(),
+                         column_to_row_buffer.view(),
+                         extents,
+                         DeviceCopyLayout::COLUMN_MAJOR,
+                         DeviceCopyLayout::ROW_MAJOR);
+        stream << row_buffer.copy_from(luisa::span{row_major})
+               << column_buffer.copy_from(luisa::span{column_major}) << commands.commit()
+               << row_to_column_buffer.copy_to(luisa::span{row_to_column})
+               << column_to_row_buffer.copy_to(luisa::span{column_to_row}) << synchronize();
+
+        for(size_t i = 0u; i < row_major.size(); ++i)
+        {
+            expect(row_to_column[i] == column_major[i]);
+            expect(column_to_row[i] == row_major[i]);
+        }
+    };
+
+    "device_copy_supports_rank_three_and_assignable_outputs"_test = [&]
+    {
+        constexpr std::array<size_t, 3u> extents{2u, 2u, 2u};
+        std::array<int, 8u>              input{0, 1, 2, 3, 4, 5, 6, 7};
+        std::array<float, 8u>            output{};
+        std::array<float, 8u>            expected{0.0f, 4.0f, 2.0f, 6.0f, 1.0f, 5.0f, 3.0f, 7.0f};
+        auto                             input_buffer  = device.create_buffer<int>(input.size());
+        auto                             output_buffer = device.create_buffer<float>(output.size());
+
+        CommandList commands;
+        device_copy.Copy(commands,
+                         BufferView<uint>{},
+                         input_buffer.view(),
+                         output_buffer.view(),
+                         extents,
+                         DeviceCopyLayout::ROW_MAJOR,
+                         DeviceCopyLayout::COLUMN_MAJOR);
+        stream << input_buffer.copy_from(luisa::span{input}) << commands.commit()
+               << output_buffer.copy_to(luisa::span{output}) << synchronize();
+        for(size_t i = 0u; i < output.size(); ++i)
+        {
+            expect(output[i] == expected[i]);
+        }
+    };
+
+    "device_copy_accepts_zero_extents"_test = [&]
+    {
+        CommandList commands;
+        device_copy.Copy(commands,
+                         BufferView<uint>{},
+                         BufferView<int>{},
+                         BufferView<int>{},
+                         std::array<size_t, 2u>{3u, 0u},
+                         DeviceCopyLayout::COLUMN_MAJOR,
+                         DeviceCopyLayout::ROW_MAJOR);
+        stream << commands.commit() << synchronize();
+        expect(true);
+    };
 }
