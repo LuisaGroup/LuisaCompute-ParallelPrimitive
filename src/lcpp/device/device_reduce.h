@@ -22,6 +22,7 @@
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/var.h>
 #include <cstddef>
+#include <utility>
 #include <lcpp/runtime/core.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/util_type.h>
@@ -266,6 +267,18 @@ class DeviceReduce : public LuisaModule
         lcpp_check(arg_assign<Type4Byte>(cmdlist, d_out_kv, d_out, d_index_out), cmdlist, debug_stream());
     }
 
+    template <NumericT Type4Byte, typename CompareOp>
+    void ArgMin(CommandList&          cmdlist,
+                BufferView<uint>      temp_storage,
+                BufferView<Type4Byte> d_in,
+                BufferView<Type4Byte> d_out,
+                BufferView<uint>      d_index_out,
+                size_t                num_item,
+                CompareOp             compare_op)
+    {
+        dispatch_arg_extremum<true>(cmdlist, temp_storage, d_in, d_out, d_index_out, num_item, std::move(compare_op));
+    }
+
     template <NumericT Type4Byte>
     void ArgMax(CommandList&          cmdlist,
                 BufferView<uint>      temp_storage,
@@ -317,6 +330,18 @@ class DeviceReduce : public LuisaModule
 
         // copy result to d_out and d_index_out
         lcpp_check(arg_assign<Type4Byte>(cmdlist, d_out_kv, d_out, d_index_out), cmdlist, debug_stream());
+    }
+
+    template <NumericT Type4Byte, typename CompareOp>
+    void ArgMax(CommandList&          cmdlist,
+                BufferView<uint>      temp_storage,
+                BufferView<Type4Byte> d_in,
+                BufferView<Type4Byte> d_out,
+                BufferView<uint>      d_index_out,
+                size_t                num_item,
+                CompareOp             compare_op)
+    {
+        dispatch_arg_extremum<false>(cmdlist, temp_storage, d_in, d_out, d_index_out, num_item, std::move(compare_op));
     }
 
 
@@ -395,6 +420,82 @@ class DeviceReduce : public LuisaModule
     }
 
   private:
+    template <bool FIND_MIN, NumericT Type4Byte, typename CompareOp>
+    void dispatch_arg_extremum(CommandList&          cmdlist,
+                               BufferView<uint>      temp_storage,
+                               BufferView<Type4Byte> d_in,
+                               BufferView<Type4Byte> d_out,
+                               BufferView<uint>      d_index_out,
+                               size_t                num_item,
+                               CompareOp             compare_op)
+    {
+        static_cast<void>(temp_storage);
+        LUISA_ASSERT(m_created, "DeviceReduce::create must be called before dispatch.");
+        LUISA_ASSERT(num_item <= std::numeric_limits<uint>::max(), "Too many items for DeviceReduce.");
+        LUISA_ASSERT(d_out.size() >= 1u, "DeviceReduce extremum output view is empty.");
+        LUISA_ASSERT(d_index_out.size() >= 1u, "DeviceReduce extremum index output view is empty.");
+        if(num_item == 0u)
+        {
+            write_scalar(cmdlist,
+                         d_out,
+                         FIND_MIN ? std::numeric_limits<Type4Byte>::max() :
+                                    std::numeric_limits<Type4Byte>::lowest());
+            write_scalar(cmdlist, d_index_out, 1u);
+            return;
+        }
+        LUISA_ASSERT(d_in.size() >= num_item, "DeviceReduce extremum input view is too small.");
+
+        using ArgExtremumShader = Shader<1, Buffer<Type4Byte>, Buffer<Type4Byte>, Buffer<uint>, uint>;
+        auto key       = luisa::format("device_arg_{}+{}+{}",
+                                 FIND_MIN ? "min" : "max",
+                                 Type::of<Type4Byte>()->description(),
+                                 get_binary_op_hash<Type4Byte>(compare_op));
+        auto shader_it = ms_arg_extremum_map.find(key);
+        if(shader_it == ms_arg_extremum_map.end())
+        {
+            U<ArgExtremumShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [compare_op](BufferVar<Type4Byte> input,
+                                      BufferVar<Type4Byte> value_output,
+                                      BufferVar<uint>      index_output,
+                                      UInt                 num_items) noexcept
+                         {
+                             set_block_size(details::WARP_SIZE);
+                             $if(dispatch_id().x == 0u)
+                             {
+                                 Var<Type4Byte> best_value = input.read(0u);
+                                 UInt           best_index = 0u;
+                                 $for(index, 1u, num_items, 1u)
+                                 {
+                                     Var<Type4Byte> candidate = input.read(index);
+                                     Bool           candidate_is_better;
+                                     if constexpr(FIND_MIN)
+                                     {
+                                         candidate_is_better = compare_op(candidate, best_value);
+                                     }
+                                     else
+                                     {
+                                         candidate_is_better = compare_op(best_value, candidate);
+                                     }
+                                     $if(candidate_is_better)
+                                     {
+                                         best_value = candidate;
+                                         best_index = index;
+                                     };
+                                 };
+                                 value_output.write(0u, best_value);
+                                 index_output.write(0u, best_index);
+                             };
+                         });
+            ms_arg_extremum_map.try_emplace(key, std::move(shader));
+            shader_it = ms_arg_extremum_map.find(key);
+        }
+        auto shader = reinterpret_cast<ArgExtremumShader*>(&(*shader_it->second));
+        LUISA_ASSERT(shader != nullptr, "Failed to compile DeviceReduce custom extremum shader.");
+        cmdlist << (*shader)(d_in, d_out, d_index_out, static_cast<uint>(num_item)).dispatch(1u);
+    }
+
     template <NumericT Type4Byte>
     [[nodiscard]] int arg_construct(CommandList&                           cmdlist,
                                     BufferView<Type4Byte>                  d_in,
@@ -589,6 +690,7 @@ class DeviceReduce : public LuisaModule
     // for arg reduce
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_construct_map;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_assign_map;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_extremum_map;
     // for reduce by key
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_reduce_by_key_map;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_tile_state_init_map;

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <lcpp/parallel_primitive.h>
 #include <random>
 #include <vector>
@@ -241,6 +242,68 @@ int main(int argc, char* argv[])
 
         expect(std::abs(result - (-3.0f)) < 1e-6f);
         expect(index == 1u);
+    };
+
+    "reduce_arg_extrema_honor_custom_comparison_and_first_ties"_test = [&]
+    {
+        luisa::vector<int> host_input{21, 11, 33, 23, 8, 28};
+        auto               input     = device.create_buffer<int>(host_input.size());
+        auto               min_value = device.create_buffer<int>(1u);
+        auto               min_index = device.create_buffer<uint>(1u);
+        auto               max_value = device.create_buffer<int>(1u);
+        auto               max_index = device.create_buffer<uint>(1u);
+        auto               temp      = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceReduce<>::GetArgTempStorageBytes<int>(host_input.size())));
+        auto last_digit_less = [](const Int& lhs, const Int& rhs) noexcept
+        { return lhs % 10 < rhs % 10; };
+
+        CommandList commands;
+        reducer.ArgMin(
+            commands, temp.view(), input.view(), min_value.view(), min_index.view(), host_input.size(), last_digit_less);
+        reducer.ArgMax(
+            commands, temp.view(), input.view(), max_value.view(), max_index.view(), host_input.size(), last_digit_less);
+
+        int  min_result       = 0;
+        uint min_index_result = 0u;
+        int  max_result       = 0;
+        uint max_index_result = 0u;
+        stream << input.copy_from(luisa::span{host_input}) << commands.commit()
+               << min_value.copy_to(luisa::span{&min_result, 1u})
+               << min_index.copy_to(luisa::span{&min_index_result, 1u})
+               << max_value.copy_to(luisa::span{&max_result, 1u})
+               << max_index.copy_to(luisa::span{&max_index_result, 1u}) << synchronize();
+
+        expect(min_result == 21);
+        expect(min_index_result == 0u);
+        expect(max_result == 8);
+        expect(max_index_result == 4u);
+    };
+
+    "reduce_custom_arg_extrema_preserve_empty_input_sentinels"_test = [&]
+    {
+        auto min_value = device.create_buffer<int>(1u);
+        auto min_index = device.create_buffer<uint>(1u);
+        auto max_value = device.create_buffer<int>(1u);
+        auto max_index = device.create_buffer<uint>(1u);
+        auto compare = [](const Int& lhs, const Int& rhs) noexcept { return lhs % 10 < rhs % 10; };
+
+        CommandList commands;
+        reducer.ArgMin(commands, BufferView<uint>{}, BufferView<int>{}, min_value.view(), min_index.view(), 0u, compare);
+        reducer.ArgMax(commands, BufferView<uint>{}, BufferView<int>{}, max_value.view(), max_index.view(), 0u, compare);
+
+        int  min_result       = 0;
+        uint min_index_result = 0u;
+        int  max_result       = 0;
+        uint max_index_result = 0u;
+        stream << commands.commit() << min_value.copy_to(luisa::span{&min_result, 1u})
+               << min_index.copy_to(luisa::span{&min_index_result, 1u})
+               << max_value.copy_to(luisa::span{&max_result, 1u})
+               << max_index.copy_to(luisa::span{&max_index_result, 1u}) << synchronize();
+
+        expect(min_result == std::numeric_limits<int>::max());
+        expect(min_index_result == 1u);
+        expect(max_result == std::numeric_limits<int>::lowest());
+        expect(max_index_result == 1u);
     };
 
 
