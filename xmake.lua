@@ -16,6 +16,7 @@ else
     LCPP_LC_DIR = 'LuisaCompute'
     local lc_lcpp_options = {
         lc_enable_xir = true,
+        lc_vk_backend_use_xir_spirv = true,
         lc_enable_tests = false,
         lc_enable_unity_build = false,
     }

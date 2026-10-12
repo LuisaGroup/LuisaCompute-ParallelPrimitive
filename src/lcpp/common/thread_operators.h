@@ -23,7 +23,7 @@ struct ArgMaxOp
                                                const Var<IndexValuePairT<Type4Byte>>& b) const noexcept
     {
         Var<IndexValuePairT<Type4Byte>> result = a;
-        $if(b.value > a.value | (b.value == a.value & b.key > a.key))
+        $if(b.value > a.value | (b.value == a.value & b.key < a.key))
         {
             result = b;
         };

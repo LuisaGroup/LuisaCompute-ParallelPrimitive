@@ -1,81 +1,158 @@
-/*
- * @Author: Ligo 
- * @Date: 2025-10-20 13:51:43 
- * @Last Modified by: Ligo
- * @Last Modified time: 2025-10-20 15:06:27
- */
-
 #pragma once
-#include "lcpp/runtime/core.h"
-#include <cstddef>
-#include <luisa/dsl/sugar.h>
-#include <luisa/dsl/func.h>
-#include <luisa/dsl/var.h>
+
+#include <lcpp/common/utils.h>
+#include <lcpp/runtime/core.h>
+
 #include <luisa/dsl/builtin.h>
+#include <luisa/dsl/sugar.h>
+#include <luisa/dsl/var.h>
 
-namespace luisa::parallel_primitive
-{
-namespace details
-{
-    template <typename T>
-    using SmemTypePtr = luisa::compute::Shared<T>*;
+#include <cstddef>
 
-    using namespace luisa::compute;
-    template <typename Type4Byte, size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_SIZE = details::WARP_SIZE>
-    struct BlockScanMem
+namespace luisa::parallel_primitive::details
+{
+
+template <typename T>
+using BlockScanSmemPtr = luisa::compute::Shared<T>*;
+
+template <typename Type4Byte, size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_SIZE = details::WARP_SIZE>
+struct BlockScanMem
+{
+    template <typename ScanOp>
+    void InclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       compute::Var<Type4Byte>&       block_aggregate,
+                       ScanOp                         scan_op) const
     {
-        template <typename ScanOp>
-        void ExclusiveScan(SmemTypePtr<Type4Byte>& m_shared_mem,
-                           const Var<Type4Byte>&   thread_data,
-                           Var<Type4Byte>&         exclusive_output,
-                           Var<Type4Byte>&         block_aggregate,
-                           ScanOp                  scan_op,
-                           const Var<Type4Byte>&   initial_value)
+        inclusive_scan(shared_mem, input, output, block_aggregate, scan_op);
+    }
+
+    template <typename ScanOp>
+    void InclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       compute::Var<Type4Byte>&       block_aggregate,
+                       ScanOp                         scan_op,
+                       const compute::Var<Type4Byte>& initial_value) const
+    {
+        compute::Var<Type4Byte> raw_inclusive;
+        inclusive_scan(shared_mem, input, raw_inclusive, block_aggregate, scan_op);
+        output = scan_op(initial_value, raw_inclusive);
+    }
+
+    template <typename ScanOp>
+    void ExclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       compute::Var<Type4Byte>&       block_aggregate,
+                       ScanOp                         scan_op) const
+    {
+        compute::Var<Type4Byte> raw_inclusive;
+        inclusive_scan(shared_mem, input, raw_inclusive, block_aggregate, scan_op);
+        compute::UInt tid = compute::thread_id().x;
+        output            = input;
+        $if(tid > 0u)
         {
-            UInt block_size_ = UInt(BLOCK_SIZE);
-            UInt thid        = thread_id().x;
-            UInt global_id   = block_id().x * block_size_x() + thid;
+            output = (*shared_mem)[tid - 1u];
+        };
+    }
 
-            (*m_shared_mem)[thid] = thread_data;
-            sync_block();
+    template <typename ScanOp>
+    void ExclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       compute::Var<Type4Byte>&       block_aggregate,
+                       ScanOp                         scan_op,
+                       const compute::Var<Type4Byte>& initial_value) const
+    {
+        compute::Var<Type4Byte> raw_inclusive;
+        inclusive_scan(shared_mem, input, raw_inclusive, block_aggregate, scan_op);
+        compute::UInt tid = compute::thread_id().x;
+        output            = initial_value;
+        $if(tid > 0u)
+        {
+            output = scan_op(initial_value, (*shared_mem)[tid - 1u]);
+        };
+    }
 
-            // up-sweep
-            UInt offset = def(1);
-            $while(offset < block_size_)
-            {
-                UInt index = (thid + 1) * offset * 2 - 1;
-                $if(index < block_size_)
-                {
-                    (*m_shared_mem)[index] =
-                        scan_op((*m_shared_mem)[index], (*m_shared_mem)[index - offset]);
-                };
-                offset <<= 1;
-                sync_block();
-            };
-            $if(thid == 0)
-            {
-                // clear the last element for exclusive scan
-                (*m_shared_mem)[block_size_ - 1] = initial_value;
-            };
-            sync_block();
-            // down-sweep
-            offset = def(block_size_ >> 1);
-            $while(offset > 0)
-            {
-                UInt index = (thid + 1) * offset * 2 - 1;
-                $if(index < block_size_)
-                {
-                    // swap
-                    auto temp = (*m_shared_mem)[index - offset];
-                    (*m_shared_mem)[index - offset] = (*m_shared_mem)[index];
-                    (*m_shared_mem)[index] = scan_op((*m_shared_mem)[index], temp);
-                };
-                offset >>= 1;
-                sync_block();
-            };
+    template <typename ScanOp, typename BlockPrefixCallbackOp>
+    void ExclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       ScanOp                         scan_op,
+                       BlockPrefixCallbackOp          prefix_op) const
+    {
+        compute::Var<Type4Byte> block_aggregate;
+        ExclusiveScan(shared_mem, input, output, block_aggregate, scan_op);
+        apply_prefix(shared_mem, output, block_aggregate, scan_op, prefix_op, true);
+    }
 
-            exclusive_output = (*m_shared_mem)[thid];
+    template <typename ScanOp, typename BlockPrefixCallbackOp>
+    void InclusiveScan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                       const compute::Var<Type4Byte>& input,
+                       compute::Var<Type4Byte>&       output,
+                       ScanOp                         scan_op,
+                       BlockPrefixCallbackOp          prefix_op) const
+    {
+        compute::Var<Type4Byte> block_aggregate;
+        InclusiveScan(shared_mem, input, output, block_aggregate, scan_op);
+        apply_prefix(shared_mem, output, block_aggregate, scan_op, prefix_op, false);
+    }
+
+  private:
+    template <typename ScanOp>
+    static void inclusive_scan(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                               const compute::Var<Type4Byte>& input,
+                               compute::Var<Type4Byte>&       output,
+                               compute::Var<Type4Byte>&       block_aggregate,
+                               ScanOp                         scan_op)
+    {
+        compute::UInt tid  = compute::thread_id().x;
+        (*shared_mem)[tid] = input;
+        compute::sync_block();
+
+        for(size_t offset = 1u; offset < BLOCK_SIZE; offset <<= 1u)
+        {
+            compute::Var<Type4Byte> value = (*shared_mem)[tid];
+            $if(tid >= compute::UInt(offset))
+            {
+                value = scan_op((*shared_mem)[tid - compute::UInt(offset)], value);
+            };
+            compute::sync_block();
+            (*shared_mem)[tid] = value;
+            compute::sync_block();
         }
-    };
-};  // namespace details
-}  // namespace luisa::parallel_primitive
+
+        output          = (*shared_mem)[tid];
+        block_aggregate = (*shared_mem)[compute::UInt(BLOCK_SIZE - 1u)];
+    }
+
+    template <typename ScanOp, typename BlockPrefixCallbackOp>
+    static void apply_prefix(BlockScanSmemPtr<Type4Byte>&   shared_mem,
+                             compute::Var<Type4Byte>&       output,
+                             const compute::Var<Type4Byte>& block_aggregate,
+                             ScanOp                         scan_op,
+                             BlockPrefixCallbackOp          prefix_op,
+                             bool                           exclusive)
+    {
+        compute::UInt tid = compute::thread_id().x;
+        $if(tid == 0u)
+        {
+            (*shared_mem)[0u] = prefix_op(block_aggregate);
+        };
+        compute::sync_block();
+        compute::Var<Type4Byte> prefix = (*shared_mem)[0u];
+        if(exclusive)
+        {
+            output = Select(prefix, scan_op(prefix, output), tid > 0u);
+        }
+        else
+        {
+            output = scan_op(prefix, output);
+        }
+        compute::sync_block();
+    }
+};
+
+}  // namespace luisa::parallel_primitive::details

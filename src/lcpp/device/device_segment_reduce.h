@@ -39,7 +39,7 @@ class DeviceSegmentReduce : public LuisaModule
     ~DeviceSegmentReduce() = default;
 
 #ifndef NDEBUG
-    Stream* m_debug_stream; // bind debug stream for sync
+    Stream* m_debug_stream;  // bind debug stream for sync
 #endif
     inline Stream* debug_stream() noexcept
     {
@@ -51,7 +51,7 @@ class DeviceSegmentReduce : public LuisaModule
     }
     void create(Device& device, Stream* debug_stream = nullptr)
     {
-        m_device                   = device;
+        m_device = device;
 #ifndef NDEBUG
         m_debug_stream = debug_stream;
 #endif
@@ -79,11 +79,11 @@ class DeviceSegmentReduce : public LuisaModule
     template <typename Type4Byte>
     static size_t GetArgTempStorageBytes(size_t num_item, size_t num_segments)
     {
-        using IVP = IndexValuePairT<Type4Byte>;
+        using IVP    = IndexValuePairT<Type4Byte>;
         size_t bytes = 0;
-        bytes += num_item * sizeof(IVP);            // d_in_kv
-        bytes  = align_up_uint(bytes, alignof(IVP));
-        bytes += num_segments * sizeof(IVP);        // d_out_kv
+        bytes += num_item * sizeof(IVP);  // d_in_kv
+        bytes = align_up_uint(bytes, alignof(IVP));
+        bytes += num_segments * sizeof(IVP);  // d_out_kv
         return bytes;
     }
 
@@ -92,8 +92,8 @@ class DeviceSegmentReduce : public LuisaModule
     // ============================================================
 
     template <typename Type4Byte, typename ReduceOp>
-    void Reduce(CommandList&          cmdlist,
-                BufferView<uint>      /*temp_storage*/,
+    void Reduce(CommandList& cmdlist,
+                BufferView<uint> /*temp_storage*/,
                 BufferView<Type4Byte> d_in,
                 BufferView<Type4Byte> d_out,
                 uint                  num_segments,
@@ -102,13 +102,19 @@ class DeviceSegmentReduce : public LuisaModule
                 ReduceOp              reduce_op,
                 Type4Byte             initial_value)
     {
+        if(num_segments == 0u)
+        {
+            return;
+        }
         lcpp_check(segment_reduce_array_recursive<Type4Byte>(
-            cmdlist, d_in, d_out, num_segments, d_begin_offsets, d_end_offsets, reduce_op, initial_value), cmdlist, debug_stream());
+                       cmdlist, d_in, d_out, num_segments, d_begin_offsets, d_end_offsets, reduce_op, initial_value),
+                   cmdlist,
+                   debug_stream());
     }
 
     template <typename Type4Byte, typename ReduceOp>
-    void Reduce(CommandList&          cmdlist,
-                BufferView<uint>      /*temp_storage*/,
+    void Reduce(CommandList& cmdlist,
+                BufferView<uint> /*temp_storage*/,
                 BufferView<Type4Byte> d_in,
                 BufferView<Type4Byte> d_out,
                 uint                  num_segments,
@@ -116,10 +122,14 @@ class DeviceSegmentReduce : public LuisaModule
                 ReduceOp              reduce_op,
                 Type4Byte             initial_value)
     {
-        lcpp_check(
-            fixed_segment_reduce_array_recursive<Type4Byte>(
-            cmdlist, d_in, d_out, num_segments, segment_size, reduce_op, initial_value)   ,
-        cmdlist, debug_stream());
+        if(num_segments == 0u)
+        {
+            return;
+        }
+        lcpp_check(fixed_segment_reduce_array_recursive<Type4Byte>(
+                       cmdlist, d_in, d_out, num_segments, segment_size, reduce_op, initial_value),
+                   cmdlist,
+                   debug_stream());
     }
 
     template <NumericT Type4Byte>
@@ -135,7 +145,12 @@ class DeviceSegmentReduce : public LuisaModule
     }
 
     template <NumericT Type4Byte>
-    void Sum(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<Type4Byte> d_in, BufferView<Type4Byte> d_out, uint num_segments, uint segment_size)
+    void Sum(CommandList&          cmdlist,
+             BufferView<uint>      temp_storage,
+             BufferView<Type4Byte> d_in,
+             BufferView<Type4Byte> d_out,
+             uint                  num_segments,
+             uint                  segment_size)
     {
         Reduce(cmdlist, temp_storage, d_in, d_out, num_segments, segment_size, SumOp(), Type4Byte(0));
     }
@@ -162,7 +177,12 @@ class DeviceSegmentReduce : public LuisaModule
     }
 
     template <NumericT Type4Byte>
-    void Min(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<Type4Byte> d_in, BufferView<Type4Byte> d_out, uint num_segments, uint segment_size)
+    void Min(CommandList&          cmdlist,
+             BufferView<uint>      temp_storage,
+             BufferView<Type4Byte> d_in,
+             BufferView<Type4Byte> d_out,
+             uint                  num_segments,
+             uint                  segment_size)
     {
         Reduce(cmdlist, temp_storage, d_in, d_out, num_segments, segment_size, compute::min, std::numeric_limits<Type4Byte>::max());
     }
@@ -188,7 +208,12 @@ class DeviceSegmentReduce : public LuisaModule
     }
 
     template <NumericT Type4Byte>
-    void Max(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<Type4Byte> d_in, BufferView<Type4Byte> d_out, uint num_segments, uint segment_size)
+    void Max(CommandList&          cmdlist,
+             BufferView<uint>      temp_storage,
+             BufferView<Type4Byte> d_in,
+             BufferView<Type4Byte> d_out,
+             uint                  num_segments,
+             uint                  segment_size)
     {
         Reduce(cmdlist, temp_storage, d_in, d_out, num_segments, segment_size, compute::max, std::numeric_limits<Type4Byte>::lowest());
     }
@@ -204,32 +229,36 @@ class DeviceSegmentReduce : public LuisaModule
                 BufferView<uint>      d_begin_offsets,
                 BufferView<uint>      d_end_offsets)
     {
+        if(num_segments == 0u)
+        {
+            return;
+        }
         using IVP = IndexValuePairT<ValueType>;
 
         // slice kv buffers from temp_storage
-        size_t offset_uint = 0;
-        size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
-        auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
+        size_t offset_uint      = 0;
+        size_t in_kv_uint_count = bytes_to_uint_count(d_in.size() * sizeof(IVP));
+        auto   d_in_kv = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
         offset_uint += in_kv_uint_count;
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
-        auto   d_out_kv          = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
+        auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
         // construct key value pair
         lcpp_check(arg_construct(cmdlist, d_in, d_in_kv, num_segments), cmdlist, debug_stream());
-        Reduce<IVP>(
-            cmdlist,
-            BufferView<uint>{},
-            d_in_kv,
-            d_out_kv,
-            num_segments,
-            d_begin_offsets,
-            d_end_offsets,
-            ArgMaxOp(),
-            IVP{1, std::numeric_limits<ValueType>::min()});
+        Reduce<IVP>(cmdlist,
+                    BufferView<uint>{},
+                    d_in_kv,
+                    d_out_kv,
+                    num_segments,
+                    d_begin_offsets,
+                    d_end_offsets,
+                    ArgMaxOp(),
+                    IVP{1u, std::numeric_limits<ValueType>::lowest()});
 
         // copy result to d_out and d_index_out
         lcpp_check(arg_assign<ValueType>(cmdlist, d_out_kv, d_begin_offsets, d_index_out, d_out, num_segments),
-        cmdlist, debug_stream());
+                   cmdlist,
+                   debug_stream());
     }
 
 
@@ -242,37 +271,41 @@ class DeviceSegmentReduce : public LuisaModule
                 uint                  num_segments,
                 uint                  segment_size)
     {
+        if(num_segments == 0u)
+        {
+            return;
+        }
         using IVP = IndexValuePairT<ValueType>;
 
         // slice kv buffers from temp_storage
-        size_t offset_uint = 0;
-        size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
-        auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
+        size_t offset_uint      = 0;
+        size_t in_kv_uint_count = bytes_to_uint_count(d_in.size() * sizeof(IVP));
+        auto   d_in_kv = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
         offset_uint += in_kv_uint_count;
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
-        auto   d_out_kv          = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
+        auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
         // construct key value pair
         lcpp_check(arg_construct(cmdlist, d_in, d_in_kv, num_segments), cmdlist, debug_stream());
 
-        Reduce<IVP>(
-            cmdlist,
-            BufferView<uint>{},
-            d_in_kv,
-            d_out_kv,
-            num_segments,
-            segment_size,
-            ArgMaxOp(),
-            IVP{1, std::numeric_limits<ValueType>::min()});
+        Reduce<IVP>(cmdlist,
+                    BufferView<uint>{},
+                    d_in_kv,
+                    d_out_kv,
+                    num_segments,
+                    segment_size,
+                    ArgMaxOp(),
+                    IVP{1u, std::numeric_limits<ValueType>::lowest()});
 
         // copy result to d_out and d_index_out
         lcpp_check(arg_fixed_size_assign<ValueType>(cmdlist, d_out_kv, d_index_out, d_out, num_segments, segment_size),
-        cmdlist, debug_stream());
+                   cmdlist,
+                   debug_stream());
     }
 
 
     template <NumericT ValueType>
-    void Argmin(CommandList&          cmdlist,
+    void ArgMin(CommandList&          cmdlist,
                 BufferView<uint>      temp_storage,
                 BufferView<ValueType> d_in,
                 BufferView<ValueType> d_out,
@@ -281,33 +314,37 @@ class DeviceSegmentReduce : public LuisaModule
                 BufferView<uint>      d_begin_offsets,
                 BufferView<uint>      d_end_offsets)
     {
+        if(num_segments == 0u)
+        {
+            return;
+        }
         using IVP = IndexValuePairT<ValueType>;
 
         // slice kv buffers from temp_storage
-        size_t offset_uint = 0;
-        size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
-        auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
+        size_t offset_uint      = 0;
+        size_t in_kv_uint_count = bytes_to_uint_count(d_in.size() * sizeof(IVP));
+        auto   d_in_kv = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
         offset_uint += in_kv_uint_count;
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
-        auto   d_out_kv          = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
+        auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
         // construct key value pair
         lcpp_check(arg_construct(cmdlist, d_in, d_in_kv, num_segments), cmdlist, debug_stream());
 
-        Reduce<IVP>(
-            cmdlist,
-            BufferView<uint>{},
-            d_in_kv,
-            d_out_kv,
-            num_segments,
-            d_begin_offsets,
-            d_end_offsets,
-            ArgMinOp(),
-            IVP{1, std::numeric_limits<ValueType>::max()});
+        Reduce<IVP>(cmdlist,
+                    BufferView<uint>{},
+                    d_in_kv,
+                    d_out_kv,
+                    num_segments,
+                    d_begin_offsets,
+                    d_end_offsets,
+                    ArgMinOp(),
+                    IVP{1, std::numeric_limits<ValueType>::max()});
 
         // copy result to d_out and d_index_out
         lcpp_check(arg_assign<ValueType>(cmdlist, d_out_kv, d_begin_offsets, d_index_out, d_out, num_segments),
-        cmdlist, debug_stream());
+                   cmdlist,
+                   debug_stream());
     }
 
 
@@ -320,45 +357,62 @@ class DeviceSegmentReduce : public LuisaModule
                 uint                  num_segments,
                 uint                  segment_size)
     {
+        if(num_segments == 0u)
+        {
+            return;
+        }
         using IVP = IndexValuePairT<ValueType>;
 
         // slice kv buffers from temp_storage
-        size_t offset_uint = 0;
-        size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
-        auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
+        size_t offset_uint      = 0;
+        size_t in_kv_uint_count = bytes_to_uint_count(d_in.size() * sizeof(IVP));
+        auto   d_in_kv = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
         offset_uint += in_kv_uint_count;
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
-        auto   d_out_kv          = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
+        auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
         // construct key value pair
         lcpp_check(arg_construct(cmdlist, d_in, d_in_kv, num_segments), cmdlist, debug_stream());
 
-        Reduce<IVP>(
-            cmdlist,
-                BufferView<uint>{},
-                d_in_kv,
-                d_out_kv,
-                num_segments,
-                segment_size,
-                ArgMinOp(),
-                IVP{1, std::numeric_limits<ValueType>::max()});
+        Reduce<IVP>(cmdlist,
+                    BufferView<uint>{},
+                    d_in_kv,
+                    d_out_kv,
+                    num_segments,
+                    segment_size,
+                    ArgMinOp(),
+                    IVP{1, std::numeric_limits<ValueType>::max()});
 
         // copy result to d_out and d_index_out
         lcpp_check(arg_fixed_size_assign<ValueType>(cmdlist, d_out_kv, d_index_out, d_out, num_segments, segment_size),
-        cmdlist, debug_stream());
+                   cmdlist,
+                   debug_stream());
+    }
+
+    template <NumericT ValueType>
+    void Argmin(CommandList&          cmdlist,
+                BufferView<uint>      temp_storage,
+                BufferView<ValueType> d_in,
+                BufferView<ValueType> d_out,
+                BufferView<uint>      d_index_out,
+                uint                  num_segments,
+                BufferView<uint>      d_begin_offsets,
+                BufferView<uint>      d_end_offsets)
+    {
+        ArgMin(cmdlist, temp_storage, d_in, d_out, d_index_out, num_segments, d_begin_offsets, d_end_offsets);
     }
 
 
   private:
     template <typename Type, typename ReduceOp>
     [[nodiscard]] int segment_reduce_array_recursive(luisa::compute::CommandList& cmdlist,
-                                        BufferView<Type>             arr_in,
-                                        BufferView<Type>             arr_out,
-                                        size_t                       num_segments,
-                                        BufferView<uint>             d_begin_offsets,
-                                        BufferView<uint>             d_end_offsets,
-                                        ReduceOp                     reduce_op,
-                                        Type                         initial_value)
+                                                     BufferView<Type>             arr_in,
+                                                     BufferView<Type>             arr_out,
+                                                     size_t                       num_segments,
+                                                     BufferView<uint>             d_begin_offsets,
+                                                     BufferView<uint>             d_end_offsets,
+                                                     ReduceOp                     reduce_op,
+                                                     Type                         initial_value)
     {
         using SegmentReduce = details::SegmentReduceModule<Type, BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
         using SegmentReduceKernel = SegmentReduce::SegmentReduceKernel;
@@ -368,13 +422,22 @@ class DeviceSegmentReduce : public LuisaModule
         if(ms_segment_reduce_it == ms_segment_reduce_map.end())
         {
             auto shader = SegmentReduce().compile(m_device, m_shared_mem_size, reduce_op);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_segment_reduce_map.try_emplace(key, std::move(shader));
             ms_segment_reduce_it = ms_segment_reduce_map.find(key);
         }
-        if(ms_segment_reduce_it == ms_segment_reduce_map.end()) { return -1; }
+        if(ms_segment_reduce_it == ms_segment_reduce_map.end())
+        {
+            return -1;
+        }
         auto ms_segment_reduce_ptr = reinterpret_cast<SegmentReduceKernel*>(&(*ms_segment_reduce_it->second));
-        if(!ms_segment_reduce_ptr) { return -1; }
+        if(!ms_segment_reduce_ptr)
+        {
+            return -1;
+        }
         cmdlist << (*ms_segment_reduce_ptr)(arr_in, arr_out, d_begin_offsets, d_end_offsets, num_segments, initial_value)
                        .dispatch(num_segments * m_block_size);
         return 0;
@@ -382,12 +445,12 @@ class DeviceSegmentReduce : public LuisaModule
 
     template <typename Type4Byte, typename ReduceOp>
     [[nodiscard]] int fixed_segment_reduce_array_recursive(luisa::compute::CommandList& cmdlist,
-                                              BufferView<Type4Byte>        arr_in,
-                                              BufferView<Type4Byte>        arr_out,
-                                              uint                         num_segments,
-                                              uint                         segment_size,
-                                              ReduceOp                     reduce_op,
-                                              Type4Byte                    initial_value)
+                                                           BufferView<Type4Byte>        arr_in,
+                                                           BufferView<Type4Byte>        arr_out,
+                                                           uint      num_segments,
+                                                           uint      segment_size,
+                                                           ReduceOp  reduce_op,
+                                                           Type4Byte initial_value)
     {
 
         using SegmentReduce = details::SegmentReduceModule<Type4Byte, BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
@@ -407,14 +470,23 @@ class DeviceSegmentReduce : public LuisaModule
         if(ms_fixed_size_segment_reduce_it == ms_fixed_segment_reduce_map.end())
         {
             auto shader = SegmentReduce().compile_fixed_size(m_device, m_shared_mem_size, reduce_op);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_fixed_segment_reduce_map.try_emplace(key, std::move(shader));
             ms_fixed_size_segment_reduce_it = ms_fixed_segment_reduce_map.find(key);
         }
-        if(ms_fixed_size_segment_reduce_it == ms_fixed_segment_reduce_map.end()) { return -1; }
+        if(ms_fixed_size_segment_reduce_it == ms_fixed_segment_reduce_map.end())
+        {
+            return -1;
+        }
         auto ms_fixed_size_segment_reduce_ptr =
             reinterpret_cast<FixedSizeSegmentReduceKernel*>(&(*ms_fixed_size_segment_reduce_it->second));
-        if(!ms_fixed_size_segment_reduce_ptr) { return -1; }
+        if(!ms_fixed_size_segment_reduce_ptr)
+        {
+            return -1;
+        }
         for(auto invocation_index = 0u; invocation_index < num_invocations; invocation_index++)
         {
             const auto current_seg_offset = invocation_index * num_segments_per_invocation;
@@ -431,9 +503,9 @@ class DeviceSegmentReduce : public LuisaModule
 
     template <NumericT Type4Byte>
     [[nodiscard]] int arg_construct(CommandList&                           cmdlist,
-                       BufferView<Type4Byte>                  d_in,
-                       BufferView<IndexValuePairT<Type4Byte>> d_kv_out,
-                       uint                                   num_segments)
+                                    BufferView<Type4Byte>                  d_in,
+                                    BufferView<IndexValuePairT<Type4Byte>> d_kv_out,
+                                    uint                                   num_segments)
     {
         using ArgReduce          = details::ArgSegmentReduceModule<Type4Byte, BLOCK_SIZE>;
         using ArgConstructShader = ArgReduce::ArgConstructShaderT;
@@ -442,13 +514,22 @@ class DeviceSegmentReduce : public LuisaModule
         if(ms_arg_construct_it == ms_arg_construct_map.end())
         {
             auto shader = ArgReduce().compile_arg_construct_shader(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_arg_construct_map.try_emplace(key, std::move(shader));
             ms_arg_construct_it = ms_arg_construct_map.find(key);
         }
-        if(ms_arg_construct_it == ms_arg_construct_map.end()) { return -1; }
+        if(ms_arg_construct_it == ms_arg_construct_map.end())
+        {
+            return -1;
+        }
         auto ms_arg_construct_ptr = reinterpret_cast<ArgConstructShader*>(&(*ms_arg_construct_it->second));
-        if(!ms_arg_construct_ptr) { return -1; }
+        if(!ms_arg_construct_ptr)
+        {
+            return -1;
+        }
 
         auto num_tiles = ceil_div(num_segments, m_block_size);
         cmdlist << (*ms_arg_construct_ptr)(d_in, d_kv_out).dispatch(d_in.size());
@@ -457,11 +538,11 @@ class DeviceSegmentReduce : public LuisaModule
 
     template <NumericT Type4Byte>
     [[nodiscard]] int arg_assign(CommandList&                           cmdlist,
-                    BufferView<IndexValuePairT<Type4Byte>> d_kv_in,
-                    BufferView<uint>                       d_begin_offset,
-                    BufferView<uint>                       d_index_out,
-                    BufferView<Type4Byte>                  d_value_out,
-                    uint                                   num_segments)
+                                 BufferView<IndexValuePairT<Type4Byte>> d_kv_in,
+                                 BufferView<uint>                       d_begin_offset,
+                                 BufferView<uint>                       d_index_out,
+                                 BufferView<Type4Byte>                  d_value_out,
+                                 uint                                   num_segments)
     {
         using ArgReduce       = details::ArgSegmentReduceModule<Type4Byte, WARP_NUMS>;
         using ArgAssignShader = ArgReduce::ArgAssignShaderT;
@@ -470,24 +551,33 @@ class DeviceSegmentReduce : public LuisaModule
         if(ms_arg_assign_it == ms_arg_assign_map.end())
         {
             auto shader = ArgReduce().compile_arg_assign_shader(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_arg_assign_map.try_emplace(key, std::move(shader));
             ms_arg_assign_it = ms_arg_assign_map.find(key);
         }
-        if(ms_arg_assign_it == ms_arg_assign_map.end()) { return -1; }
+        if(ms_arg_assign_it == ms_arg_assign_map.end())
+        {
+            return -1;
+        }
         auto ms_arg_assign_ptr = reinterpret_cast<ArgAssignShader*>(&(*ms_arg_assign_it->second));
-        if(!ms_arg_assign_ptr) { return -1; }
+        if(!ms_arg_assign_ptr)
+        {
+            return -1;
+        }
         cmdlist << (*ms_arg_assign_ptr)(d_kv_in, d_begin_offset, d_index_out, d_value_out).dispatch(num_segments * WARP_NUMS);
         return 0;
     }
 
     template <NumericT Type4Byte>
     [[nodiscard]] int arg_fixed_size_assign(CommandList&                           cmdlist,
-                               BufferView<IndexValuePairT<Type4Byte>> d_kv_in,
-                               BufferView<uint>                       d_index_out,
-                               BufferView<Type4Byte>                  d_value_out,
-                               uint                                   num_segments,
-                               uint                                   segment_size)
+                                            BufferView<IndexValuePairT<Type4Byte>> d_kv_in,
+                                            BufferView<uint>                       d_index_out,
+                                            BufferView<Type4Byte>                  d_value_out,
+                                            uint                                   num_segments,
+                                            uint                                   segment_size)
     {
         using ArgReduce       = details::ArgSegmentReduceModule<Type4Byte, WARP_NUMS>;
         using ArgAssignShader = ArgReduce::ArgFixedSizeAssignShaderT;
@@ -500,13 +590,22 @@ class DeviceSegmentReduce : public LuisaModule
         if(ms_arg_assign_it == ms_arg_fixed_size_assign_map.end())
         {
             auto shader = ArgReduce().compile_arg_fixed_size_assign_shader(m_device);
-            if (!shader) { return -1; }
+            if(!shader)
+            {
+                return -1;
+            }
             ms_arg_fixed_size_assign_map.try_emplace(key, std::move(shader));
             ms_arg_assign_it = ms_arg_fixed_size_assign_map.find(key);
         }
-        if(ms_arg_assign_it == ms_arg_fixed_size_assign_map.end()) { return -1; }
+        if(ms_arg_assign_it == ms_arg_fixed_size_assign_map.end())
+        {
+            return -1;
+        }
         auto ms_arg_assign_ptr = reinterpret_cast<ArgAssignShader*>(&(*ms_arg_assign_it->second));
-        if(!ms_arg_assign_ptr) { return -1; }
+        if(!ms_arg_assign_ptr)
+        {
+            return -1;
+        }
         cmdlist << (*ms_arg_assign_ptr)(d_kv_in, segment_size, d_index_out, d_value_out).dispatch(num_segments * WARP_NUMS);
         return 0;
     }

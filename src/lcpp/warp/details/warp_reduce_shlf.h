@@ -22,25 +22,29 @@ namespace details
     struct WarpReduceShfl
     {
         constexpr static bool IS_ARCH_WARP = (LOGIC_WARP_SIZE == details::WARP_SIZE);
+        compute::UInt         physical_lane;
+        compute::UInt         warp_base;
         compute::UInt         lane_id;
-        compute::UInt         warp_id;
-        compute::UInt         member_mask;
 
         WarpReduceShfl()
-            : lane_id(warp_lane_id())
-            , warp_id(IS_ARCH_WARP ? 0 : warp_lane_id() / compute::UInt(LOGIC_WARP_SIZE))
-            , member_mask(IS_ARCH_WARP ? 0xFFFFFFFFu : warp_mask<LOGIC_WARP_SIZE>(warp_id))
+            : physical_lane(warp_lane_id())
+            , warp_base(physical_lane / compute::UInt(LOGIC_WARP_SIZE) * compute::UInt(LOGIC_WARP_SIZE))
+            , lane_id(physical_lane - warp_base)
         {
-            if constexpr(!IS_ARCH_WARP)
-            {
-                lane_id = lane_id % compute::UInt(LOGIC_WARP_SIZE);
-            }
         }
 
         template <typename ReduceOp>
         Var<Type4Byte> Reduce(const Var<Type4Byte>& input, ReduceOp op, UInt valid_item = LOGIC_WARP_SIZE)
         {
-            return ReduceStep(input, op, valid_item - 1);
+            Var<Type4Byte> result = input;
+            $for(source_lane, compute::UInt(LOGIC_WARP_SIZE))
+            {
+                Var<Type4Byte> candidate = WarpReadLane(input, warp_base + source_lane);
+                Var<Type4Byte> combined  = op(result, candidate);
+                Bool           include   = source_lane > lane_id & source_lane < valid_item;
+                result                   = Select(result, combined, include);
+            };
+            return result;
         }
 
         template <bool HEAD_SEGMENT, typename FlagT, typename ReduceOp>
@@ -49,41 +53,36 @@ namespace details
                                      ReduceOp              reduce_op,
                                      UInt                  valid_item = LOGIC_WARP_SIZE)
         {
-            UInt warp_flags = compute::warp_active_bit_mask(flag == 1u).x;
-            if constexpr(HEAD_SEGMENT)
+            UInt segment_end    = compute::select(UInt(0u), valid_item - 1u, valid_item > 0u);
+            Bool found_boundary = false;
+            $for(source_lane, compute::UInt(LOGIC_WARP_SIZE))
             {
-                warp_flags >>= 1;
-            };
-
-            warp_flags &= get_lane_mask_ge();
-
-            if constexpr(!IS_ARCH_WARP)
-            {
-                warp_flags = (warp_flags & member_mask) >> (warp_id * UInt(LOGIC_WARP_SIZE));
-            };
-
-            warp_flags |= 1u << (UInt(LOGIC_WARP_SIZE) - 1u);
-
-            UInt last_lane = compute::ctz(warp_flags);
-
-            return ReduceStep(input, reduce_op, last_lane);
-        }
-
-      private:
-        template <typename ReduceOp>
-        Var<Type4Byte> ReduceStep(const Var<Type4Byte>& input, ReduceOp op, UInt valid_item = LOGIC_WARP_SIZE)
-        {
-            Var<Type4Byte> result = input;
-
-            compute::UInt offset = 1u;
-            $while(offset < compute::warp_lane_count())
-            {
-                Var<Type4Byte> temp = ShuffleDown(result, lane_id, offset, valid_item);
-                $if(lane_id + offset <= valid_item)
+                UInt       candidate_lane = source_lane;
+                Var<FlagT> candidate_flag = WarpReadLane(flag, warp_base + candidate_lane);
+                Bool       is_boundary    = candidate_flag != Var<FlagT>(0);
+                if constexpr(HEAD_SEGMENT)
                 {
-                    result = op(result, temp);
-                };
-                offset <<= 1;
+                    is_boundary = is_boundary & (candidate_lane > lane_id);
+                }
+                else
+                {
+                    is_boundary = is_boundary & (candidate_lane >= lane_id);
+                }
+                is_boundary        = is_boundary & (candidate_lane < valid_item) & !found_boundary;
+                UInt candidate_end = HEAD_SEGMENT ? candidate_lane - 1u : candidate_lane;
+                segment_end        = compute::select(segment_end, candidate_end, is_boundary);
+                found_boundary     = found_boundary | is_boundary;
+            };
+
+            Var<Type4Byte> result = input;
+            $for(source_lane, compute::UInt(LOGIC_WARP_SIZE))
+            {
+                UInt           candidate_lane = source_lane;
+                Var<Type4Byte> candidate      = WarpReadLane(input, warp_base + candidate_lane);
+                Var<Type4Byte> combined       = reduce_op(result, candidate);
+                Bool           include = candidate_lane > lane_id & candidate_lane <= segment_end
+                               & candidate_lane < valid_item;
+                result = Select(result, combined, include);
             };
             return result;
         }

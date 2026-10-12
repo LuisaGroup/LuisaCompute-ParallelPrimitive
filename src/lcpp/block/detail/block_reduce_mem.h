@@ -31,24 +31,23 @@ namespace details
                               ReduceOp                reduce_op,
                               UInt                    valid_item = BLOCK_SIZE)
         {
-            Var<Type4Byte> result;
-            Int            thid   = Int(thread_id().x);
-            (*m_shared_mem)[thid] = thread_data;
+            UInt           tid    = thread_id().x;
+            Var<Type4Byte> result = thread_data;
+            (*m_shared_mem)[tid]  = thread_data;
             sync_block();
-            UInt stride = BLOCK_SIZE >> 1;
-            $while(stride > 0)
-            {
-                $if(thid < stride)
-                {
-                    (*m_shared_mem)[thid] = reduce_op((*m_shared_mem)[thid], (*m_shared_mem)[thid + stride]);
-                };
-                sync_block();
-                stride >>= 1;
-            };
 
-            $if(thid == 0)
+            // Preserve input order and support partial/non-power-of-two blocks.
+            // As with CUB, only thread 0's result is specified.
+            $if(tid == 0u)
             {
-                result = (*m_shared_mem)[0];
+                result = (*m_shared_mem)[0u];
+                $for(item, compute::UInt(1u), compute::UInt(BLOCK_SIZE))
+                {
+                    $if(item < valid_item)
+                    {
+                        result = reduce_op(result, (*m_shared_mem)[item]);
+                    };
+                };
             };
             return result;
         }

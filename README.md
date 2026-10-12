@@ -1,6 +1,6 @@
 # LCPP - LuisaCompute Parallel Primitives
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org/)
 
 A high-performance GPU parallel primitives library built on [LuisaCompute](https://github.com/LuisaGroup/LuisaCompute), providing thread-level to device-level parallel operations. LCPP is a header-only C++20 library inspired by CUDA CUB (Cooperative primitives for CUDA C++).
@@ -10,15 +10,15 @@ A high-performance GPU parallel primitives library built on [LuisaCompute](https
 LCPP provides a comprehensive set of parallel primitives organized in a hierarchical architecture:
 
 ```
-Device Level  → DeviceReduce, DeviceScan, DeviceRadixSort, DeviceSegmentReduce
+Device Level  → Reduce, Scan, Sort, Select, Partition, Find, Transform, Copy, RLE, SpMV
        ↓
 Agent Layer   → Algorithm policy management (e.g., OneSweepSmallKeyTunedPolicy)
        ↓
-Block Level   → BlockReduce, BlockScan, BlockLoad, BlockStore, BlockRadixRank
+Block Level   → Reduce, Scan, Load/Store, Exchange, Sort, Histogram, Shuffle
        ↓
-Warp Level    → WarpReduce, WarpScan, WarpExchange (32 threads)
+Warp Level    → Reduce, Scan, Exchange, Load/Store, MergeSort (32 threads)
        ↓
-Thread Level  → ThreadReduce, ThreadScan
+Thread Level  → Reduce, Scan, Search, Sort, Load, Store
 ```
 
 ### Key Features
@@ -28,7 +28,7 @@ Thread Level  → ThreadReduce, ThreadScan
 - **Lazy compilation** - Shaders are compiled on-demand using the `lazy_compile` macro
 - **Flexible algorithms** - Multiple algorithm implementations (SHARED_MEMORY, WARP_SHUFFLE)
 - **Type-safe** - Modern C++20 with strong type checking
-- **Performance-focused** - Optimized policies and tuning parameters
+- **Portable semantics first** - Optimized policies where available, with portable fallbacks
 
 ## Build
 
@@ -51,13 +51,16 @@ xmake
 # Build tests
 xmake build -g test
 
-# Run tests
+# Run tests (CUDA is the Linux default)
 xmake run block_level_test
 xmake run warp_level_test
 xmake run device_reduce_test
 xmake run device_scan_test
 xmake run device_segment_reduce
 xmake run device_radix_sort_one_sweep
+
+# Select Vulkan explicitly
+xmake run device_scan_test --backend=vk
 ```
 
 `xmake prepare-lc` only updates a clean `LuisaCompute/` checkout on its `next`
@@ -65,11 +68,17 @@ branch with the official `origin` URL. It refuses dirty, divergent, wrong-branch
 or wrong-remote checkouts instead of overwriting local work. Regular `xmake`
 commands do not access the network when `lc_use_xrepo=false`.
 
+The vendored XMake configuration enables LuisaCompute's native XIR-to-SPIR-V
+path for Vulkan. Keep `lc_vk_backend_use_xir_spirv=true`: the complete LCPP
+surface includes bindless destination-buffer writes that are not implemented by
+the legacy HLSL-to-SPIR-V path.
+
 ### CMake
 
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+    -DLUISA_COMPUTE_ENABLE_VK_XIR_SPIRV=ON
 cmake --build .
 
 # Run tests
@@ -83,164 +92,283 @@ ctest
 
 ```cpp
 #include <lcpp/parallel_primitive.h>
+using namespace luisa;
+using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
 
 // Create device and stream
-Context ctx{argv[0]};
-Device device = ctx.create_device("cuda");
+Context context{argv[0]};
+Device device = context.create_device("cuda");
 Stream stream = device.create_stream();
 
 // Device-level reduce example
 DeviceReduce<> device_reduce;
-device_reduce.create(device);
+device_reduce.create(device, &stream);
 
-Buffer<int> input = device.create_buffer<int>(1024);
-Buffer<int> output = device.create_buffer<int>(1);
+constexpr size_t item_count = 4096u;
+Buffer<int> input = device.create_buffer<int>(item_count);
+Buffer<int> output = device.create_buffer<int>(1u);
+size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<int>(item_count);
+Buffer<uint> temp_storage =
+    device.create_buffer<uint>((temp_bytes + sizeof(uint) - 1u) / sizeof(uint));
 
 CommandList cmdlist;
-device_reduce.Sum(cmdlist, stream, input, output, 1024);
+device_reduce.Sum(cmdlist, temp_storage.view(), input.view(), output.view(), item_count);
 stream << cmdlist.commit() << synchronize();
 ```
 
 ## Implemented Features
 
 ### ✅ Thread Level
-- [x] **ThreadReduce** - Thread-level reduction operations
-- [x] **ThreadScan** - Thread-level scan (prefix sum) operations
+- [x] **ThreadReduce** - Full and partial fixed-array reductions
+- [x] **ThreadScan** - Full and partial inclusive/exclusive fixed-array scans
+- [x] **ThreadSearch** - Lower/upper-bound and merge-path searches
+- [x] **ThreadSort** - Stable key and key-value odd-even sorting
+- [x] **ThreadLoad / ThreadStore** - Cache-modifier-compatible scalar access
 
 ### ✅ Warp Level (32 threads)
-- [x] **WarpReduce** - Warp-level reduction (Sum, Min, Max, custom operators)
-- [x] **WarpScan** - Warp-level inclusive/exclusive scan
+- [x] **WarpReduce** - Scalar/array, valid-item, and head/tail-segmented reductions
+- [x] **WarpReduceBatched** - Independent batched reductions with direct, striped, and blocked layouts
+- [x] **WarpScan** - Full and partial inclusive/exclusive scans and broadcast
 - [x] **WarpExchange** - Data exchange patterns within a warp
+- [x] **WarpLoad / WarpStore** - Blocked, striped, and transpose I/O
+- [x] **WarpMergeSort** - Stable key and key-value merge sort
 
 ### ✅ Block Level (typically 256 threads)
 - [x] **BlockReduce** - Block-level reduction with SHARED_MEMORY and WARP_SHUFFLE algorithms
-- [x] **BlockScan** - Block-level inclusive/exclusive scan with prefix callback support
+- [x] **BlockScan** - Inclusive/exclusive scans, aggregates, initial values, and prefix callbacks
 - [x] **BlockLoad** - Efficient block-wide data loading (DIRECT, STRIPED modes)
 - [x] **BlockStore** - Efficient block-wide data storing
 - [x] **BlockExchange** - Data rearrangement within a block
 - [x] **BlockRadixRank** - Ranking operations for radix sort
+- [x] **BlockRadixSort** - Numeric/decomposed key and pair sorting with bit ranges and layout conversion
 - [x] **BlockDiscontinuity** - Flag head/tail discontinuities in sequences
+- [x] **BlockAdjacentDifference** - Left/right differences and flags
+- [x] **BlockHistogram** - Sort and atomic histogram policies
+- [x] **BlockMergeSort** - Stable blocked and striped merge sort
+- [x] **BlockRunLengthDecode** - Block-wide run decoding
+- [x] **BlockShuffle** - Offset, up, and down shuffles
 
 ### ✅ Device Level
-- [x] **DeviceReduce** - Device-wide reduction (Sum, Min, Max, custom operators)
-- [x] **DeviceScan** - Device-wide inclusive/exclusive scan with decoupled look-back
-- [x] **DeviceRadixSort** - Radix sort with OneSweep algorithm (SortKeys, SortPairs)
+- [x] **DeviceAdjacentDifference** - In-place/copy left and right adjacent differences
+- [x] **DeviceBatchedTopK** - Per-segment min/max key and pair selection over flat buffers
+- [x] **DeviceCopy** - Typed batched copies and multidimensional layout conversion
+- [x] **DeviceFind** - First-match search, batched bounds, and sorted-query bound variants
+- [x] **DeviceFor** - Mutable/copy iteration, bulk dispatch, and multidimensional layouts
+- [x] **DeviceHistogram** - Even/range histogram computation
+- [x] **DeviceMemcpy** - Batched raw-byte copies over bindless source and destination ranges
+- [x] **DeviceMerge** - Sorted key and key-value pair merging with custom ordering
+- [x] **DeviceMergeSort** - Copy/in-place key and pair sorting with stable variants
+- [x] **DevicePartition** - Flagged, two-way predicate, and three-way predicate partitioning
+- [x] **DeviceRadixSort** - Numeric/decomposed key and pair sorting with copy and DoubleBuffer flows
+- [x] **DeviceReduce** - Reductions, custom arg comparison, transform-reduce, and reduce-by-key
+- [x] **DeviceRunLengthEncode** - Full and non-trivial run encoding
+- [x] **DeviceScan** - Inclusive/exclusive, initialized-inclusive, and by-key scans
+- [x] **DeviceSelect** - Flagged/FlaggedIf, predicate, unique, and unique-by-key copy/in-place selection
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
-- [x] **DeviceHistogram** - Histogram computation
-- [x] **DeviceFor** - Parallel for-loop utilities
+- [x] **DeviceSegmentedScan** - Inclusive/exclusive scans with shared or independent output offsets
+- [x] **DeviceSegmentedRadixSort** - Numeric bit-range copy and DoubleBuffer sorting within segments
+- [x] **DeviceSegmentedSort** - Ordered/stable copy and DoubleBuffer sorting within segments
+- [x] **DeviceTopK** - Min/max key and pair selection with numeric or decomposed keys
+- [x] **DeviceTransform** - Fill, generate, conditional, tuple-input, and tuple-output transforms
+- [x] **DeviceSpmv** - CSR sparse-matrix vector multiplication (retained LCPP extension)
 
-## TODO List (Compared to CUDA CUB)
+## CUB Comparison Coverage
 
-This section tracks missing features compared to the CUDA CUB library. Contributions are welcome!
+This matrix is derived from the public semantic method and data-flow families in
+CCCL/CUB v3.5.0 at release commit
+`28101b07413743e1dcca8ca8af1cfc63e8cff2d1`. It records the portable
+LuisaCompute surface implemented here.
+
+### Completion Status
+
+Portable semantic coverage of the pinned public surface is complete:
+
+- [x] Add the aggregate-header device families that were not represented:
+  `DeviceBatchedTopK`, `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
+  `DeviceTransform`.
+- [x] Add the v3.5 sorted-query `DeviceFind` variants and the portable
+  flat-buffer `DeviceBatchedTopK` key/pair method groups.
+- [x] Evaluate the public families outside the aggregate header and implement
+  the portable ones, including `thread_search`, `thread_sort`,
+  `WarpReduceBatched`, and `DeviceSegmentedScan`.
+- [x] Audit existing families overload-by-overload and implement every distinct
+  portable method/data-flow group, including copy/in-place and DoubleBuffer
+  forms, decomposed radix keys, multidimensional layouts, initialized scans,
+  partial collectives, custom comparators, and three-way partitioning.
+- [x] Cover temporary-storage queries, empty inputs, aliasing, range boundaries,
+  stability, selector updates, and custom comparison behavior where applicable.
+- [x] Export every implemented family through `lcpp/parallel_primitive.h` and
+  register all 40 GPU behavior tests in both XMake and CMake.
+
+This is semantic portability, not CUDA source compatibility. LCPP deliberately
+collapses CUB's legacy/environment/stream wrappers and two-call scratch-query
+protocol into LuisaCompute modules, `CommandList`, and explicit storage queries.
+It does not claim arbitrary CUDA iterator compatibility, 64-bit dispatch,
+architecture-specific performance parity, or identical overload signatures.
+Some portable fallback algorithms favor clarity and correctness over CUB-level
+asymptotic performance.
+
+The v3.5 `DeviceBatchedTopK` adapter intentionally uses LuisaCompute buffer
+views plus begin/end offsets and packed `segment * k` output. CUDA iterator
+arrays, `cuda::args` deferred problem sizes, execution environments, and CUB's
+architecture-specific tuning remain outside the portable contract.
+
+### Verification
+
+- Public aggregate: 6 thread, 7 warp, 13 block, and 22 device headers. The
+  device set contains the 20 v3.5 aggregate families, public
+  `DeviceSegmentedScan`, and the retained `DeviceSpmv` extension.
+- Validation snapshot: Linux x86_64, NVIDIA GeForce RTX 5090, LuisaCompute
+  `next` at `9ff7419332340683402993e3b5b57f186767e4c0` (2026-10-12).
+- Forced XMake ordinary Release, CUDA: 40/40 executables, 140 tests,
+  16,809,376 assertions.
+- Forced XMake SAFE Release, CUDA: 40/40 executables, 140 tests,
+  16,809,376 assertions.
+- Forced XMake ordinary Release, Vulkan with native XIR-to-SPIR-V: 40/40
+  executables, 140 tests, 16,809,376 assertions.
+- Forced XMake SAFE Release, Vulkan with native XIR-to-SPIR-V: 40/40
+  executables, 140 tests, 16,809,376 assertions.
+- Independent CMake CUDA Release build and CTest: 40/40 tests passed.
+
+Both Vulkan rows were run with `LUISA_VULKAN_VALIDATION=1`,
+`LUISA_VULKAN_REQUIRE_NATIVE_XIR_SPIRV=1`, and `LUISA_DUMP_SOURCE=1`. These
+guards reject compatibility-route fallback and force fresh JIT code generation.
+
+This snapshot does not claim runtime validation for Metal or DirectX. The
+portable API surface is shared, but those backends still require their own
+build and GPU test runs.
 
 ### Priority 1: High-Priority Device Operations
 
 #### DeviceSelect
-- [ ] `DeviceSelect::Flagged` - Select items based on selection flags
-- [ ] `DeviceSelect::If` - Select items based on predicate
-- [ ] `DeviceSelect::Unique` - Select unique items from input sequence
-- [ ] `DeviceSelect::UniqueByKey` - Select unique keys from key-value pairs
+- [x] `DeviceSelect::Flagged` - Select items based on selection flags
+- [x] `DeviceSelect::FlaggedIf` - Select items by applying a predicate to flags
+- [x] `DeviceSelect::If` - Select items based on predicate
+- [x] `DeviceSelect::Unique` - Select unique items from input sequence
+- [x] `DeviceSelect::UniqueByKey` - Select unique keys from key-value pairs
+- [x] Copy and exact in-place data flows where provided by the pinned contract
 
 #### DevicePartition
-- [ ] `DevicePartition::Flagged` - Partition based on selection flags
-- [ ] `DevicePartition::If` - Partition based on predicate
+- [x] `DevicePartition::Flagged` - Partition based on selection flags
+- [x] `DevicePartition::If` - Two-way and three-way predicate partitioning
 
 #### DeviceReduce Extensions
-- [ ] `DeviceReduce::ReduceByKey` - Reduce segments defined by keys
-- [ ] `DeviceReduce::ArgMin` - Find minimum value and its index
-- [ ] `DeviceReduce::ArgMax` - Find maximum value and its index
+- [x] `DeviceReduce::ReduceByKey` - Reduce segments defined by keys
+- [x] `DeviceReduce::ArgMin` - Find minimum value and its index
+- [x] `DeviceReduce::ArgMax` - Find maximum value and its index
+- [x] Custom strict-order comparators for argument reductions
 
 #### DeviceScan Extensions
-- [ ] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
-- [ ] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
-- [ ] Complete key-based scan implementation (partial implementation exists)
+- [x] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
+- [x] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
+- [x] `DeviceScan::InclusiveScanInit` - Inclusive scan with an explicit initial value
+- [x] Custom key equality and distinct key/value types
 
 ### Priority 2: Sorting and Merging
 
+#### DeviceRadixSort
+- [x] Numeric and decomposed key/pair sorting in ascending and descending order
+- [x] Copy and DoubleBuffer data flows with full/partial bit ranges and selector updates
+
 #### DeviceMergeSort
-- [ ] `DeviceMergeSort::SortKeys` - Stable merge sort for keys
-- [ ] `DeviceMergeSort::SortPairs` - Stable merge sort for key-value pairs
-- [ ] `DeviceMergeSort::StableSortKeys` - Guaranteed stable sort
-- [ ] `DeviceMergeSort::StableSortPairs` - Guaranteed stable sort for pairs
+- [x] `DeviceMergeSort::SortKeys` - Stable merge sort for keys
+- [x] `DeviceMergeSort::SortPairs` - Stable merge sort for key-value pairs
+- [x] `DeviceMergeSort::StableSortKeys` - Guaranteed stable sort
+- [x] `DeviceMergeSort::StableSortPairs` - Guaranteed stable sort for pairs
+- [x] `SortKeysCopy`, `StableSortKeysCopy`, and `SortPairsCopy` data flows
 
 #### DeviceSegmentedSort
-- [ ] `DeviceSegmentedRadixSort` - Radix sort within segments
-- [ ] `DeviceSegmentedSort` - General sorting within segments
+- [x] `DeviceSegmentedRadixSort` - Copy/DoubleBuffer radix ordering within segments
+- [x] `DeviceSegmentedSort` - Copy/DoubleBuffer ordered and stable sorting within segments
 
 #### BlockMergeSort
-- [ ] `BlockMergeSort::Sort` - Block-level stable merge sort
-- [ ] `BlockMergeSort::SortBlockedToStriped` - Sort with layout transformation
+- [x] `BlockMergeSort::Sort` - Block-level stable merge sort
+- [x] `BlockMergeSort::SortBlockedToStriped` - Sort with layout transformation
 
 ### Priority 3: Advanced Operations
 
 #### DeviceRunLengthEncode
-- [ ] `DeviceRunLengthEncode::Encode` - Run-length encoding
-- [ ] `DeviceRunLengthEncode::NonTrivialRuns` - Encode runs with length > 1
+- [x] `DeviceRunLengthEncode::Encode` - Run-length encoding
+- [x] `DeviceRunLengthEncode::NonTrivialRuns` - Encode runs with length > 1
 
 #### DeviceAdjacentDifference
-- [ ] `DeviceAdjacentDifference::SubtractLeft` - In-place left subtraction
-- [ ] `DeviceAdjacentDifference::SubtractLeftCopy` - Copy with left subtraction
-- [ ] `DeviceAdjacentDifference::SubtractRight` - In-place right subtraction
-- [ ] `DeviceAdjacentDifference::SubtractRightCopy` - Copy with right subtraction
+- [x] `DeviceAdjacentDifference::SubtractLeft` - In-place left subtraction
+- [x] `DeviceAdjacentDifference::SubtractLeftCopy` - Copy with left subtraction
+- [x] `DeviceAdjacentDifference::SubtractRight` - In-place right subtraction
+- [x] `DeviceAdjacentDifference::SubtractRightCopy` - Copy with right subtraction
 
 #### DeviceSpmv (Sparse Matrix Operations)
-- [ ] `DeviceSpmv::CsrMV` - Sparse matrix-vector multiplication (CSR format)
+- [x] `DeviceSpmv::CsrMV` - Sparse matrix-vector multiplication (CSR format)
 
 #### DeviceCopy
-- [ ] `DeviceCopy::Batched` - Batched memory copy operations
+- [x] `DeviceCopy::Batched` - Batched memory copy operations
+- [x] `DeviceCopy::Copy` - Multidimensional row/column-major layout conversion
+
+#### DeviceMemcpy
+- [x] `DeviceMemcpy::Batched` - Bindless raw-byte range copies
 
 ### Priority 4: Block-Level Extensions
 
 #### BlockRadixSort
-- [ ] `BlockRadixSort::Sort` - Complete radix sort (not just ranking)
-- [ ] `BlockRadixSort::SortDescending` - Descending radix sort
-- [ ] `BlockRadixSort::SortBlockedToStriped` - Sort with layout change
+- [x] `BlockRadixSort::Sort` - Complete radix sort (not just ranking)
+- [x] `BlockRadixSort::SortDescending` - Descending radix sort
+- [x] `BlockRadixSort::SortBlockedToStriped` - Sort with layout change
+- [x] Numeric and decomposed custom keys with full and partial bit ranges
 
 #### BlockHistogram
-- [ ] `BlockHistogram::Composite` - Block-level histogram computation
-- [ ] `BlockHistogram::Init` - Initialize histogram bins
+- [x] `BlockHistogram::Composite` - Block-level histogram computation
+- [x] `BlockHistogram::Init` - Initialize histogram bins
 
 #### BlockAdjacentDifference
-- [ ] `BlockAdjacentDifference::SubtractLeft` - Block-level left subtraction
-- [ ] `BlockAdjacentDifference::SubtractRight` - Block-level right subtraction
-- [ ] `BlockAdjacentDifference::FlagHeads` - Flag heads of segments
-- [ ] `BlockAdjacentDifference::FlagTails` - Flag tails of segments
+- [x] `BlockAdjacentDifference::SubtractLeft` - Block-level left subtraction
+- [x] `BlockAdjacentDifference::SubtractRight` - Block-level right subtraction
+- [x] `BlockAdjacentDifference::FlagHeads` - Flag heads of segments
+- [x] `BlockAdjacentDifference::FlagTails` - Flag tails of segments
 
 #### BlockRunLengthDecode
-- [ ] `BlockRunLengthDecode::RunLengthDecode` - Decode run-length encoded data
+- [x] `BlockRunLengthDecode::RunLengthDecode` - Decode run-length encoded data
 
 #### BlockShuffle
-- [ ] `BlockShuffle::Up` - Shuffle data up within block
-- [ ] `BlockShuffle::Down` - Shuffle data down within block
-- [ ] `BlockShuffle::Offset` - Shuffle data by offset
+- [x] `BlockShuffle::Up` - Shuffle data up within block
+- [x] `BlockShuffle::Down` - Shuffle data down within block
+- [x] `BlockShuffle::Offset` - Shuffle data by offset
 
 ### Priority 5: Warp-Level Extensions
 
 #### WarpMergeSort
-- [ ] `WarpMergeSort::Sort` - Warp-level stable merge sort
+- [x] `WarpMergeSort::Sort` - Warp-level stable merge sort
 
 #### WarpLoad/WarpStore
-- [ ] `WarpLoad` - Optimized warp-level data loading
-- [ ] `WarpStore` - Optimized warp-level data storing
+- [x] `WarpLoad` - Optimized warp-level data loading
+- [x] `WarpStore` - Optimized warp-level data storing
 
 #### WarpScan Extensions
-- [ ] `WarpScan::Broadcast` - Broadcast value across warp
+- [x] `WarpScan::Broadcast` - Broadcast value across warp
+- [x] Full and partial fixed-array inclusive/exclusive scan groups
 
 #### WarpReduce Extensions
-- [ ] `WarpReduce::HeadSegmentedReduce` - Segmented reduce with head flags
-- [ ] `WarpReduce::TailSegmentedReduce` - Segmented reduce with tail flags
+- [x] `WarpReduce::HeadSegmentedReduce` - Segmented reduce with head flags
+- [x] `WarpReduce::TailSegmentedReduce` - Segmented reduce with tail flags
+- [x] Fixed-array full and partial reduction groups
 
 ### Priority 6: Thread-Level Extensions
 
+#### ThreadReduce / ThreadScan
+- [x] Fixed-array full and partial reduction and scan groups
+
+#### ThreadSearch / ThreadSort
+- [x] Lower/upper-bound and merge-path search utilities
+- [x] Stable odd-even key and key/value sorting
+
 #### ThreadLoad/ThreadStore
-- [ ] `ThreadLoad` - Thread-level load with cache modifiers (CG, CA, CS, CV)
-- [ ] `ThreadStore` - Thread-level store with cache modifiers (CG, CS, WT, WB)
+- [x] `ThreadLoad` - Thread-level load with cache modifiers (CG, CA, CS, CV)
+- [x] `ThreadStore` - Thread-level store with cache modifiers (CG, CS, WT, WB)
 
 ### Algorithm Improvements
-- [ ] Add SHARED_MEMORY implementations for Warp operations (currently only WARP_SHUFFLE)
-- [ ] Add TRANSPOSE and WARP_TRANSPOSE modes for BlockLoad
-- [ ] Add VECTORIZE mode for BlockLoad/BlockStore
+- [x] Add SHARED_MEMORY implementations for Warp operations
+- [x] Add TRANSPOSE and WARP_TRANSPOSE modes for BlockLoad
+- [x] Add VECTORIZE mode for BlockLoad/BlockStore
 - [ ] Optimize policies for different GPU architectures
 - [ ] Add support for 64-bit indexing for large data
 
@@ -321,7 +449,11 @@ Contributions are welcome! Please feel free to:
 
 ## License
 
-[Specify your license here]
+LCPP is distributed under the [Apache License, Version 2.0](LICENSE).
+
+The license applies to this repository's source and documentation. Third-party
+dependencies, including LuisaCompute and CCCL/CUB, retain their own licenses
+and notices.
 
 ## Acknowledgments
 

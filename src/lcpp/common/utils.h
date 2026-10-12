@@ -7,10 +7,12 @@
 
 
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <typeindex>
+#include <cstdint>
 #include <luisa/dsl/builtin.h>
+#include <luisa/dsl/func.h>
 #include <luisa/dsl/var.h>
 #include <lcpp/common/util_type.h>
 #include <lcpp/runtime/core.h>
@@ -48,7 +50,7 @@ static inline int floor_pow_2(int n)
 template <typename T>
 constexpr inline T ceil_div(T a, T b) noexcept
 {
-    return (a + b - 1) / b;
+    return a / b + static_cast<T>(a % b != 0);
 }
 
 template <int N, int CURRENT_VAL = N, int COUNT = 0>
@@ -65,34 +67,45 @@ struct Log2<N, 0, COUNT>
 };
 
 
+template <typename Type, typename BinaryOp>
+uint64_t get_binary_op_hash(BinaryOp op)
+{
+    luisa::compute::Callable callable = [op](luisa::compute::Var<Type> a, luisa::compute::Var<Type> b) noexcept
+    { return op(a, b); };
+    return callable.function().hash();
+}
+
+template <typename Type, typename UnaryOp>
+uint64_t get_unary_op_hash(UnaryOp op)
+{
+    luisa::compute::Callable callable = [op](luisa::compute::Var<Type> value) noexcept
+    { return op(value); };
+    return callable.function().hash();
+}
+
 template <NumericT Type4Byte, typename ReduceOp>
 luisa::string get_type_and_op_desc(ReduceOp op)
 {
-    luisa::string_view key_desc       = luisa::compute::Type::of<Type4Byte>()->description();
-    luisa::string_view reduce_op_desc = std::type_index(typeid(op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc);
+    return luisa::format("{}+{}",
+                         luisa::compute::Type::of<Type4Byte>()->description(),
+                         get_binary_op_hash<Type4Byte>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp>
 luisa::string get_type_and_op_desc(ReduceOp op)
 {
-    using ValueType                   = value_type_of_t<KeyValueType>;
-    luisa::string_view key_desc       = luisa::compute::Type::of<ValueType>()->description();
-    luisa::string_view reduce_op_desc = std::type_index(typeid(op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc);
+    return luisa::format("{}+{}",
+                         luisa::compute::Type::of<KeyValueType>()->description(),
+                         get_binary_op_hash<KeyValueType>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp, typename TransformOp>
 luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    using ValueType                      = value_type_of_t<KeyValueType>;
-    luisa::string_view key_desc          = luisa::compute::Type::of<ValueType>()->description();
-    luisa::string_view reduce_op_desc    = std::type_index(typeid(op)).name();
-    luisa::string_view transform_op_desc = std::type_index(typeid(transform_op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc) + "+" + luisa::string(transform_op_desc);
+    return luisa::format("{}+{}+{}",
+                         luisa::compute::Type::of<KeyValueType>()->description(),
+                         get_binary_op_hash<KeyValueType>(op),
+                         get_unary_op_hash<KeyValueType>(transform_op));
 }
 
 template <typename KeyType, typename ValueType>
@@ -107,48 +120,43 @@ luisa::string get_type_and_op_desc()
 template <typename KeyType, typename ValueType, typename ReduceOp>
 luisa::string get_type_and_op_desc(ReduceOp op)
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
-
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc) + "+"
-           + std::type_index(typeid(op)).name();
+    return luisa::format("{}+{}+{}",
+                         luisa::compute::Type::of<KeyType>()->description(),
+                         luisa::compute::Type::of<ValueType>()->description(),
+                         get_binary_op_hash<ValueType>(op));
 }
 
 template <NumericT Type4Byte, typename ReduceOp, typename TransformOp>
 luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    luisa::string_view reduce_op_desc    = std::type_index(typeid(op)).name();
-    luisa::string_view key_desc          = luisa::compute::Type::of<Type4Byte>()->description();
-    luisa::string_view transform_op_desc = std::type_index(typeid(transform_op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc) + "+" + luisa::string(transform_op_desc);
+    return luisa::format("{}+{}+{}",
+                         luisa::compute::Type::of<Type4Byte>()->description(),
+                         get_binary_op_hash<Type4Byte>(op),
+                         get_unary_op_hash<Type4Byte>(transform_op));
 }
 
 
 template <typename KeyType, typename ValueType, typename ReduceOp, typename TransformOp>
 luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
-
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc) + "+"
-           + std::type_index(typeid(op)).name() + "+" + std::type_index(typeid(transform_op)).name();
+    return luisa::format("{}+{}+{}+{}",
+                         luisa::compute::Type::of<KeyType>()->description(),
+                         luisa::compute::Type::of<ValueType>()->description(),
+                         get_binary_op_hash<ValueType>(op),
+                         get_unary_op_hash<ValueType>(transform_op));
 }
 
 static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items)
 {
-    auto         block_size       = m_block_size;
-    unsigned int max_num_elements = num_items;
-    temp_storage_size             = 0;
-    unsigned int num_elements     = max_num_elements;  // input segment size
-    int          level            = 0;
+    auto   block_size   = m_block_size;
+    auto   tile_items   = items_per_thread * block_size;
+    size_t num_elements = num_items;
+    temp_storage_size   = 0;
     do
     {
-        // output segment size
-        unsigned int num_blocks = imax(1, (int)ceil((float)num_elements / (items_per_thread * block_size)));
+        size_t num_blocks = std::max<size_t>(1u, ceil_div(num_elements, tile_items));
         if(num_blocks > 1)
         {
-            level++;
             temp_storage_size += num_blocks;
         }
         num_elements = num_blocks;
@@ -162,6 +170,24 @@ inline size_t align_up_uint(size_t byte_offset, size_t alignment)
     return (byte_offset + alignment - 1) / alignment * alignment;
 }
 
+// Vulkan guarantees minStorageBufferOffsetAlignment is at most 256 bytes.
+// Keeping internal scratch-buffer views on this boundary also remains valid
+// for backends with less restrictive storage-buffer alignment requirements.
+inline constexpr size_t TEMP_STORAGE_VIEW_ALIGNMENT = 256u;
+
+inline size_t align_up_temp_storage(size_t byte_offset)
+{
+    return align_up_uint(byte_offset, TEMP_STORAGE_VIEW_ALIGNMENT);
+}
+
+template <typename T>
+inline size_t aligned_temp_storage_count(size_t element_count)
+{
+    static_assert(TEMP_STORAGE_VIEW_ALIGNMENT % sizeof(T) == 0u,
+                  "Temporary-storage element size must divide the portable view alignment.");
+    return align_up_temp_storage(element_count * sizeof(T)) / sizeof(T);
+}
+
 // Helper: convert byte size to uint element count (round up)
 inline size_t bytes_to_uint_count(size_t byte_size)
 {
@@ -172,13 +198,59 @@ inline size_t bytes_to_uint_count(size_t byte_size)
 static inline luisa::compute::Callable bit_log2 = [](luisa::compute::UInt x)
 { return 31 - luisa::compute::clz(x); };
 
+template <typename T>
+    requires(!KeyValuePairType<T>)
+luisa::compute::Var<T> WarpReadLane(const luisa::compute::Var<T>& input, luisa::compute::UInt source_lane)
+{
+    if constexpr(std::is_same_v<T, double>)
+    {
+        auto bits = input.template as<luisa::ulong>();
+        return compute::warp_read_lane(bits, source_lane).template as<double>();
+    }
+    else
+    {
+        return compute::warp_read_lane(input, source_lane);
+    }
+}
+
+template <NumericT KeyType, NumericT ValueType>
+luisa::compute::Var<KeyValuePair<KeyType, ValueType>> WarpReadLane(
+    const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& input, luisa::compute::UInt source_lane)
+{
+    luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
+    result.key   = WarpReadLane(input.key, source_lane);
+    result.value = WarpReadLane(input.value, source_lane);
+    return result;
+}
+
+template <typename T>
+    requires(!KeyValuePairType<T>)
+luisa::compute::Var<T> Select(const luisa::compute::Var<T>& false_value,
+                              const luisa::compute::Var<T>& true_value,
+                              luisa::compute::Bool          predicate)
+{
+    return compute::select(false_value, true_value, predicate);
+}
+
+template <NumericT KeyType, NumericT ValueType>
+luisa::compute::Var<KeyValuePair<KeyType, ValueType>> Select(
+    const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& false_value,
+    const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& true_value,
+    luisa::compute::Bool                                         predicate)
+{
+    luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
+    result.key   = compute::select(false_value.key, true_value.key, predicate);
+    result.value = compute::select(false_value.value, true_value.value, predicate);
+    return result;
+}
+
 template <NumericT Type4Byte>
 luisa::compute::Var<Type4Byte> ShuffleUp(luisa::compute::Var<Type4Byte>& input,
                                          luisa::compute::UInt            curr_lane_id,
                                          luisa::compute::UInt            offset,
                                          luisa::compute::UInt            first_lane = 0u)
 {
-    luisa::compute::Var<Type4Byte> result = compute::warp_read_lane(input, curr_lane_id - offset);
+    luisa::compute::Var<Type4Byte> result = WarpReadLane(input, curr_lane_id - offset);
 
     $if(compute::Int(curr_lane_id - offset) < compute::Int(first_lane))
     {
@@ -198,8 +270,8 @@ luisa::compute::Var<KeyValuePair<KeyType, ValueType>> ShuffleUp(luisa::compute::
     luisa::compute::UInt                                  src_lane = curr_lane_id - offset;
     $if(src_lane >= first_lane)
     {
-        result.key   = compute::warp_read_lane(input.key, src_lane);
-        result.value = compute::warp_read_lane(input.value, src_lane);
+        result.key   = WarpReadLane(input.key, src_lane);
+        result.value = WarpReadLane(input.value, src_lane);
     }
     $else
     {
@@ -215,7 +287,7 @@ luisa::compute::Var<Type4Byte> ShuffleDown(luisa::compute::Var<Type4Byte>& input
                                            luisa::compute::UInt            last_lane = 32u)
 {
     luisa::compute::UInt           src_lane = curr_lane_id + offset;
-    luisa::compute::Var<Type4Byte> result   = compute::warp_read_lane(input, src_lane);
+    luisa::compute::Var<Type4Byte> result   = WarpReadLane(input, src_lane);
     $if(src_lane > last_lane)
     {
         result = input;
@@ -232,8 +304,8 @@ luisa::compute::Var<KeyValuePair<KeyType, ValueType>> ShuffleDown(luisa::compute
 {
     luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
     luisa::compute::UInt                                  src_lane = curr_lane_id + offset;
-    result.key   = compute::warp_read_lane(input.key, src_lane);
-    result.value = compute::warp_read_lane(input.value, src_lane);
+    result.key   = WarpReadLane(input.key, src_lane);
+    result.value = WarpReadLane(input.value, src_lane);
     $if(src_lane > last_lane)
     {
         result = input;
