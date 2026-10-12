@@ -42,6 +42,7 @@
 #include <lcpp/block/block_discontinuity.h>
 // device level
 #include <lcpp/device/device_adjacent_difference.h>
+#include <lcpp/device/device_batched_topk.h>
 #include <lcpp/device/device_copy.h>
 #include <lcpp/device/device_find.h>
 #include <lcpp/device/device_for.h>

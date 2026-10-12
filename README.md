@@ -151,8 +151,9 @@ stream << cmdlist.commit() << synchronize();
 
 ### ✅ Device Level
 - [x] **DeviceAdjacentDifference** - In-place/copy left and right adjacent differences
+- [x] **DeviceBatchedTopK** - Per-segment min/max key and pair selection over flat buffers
 - [x] **DeviceCopy** - Typed batched copies and multidimensional layout conversion
-- [x] **DeviceFind** - First-match search and batched lower/upper bounds
+- [x] **DeviceFind** - First-match search, batched bounds, and sorted-query bound variants
 - [x] **DeviceFor** - Mutable/copy iteration, bulk dispatch, and multidimensional layouts
 - [x] **DeviceHistogram** - Even/range histogram computation
 - [x] **DeviceMemcpy** - Batched raw-byte copies over bindless source and destination ranges
@@ -175,8 +176,8 @@ stream << cmdlist.commit() << synchronize();
 ## CUB Comparison Coverage
 
 This matrix is derived from the public semantic method and data-flow families in
-CCCL/CUB v3.4.0 at commit
-`a5630ac57111e1aaef8cfe0069ede566c3d15f60`. It records the portable
+CCCL/CUB v3.5.0 at release commit
+`28101b07413743e1dcca8ca8af1cfc63e8cff2d1`. It records the portable
 LuisaCompute surface implemented here.
 
 ### Completion Status
@@ -184,8 +185,10 @@ LuisaCompute surface implemented here.
 Portable semantic coverage of the pinned public surface is complete:
 
 - [x] Add the aggregate-header device families that were not represented:
-  `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
+  `DeviceBatchedTopK`, `DeviceFind`, `DeviceMemcpy`, `DeviceMerge`, `DeviceTopK`, and
   `DeviceTransform`.
+- [x] Add the v3.5 sorted-query `DeviceFind` variants and the portable
+  flat-buffer `DeviceBatchedTopK` key/pair method groups.
 - [x] Evaluate the public families outside the aggregate header and implement
   the portable ones, including `thread_search`, `thread_sort`,
   `WarpReduceBatched`, and `DeviceSegmentedScan`.
@@ -196,7 +199,7 @@ Portable semantic coverage of the pinned public surface is complete:
 - [x] Cover temporary-storage queries, empty inputs, aliasing, range boundaries,
   stability, selector updates, and custom comparison behavior where applicable.
 - [x] Export every implemented family through `lcpp/parallel_primitive.h` and
-  register all 39 GPU behavior tests in both XMake and CMake.
+  register all 40 GPU behavior tests in both XMake and CMake.
 
 This is semantic portability, not CUDA source compatibility. LCPP deliberately
 collapses CUB's legacy/environment/stream wrappers and two-call scratch-query
@@ -206,25 +209,27 @@ architecture-specific performance parity, or identical overload signatures.
 Some portable fallback algorithms favor clarity and correctness over CUB-level
 asymptotic performance.
 
-APIs introduced by later CCCL/CUB releases are not implicitly included here;
-the comparison baseline must be pinned again before extending this roadmap.
+The v3.5 `DeviceBatchedTopK` adapter intentionally uses LuisaCompute buffer
+views plus begin/end offsets and packed `segment * k` output. CUDA iterator
+arrays, `cuda::args` deferred problem sizes, execution environments, and CUB's
+architecture-specific tuning remain outside the portable contract.
 
 ### Verification
 
-- Public aggregate: 6 thread, 7 warp, 13 block, and 21 device headers. The
-  device set contains the 19 pinned aggregate families, public
+- Public aggregate: 6 thread, 7 warp, 13 block, and 22 device headers. The
+  device set contains the 20 v3.5 aggregate families, public
   `DeviceSegmentedScan`, and the retained `DeviceSpmv` extension.
 - Validation snapshot: Linux x86_64, NVIDIA GeForce RTX 5090, LuisaCompute
-  `next` at `9ff7419332340683402993e3b5b57f186767e4c0` (2026-08-30).
-- Forced XMake ordinary Release, CUDA: 39/39 executables, 136 tests,
-  16,809,342 assertions.
-- Forced XMake SAFE Release, CUDA: 39/39 executables, 136 tests,
-  16,809,342 assertions.
-- Forced XMake ordinary Release, Vulkan with native XIR-to-SPIR-V: 39/39
-  executables, 136 tests, 16,809,342 assertions.
-- Forced XMake SAFE Release, Vulkan with native XIR-to-SPIR-V: 39/39
-  executables, 136 tests, 16,809,342 assertions.
-- Independent CMake CUDA Release build and CTest: 39/39 tests passed.
+  `next` at `9ff7419332340683402993e3b5b57f186767e4c0` (2026-10-12).
+- Forced XMake ordinary Release, CUDA: 40/40 executables, 139 tests,
+  16,809,374 assertions.
+- Forced XMake SAFE Release, CUDA: 40/40 executables, 139 tests,
+  16,809,374 assertions.
+- Forced XMake ordinary Release, Vulkan with native XIR-to-SPIR-V: 40/40
+  executables, 139 tests, 16,809,374 assertions.
+- Forced XMake SAFE Release, Vulkan with native XIR-to-SPIR-V: 40/40
+  executables, 139 tests, 16,809,374 assertions.
+- Independent CMake CUDA Release build and CTest: 40/40 tests passed.
 
 Both Vulkan rows were run with `LUISA_VULKAN_VALIDATION=1`,
 `LUISA_VULKAN_REQUIRE_NATIVE_XIR_SPIRV=1`, and `LUISA_DUMP_SOURCE=1`. These

@@ -121,6 +121,37 @@ class DeviceFind : public LuisaModule
             cmdlist, temp_storage, range, range_num_items, values, values_num_items, output, std::move(compare));
     }
 
+    // v3.5 adds sorted-query variants. The portable implementation keeps the
+    // same result contract and uses the existing per-query binary search;
+    // callers must still provide ranges and queries sorted consistently.
+    template <typename RangeT, typename ValueT, typename Compare>
+    void LowerBoundSortedValues(CommandList&       cmdlist,
+                                BufferView<uint>   temp_storage,
+                                BufferView<RangeT> range,
+                                size_t             range_num_items,
+                                BufferView<ValueT> values,
+                                size_t             values_num_items,
+                                BufferView<uint>   output,
+                                Compare            compare)
+    {
+        dispatch_bound<false>(
+            cmdlist, temp_storage, range, range_num_items, values, values_num_items, output, std::move(compare));
+    }
+
+    template <typename RangeT, typename ValueT, typename Compare>
+    void UpperBoundSortedValues(CommandList&       cmdlist,
+                                BufferView<uint>   temp_storage,
+                                BufferView<RangeT> range,
+                                size_t             range_num_items,
+                                BufferView<ValueT> values,
+                                size_t             values_num_items,
+                                BufferView<uint>   output,
+                                Compare            compare)
+    {
+        dispatch_bound<true>(
+            cmdlist, temp_storage, range, range_num_items, values, values_num_items, output, std::move(compare));
+    }
+
   private:
     void fill_indices(CommandList& cmdlist, BufferView<uint> output, uint value)
     {

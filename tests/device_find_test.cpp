@@ -165,6 +165,48 @@ int main(int argc, char* argv[])
         }
     };
 
+    "device_find_sorted_bound_variants_match_sorted_query_contract"_test = [&]
+    {
+        const luisa::vector<int>  range_values{1, 2, 2, 4, 8};
+        const luisa::vector<int>  query_values{0, 2, 2, 5, 9};
+        const luisa::vector<uint> expected_lower{0u, 1u, 1u, 4u, 5u};
+        const luisa::vector<uint> expected_upper{0u, 3u, 3u, 4u, 5u};
+        auto                      range  = device.create_buffer<int>(range_values.size());
+        auto                      values = device.create_buffer<int>(query_values.size());
+        auto                      lower  = device.create_buffer<uint>(query_values.size());
+        auto                      upper  = device.create_buffer<uint>(query_values.size());
+        stream << range.copy_from(luisa::span{range_values}) << values.copy_from(luisa::span{query_values});
+
+        auto        less = [](const Int& lhs, const Int& rhs) noexcept { return lhs < rhs; };
+        CommandList commands;
+        find.LowerBoundSortedValues(commands,
+                                    BufferView<uint>{},
+                                    range.view(),
+                                    range_values.size(),
+                                    values.view(),
+                                    query_values.size(),
+                                    lower.view(),
+                                    less);
+        find.UpperBoundSortedValues(commands,
+                                    BufferView<uint>{},
+                                    range.view(),
+                                    range_values.size(),
+                                    values.view(),
+                                    query_values.size(),
+                                    upper.view(),
+                                    less);
+
+        luisa::vector<uint> lower_result(query_values.size());
+        luisa::vector<uint> upper_result(query_values.size());
+        stream << commands.commit() << lower.copy_to(luisa::span{lower_result})
+               << upper.copy_to(luisa::span{upper_result}) << synchronize();
+        for(size_t index = 0u; index < query_values.size(); ++index)
+        {
+            expect(lower_result[index] == expected_lower[index]);
+            expect(upper_result[index] == expected_upper[index]);
+        }
+    };
+
     "device_find_bounds_handle_empty_ranges_and_zero_queries"_test = [&]
     {
         expect(DeviceFind<>::GetTempStorageBytes<int>(17u) == 0u);
