@@ -221,14 +221,14 @@ architecture-specific tuning remain outside the portable contract.
   `DeviceSegmentedScan`, and the retained `DeviceSpmv` extension.
 - Validation snapshot: Linux x86_64, NVIDIA GeForce RTX 5090, LuisaCompute
   `next` at `9ff7419332340683402993e3b5b57f186767e4c0` (2026-10-12).
-- Forced XMake ordinary Release, CUDA: 40/40 executables, 139 tests,
-  16,809,374 assertions.
-- Forced XMake SAFE Release, CUDA: 40/40 executables, 139 tests,
-  16,809,374 assertions.
+- Forced XMake ordinary Release, CUDA: 40/40 executables, 140 tests,
+  16,809,376 assertions.
+- Forced XMake SAFE Release, CUDA: 40/40 executables, 140 tests,
+  16,809,376 assertions.
 - Forced XMake ordinary Release, Vulkan with native XIR-to-SPIR-V: 40/40
-  executables, 139 tests, 16,809,374 assertions.
+  executables, 140 tests, 16,809,376 assertions.
 - Forced XMake SAFE Release, Vulkan with native XIR-to-SPIR-V: 40/40
-  executables, 139 tests, 16,809,374 assertions.
+  executables, 140 tests, 16,809,376 assertions.
 - Independent CMake CUDA Release build and CTest: 40/40 tests passed.
 
 Both Vulkan rows were run with `LUISA_VULKAN_VALIDATION=1`,

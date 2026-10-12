@@ -50,6 +50,8 @@ class DeviceFor : public LuisaModule
     void ForEachN(CommandList& cmdlist, BufferView<T> data, size_t num_items, const Callable<void(T&)>& op)
     {
         LUISA_ASSERT(m_created, "DeviceFor::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(),
+                     "DeviceFor item count exceeds the shader index range.");
         LUISA_ASSERT(num_items <= data.size(),
                      "DeviceFor item count {} exceeds buffer size {}.",
                      num_items,
@@ -145,6 +147,8 @@ class DeviceFor : public LuisaModule
     void ForEachCopyN(CommandList& cmdlist, BufferView<T> data, size_t num_items, Op op)
     {
         LUISA_ASSERT(m_created, "DeviceFor::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(),
+                     "DeviceFor copy item count exceeds the shader index range.");
         LUISA_ASSERT(num_items <= data.size(),
                      "DeviceFor copy item count {} exceeds buffer size {}.",
                      num_items,

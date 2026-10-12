@@ -5,6 +5,8 @@
 
 #include <array>
 #include <boost/ut.hpp>
+#include <cstdlib>
+#include <limits>
 #include <luisa/runtime/context.h>
 #include <luisa/runtime/stream.h>
 
@@ -16,6 +18,46 @@ using boost::ut::operator""_test;
 
 int main(int argc, char* argv[])
 {
+#if defined(__unix__) || defined(__APPLE__)
+    // Exercise host-side count checks without allocating an oversized buffer.
+    "devicefor_rejects_counts_outside_the_shader_index_range"_test = []
+    {
+        if constexpr(std::numeric_limits<size_t>::max() > std::numeric_limits<uint>::max())
+        {
+            for(bool copy : {false, true})
+            {
+                expect(boost::ut::aborts(
+                    [copy]
+                    {
+                        luisa::detail::default_logger_set_sink(luisa::detail::create_sink_with_callback(
+                            [](const char*, const char* message)
+                            {
+                                if(luisa::string_view{message}.find("item count exceeds the shader index range")
+                                   == luisa::string_view::npos)
+                                {
+                                    std::_Exit(0);
+                                }
+                            }));
+                        Device    device;
+                        DeviceFor device_for;
+                        device_for.create(device);
+                        CommandList          commands;
+                        Callable<void(int&)> noop = [](Int&) noexcept {};
+                        auto count = static_cast<size_t>(std::numeric_limits<uint>::max()) + 1u;
+                        if(copy)
+                        {
+                            device_for.ForEachCopyN(commands, BufferView<int>{}, count, noop);
+                        }
+                        else
+                        {
+                            device_for.ForEachN(commands, BufferView<int>{}, count, noop);
+                        }
+                    }));
+            }
+        }
+    };
+#endif
+
     luisa::string_view context_directory;
     luisa::string_view backend_name = "cuda";
     for(int i = 1; i < argc; ++i)
