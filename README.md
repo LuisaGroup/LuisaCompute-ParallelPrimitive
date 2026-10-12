@@ -1,6 +1,6 @@
 # LCPP - LuisaCompute Parallel Primitives
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org/)
 
 A high-performance GPU parallel primitives library built on [LuisaCompute](https://github.com/LuisaGroup/LuisaCompute), providing thread-level to device-level parallel operations. LCPP is a header-only C++20 library inspired by CUDA CUB (Cooperative primitives for CUDA C++).
@@ -449,7 +449,11 @@ Contributions are welcome! Please feel free to:
 
 ## License
 
-[Specify your license here]
+LCPP is distributed under the [Apache License, Version 2.0](LICENSE).
+
+The license applies to this repository's source and documentation. Third-party
+dependencies, including LuisaCompute and CCCL/CUB, retain their own licenses
+and notices.
 
 ## Acknowledgments
 
