@@ -51,13 +51,16 @@ xmake
 # Build tests
 xmake build -g test
 
-# Run tests
+# Run tests (CUDA is the Linux default)
 xmake run block_level_test
 xmake run warp_level_test
 xmake run device_reduce_test
 xmake run device_scan_test
 xmake run device_segment_reduce
 xmake run device_radix_sort_one_sweep
+
+# Select Vulkan explicitly
+xmake run device_scan_test --backend=vk
 ```
 
 `xmake prepare-lc` only updates a clean `LuisaCompute/` checkout on its `next`
@@ -65,11 +68,17 @@ branch with the official `origin` URL. It refuses dirty, divergent, wrong-branch
 or wrong-remote checkouts instead of overwriting local work. Regular `xmake`
 commands do not access the network when `lc_use_xrepo=false`.
 
+The vendored XMake configuration enables LuisaCompute's native XIR-to-SPIR-V
+path for Vulkan. Keep `lc_vk_backend_use_xir_spirv=true`: the complete LCPP
+surface includes bindless destination-buffer writes that are not implemented by
+the legacy HLSL-to-SPIR-V path.
+
 ### CMake
 
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+    -DLUISA_COMPUTE_ENABLE_VK_XIR_SPIRV=ON
 cmake --build .
 
 # Run tests
@@ -205,9 +214,25 @@ the comparison baseline must be pinned again before extending this roadmap.
 - Public aggregate: 6 thread, 7 warp, 13 block, and 21 device headers. The
   device set contains the 19 pinned aggregate families, public
   `DeviceSegmentedScan`, and the retained `DeviceSpmv` extension.
-- Forced XMake SAFE Release: 39/39 executables, 136 tests, 16,809,342 assertions.
-- Forced XMake ordinary Release: 39/39 executables, 136 tests, 16,809,342 assertions.
-- Independent CMake Release build and CTest: 39/39 tests passed.
+- Validation snapshot: Linux x86_64, NVIDIA GeForce RTX 5090, LuisaCompute
+  `next` at `9ff7419332340683402993e3b5b57f186767e4c0` (2026-08-30).
+- Forced XMake ordinary Release, CUDA: 39/39 executables, 136 tests,
+  16,809,342 assertions.
+- Forced XMake SAFE Release, CUDA: 39/39 executables, 136 tests,
+  16,809,342 assertions.
+- Forced XMake ordinary Release, Vulkan with native XIR-to-SPIR-V: 39/39
+  executables, 136 tests, 16,809,342 assertions.
+- Forced XMake SAFE Release, Vulkan with native XIR-to-SPIR-V: 39/39
+  executables, 136 tests, 16,809,342 assertions.
+- Independent CMake CUDA Release build and CTest: 39/39 tests passed.
+
+Both Vulkan rows were run with `LUISA_VULKAN_VALIDATION=1`,
+`LUISA_VULKAN_REQUIRE_NATIVE_XIR_SPIRV=1`, and `LUISA_DUMP_SOURCE=1`. These
+guards reject compatibility-route fallback and force fresh JIT code generation.
+
+This snapshot does not claim runtime validation for Metal or DirectX. The
+portable API surface is shared, but those backends still require their own
+build and GPU test runs.
 
 ### Priority 1: High-Priority Device Operations
 

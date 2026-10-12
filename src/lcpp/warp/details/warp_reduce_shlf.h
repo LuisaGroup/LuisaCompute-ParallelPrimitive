@@ -42,7 +42,7 @@ namespace details
                 Var<Type4Byte> candidate = WarpReadLane(input, warp_base + source_lane);
                 Var<Type4Byte> combined  = op(result, candidate);
                 Bool           include   = source_lane > lane_id & source_lane < valid_item;
-                result                   = compute::select(result, combined, include);
+                result                   = Select(result, combined, include);
             };
             return result;
         }
@@ -82,7 +82,7 @@ namespace details
                 Var<Type4Byte> combined       = reduce_op(result, candidate);
                 Bool           include = candidate_lane > lane_id & candidate_lane <= segment_end
                                & candidate_lane < valid_item;
-                result = compute::select(result, combined, include);
+                result = Select(result, combined, include);
             };
             return result;
         }

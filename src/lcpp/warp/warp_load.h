@@ -32,7 +32,17 @@ class WarpLoad : public LuisaModule
               compute::ArrayVar<T, ITEMS_PER_THREAD>& items,
               compute::UInt                           warp_item_start) const
     {
-        Load(input, items, warp_item_start, compute::UInt(LOGICAL_WARP_THREADS * ITEMS_PER_THREAD), T{});
+        if constexpr(ALGORITHM == WarpLoadAlgorithm::WARP_LOAD_TRANSPOSE)
+        {
+            compute::ArrayVar<T, ITEMS_PER_THREAD> striped_items;
+            load_striped(input, striped_items, warp_item_start, compute::UInt(LOGICAL_WARP_THREADS * ITEMS_PER_THREAD), T{});
+            WarpExchange<T, ITEMS_PER_THREAD, LOGICAL_WARP_THREADS, WarpExchangeAlgorithm::WARP_EXCHANGE_SHUFFLE>()
+                .StripedToBlocked(striped_items, items);
+        }
+        else
+        {
+            Load(input, items, warp_item_start, compute::UInt(LOGICAL_WARP_THREADS * ITEMS_PER_THREAD), T{});
+        }
     }
 
     void Load(const compute::BufferVar<T>&            input,
@@ -46,14 +56,10 @@ class WarpLoad : public LuisaModule
         }
         else if constexpr(ALGORITHM == WarpLoadAlgorithm::WARP_LOAD_TRANSPOSE)
         {
-            compute::ArrayVar<T, ITEMS_PER_THREAD> striped_items;
-            for(size_t i = 0u; i < ITEMS_PER_THREAD; ++i)
-            {
-                striped_items[i] = items[i];
-            }
-            load_striped_guarded(input, striped_items, warp_item_start, valid_items);
-            WarpExchange<T, ITEMS_PER_THREAD, LOGICAL_WARP_THREADS, WarpExchangeAlgorithm::WARP_EXCHANGE_SHUFFLE>()
-                .StripedToBlocked(striped_items, items);
+            // Some backends cannot shuffle values produced by lane-divergent guarded loads.
+            // The observable transpose-load result is still blocked, so use the equivalent
+            // guarded blocked access path when a runtime item bound is present.
+            load_blocked_guarded(input, items, warp_item_start, valid_items);
         }
         else
         {
@@ -73,10 +79,9 @@ class WarpLoad : public LuisaModule
         }
         else if constexpr(ALGORITHM == WarpLoadAlgorithm::WARP_LOAD_TRANSPOSE)
         {
-            compute::ArrayVar<T, ITEMS_PER_THREAD> striped_items;
-            load_striped(input, striped_items, warp_item_start, valid_items, out_of_bounds_default);
-            WarpExchange<T, ITEMS_PER_THREAD, LOGICAL_WARP_THREADS, WarpExchangeAlgorithm::WARP_EXCHANGE_SHUFFLE>()
-                .StripedToBlocked(striped_items, items);
+            // Keep guarded transpose loads portable for the same reason as the no-default
+            // overload above. This preserves the blocked output and default-value contract.
+            load_blocked(input, items, warp_item_start, valid_items, out_of_bounds_default);
         }
         else
         {

@@ -87,9 +87,7 @@ class DeviceReduce : public LuisaModule
     template <typename Type4Byte>
     static size_t GetTempStorageBytes(size_t num_item)
     {
-        size_t temp_count = 0;
-        get_temp_size_scan(temp_count, BLOCK_SIZE, ITEMS_PER_THREAD, num_item);
-        return temp_count * sizeof(Type4Byte);
+        return reduce_temp_storage_bytes<Type4Byte>(num_item);
     }
 
     /// Temp storage bytes for ArgMin / ArgMax
@@ -97,14 +95,12 @@ class DeviceReduce : public LuisaModule
     template <typename Type4Byte>
     static size_t GetArgTempStorageBytes(size_t num_item)
     {
-        using IVP                = IndexValuePairT<Type4Byte>;
-        size_t reduce_temp_count = 0;
-        get_temp_size_scan(reduce_temp_count, BLOCK_SIZE, ITEMS_PER_THREAD, num_item);
+        using IVP    = IndexValuePairT<Type4Byte>;
         size_t bytes = 0;
-        bytes += reduce_temp_count * sizeof(IVP);  // reduce temp
-        bytes = align_up_uint(bytes, alignof(IVP));
+        bytes += reduce_temp_storage_bytes<IVP>(num_item);  // reduce temp
+        bytes = align_up_temp_storage(bytes);
         bytes += num_item * sizeof(IVP);  // d_in_kv
-        bytes = align_up_uint(bytes, alignof(IVP));
+        bytes = align_up_temp_storage(bytes);
         bytes += 1 * sizeof(IVP);  // d_out_kv
         return bytes;
     }
@@ -119,9 +115,9 @@ class DeviceReduce : public LuisaModule
 
         size_t bytes = 0;
         bytes += tile_count * sizeof(uint);  // tile_states
-        bytes = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes = align_up_temp_storage(bytes);
         bytes += tile_count * sizeof(FlagValuePairT);  // tile_partial
-        bytes = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes = align_up_temp_storage(bytes);
         bytes += tile_count * sizeof(FlagValuePairT);  // tile_inclusive
         return bytes;
     }
@@ -145,10 +141,9 @@ class DeviceReduce : public LuisaModule
             write_scalar(cmdlist, d_out, initial_value);
             return;
         }
-        size_t temp_count = 0;
-        get_temp_size_scan(temp_count, m_block_size, ITEMS_PER_THREAD, num_item);
-        auto temp_view =
-            temp_storage.subview(0, bytes_to_uint_count(temp_count * sizeof(Type4Byte))).template as<Type4Byte>();
+        auto temp_view = temp_storage
+                             .subview(0, bytes_to_uint_count(reduce_temp_storage_bytes<Type4Byte>(num_item)))
+                             .template as<Type4Byte>();
 
         lcpp_check(reduce_array_recursive<Type4Byte>(
                        cmdlist, temp_view, d_in, d_out, num_item, 0, 0, reduce_op, initial_value, IdentityOp()),
@@ -172,10 +167,8 @@ class DeviceReduce : public LuisaModule
             write_scalar(cmdlist, d_out, initial_value);
             return;
         }
-        size_t temp_count = 0;
-        get_temp_size_scan(temp_count, m_block_size, ITEMS_PER_THREAD, num_item);
         auto temp_view =
-            temp_storage.subview(0, bytes_to_uint_count(temp_count * sizeof(IVP))).template as<IVP>();
+            temp_storage.subview(0, bytes_to_uint_count(reduce_temp_storage_bytes<IVP>(num_item))).template as<IVP>();
 
         lcpp_check(reduce_array_recursive<IVP>(
                        cmdlist, temp_view, d_in, d_out, num_item, 0, 0, reduce_op, initial_value, IdentityOp()),
@@ -229,23 +222,20 @@ class DeviceReduce : public LuisaModule
             write_scalar(cmdlist, d_index_out, 1u);
             return;
         }
-        size_t reduce_temp_count = 0;
-        get_temp_size_scan(reduce_temp_count, m_block_size, ITEMS_PER_THREAD, num_item);
-
         size_t offset_bytes = 0;
         // reduce temp
-        size_t reduce_temp_uint_count = bytes_to_uint_count(reduce_temp_count * sizeof(IVP));
-        auto   reduce_temp =
+        size_t reduce_temp_uint_count = bytes_to_uint_count(reduce_temp_storage_bytes<IVP>(num_item));
+        auto reduce_temp =
             temp_storage.subview(offset_bytes / sizeof(uint), reduce_temp_uint_count).template as<IVP>();
         offset_bytes += reduce_temp_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // d_in_kv
         size_t in_kv_uint_count = bytes_to_uint_count(num_item * sizeof(IVP));
         auto   d_in_kv =
             temp_storage.subview(offset_bytes / sizeof(uint), in_kv_uint_count).template as<IVP>();
         offset_bytes += in_kv_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // d_out_kv
         size_t out_kv_uint_count = bytes_to_uint_count(sizeof(IVP));
@@ -294,23 +284,20 @@ class DeviceReduce : public LuisaModule
             write_scalar(cmdlist, d_index_out, 1u);
             return;
         }
-        size_t reduce_temp_count = 0;
-        get_temp_size_scan(reduce_temp_count, m_block_size, ITEMS_PER_THREAD, num_item);
-
         size_t offset_bytes = 0;
         // reduce temp
-        size_t reduce_temp_uint_count = bytes_to_uint_count(reduce_temp_count * sizeof(IVP));
-        auto   reduce_temp =
+        size_t reduce_temp_uint_count = bytes_to_uint_count(reduce_temp_storage_bytes<IVP>(num_item));
+        auto reduce_temp =
             temp_storage.subview(offset_bytes / sizeof(uint), reduce_temp_uint_count).template as<IVP>();
         offset_bytes += reduce_temp_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // d_in_kv
         size_t in_kv_uint_count = bytes_to_uint_count(num_item * sizeof(IVP));
         auto   d_in_kv =
             temp_storage.subview(offset_bytes / sizeof(uint), in_kv_uint_count).template as<IVP>();
         offset_bytes += in_kv_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // d_out_kv
         size_t out_kv_uint_count = bytes_to_uint_count(sizeof(IVP));
@@ -372,14 +359,14 @@ class DeviceReduce : public LuisaModule
         // tile_states: tile_count * uint
         auto tile_states = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // tile_partial: tile_count * FlagValuePairT
         size_t partial_uint_count = bytes_to_uint_count(tile_count * sizeof(FlagValuePairT));
         auto   tile_partial =
             temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_temp_storage(offset_bytes);
 
         // tile_inclusive: tile_count * FlagValuePairT
         size_t inclusive_uint_count = bytes_to_uint_count(tile_count * sizeof(FlagValuePairT));
@@ -409,10 +396,9 @@ class DeviceReduce : public LuisaModule
             write_scalar(cmdlist, d_out, init);
             return;
         }
-        size_t temp_count = 0;
-        get_temp_size_scan(temp_count, m_block_size, ITEMS_PER_THREAD, num_item);
-        auto temp_view =
-            temp_storage.subview(0, bytes_to_uint_count(temp_count * sizeof(Type4Byte))).template as<Type4Byte>();
+        auto temp_view = temp_storage
+                             .subview(0, bytes_to_uint_count(reduce_temp_storage_bytes<Type4Byte>(num_item)))
+                             .template as<Type4Byte>();
         lcpp_check(reduce_array_recursive<Type4Byte, ReduceOp, TransformOp>(
                        cmdlist, temp_view, d_in, d_out, num_item, 0, 0, reduce_op, init, transform_op),
                    cmdlist,
@@ -420,6 +406,27 @@ class DeviceReduce : public LuisaModule
     }
 
   private:
+    template <typename Type>
+    [[nodiscard]] static size_t reduce_temp_storage_bytes(size_t num_items)
+    {
+        size_t bytes       = 0u;
+        size_t level_items = num_items;
+        bool   first_level = true;
+        do
+        {
+            size_t num_blocks =
+                std::max<size_t>(1u, ceil_div(level_items, static_cast<size_t>(BLOCK_SIZE * ITEMS_PER_THREAD)));
+            if(!first_level)
+            {
+                bytes = align_up_temp_storage(bytes);
+            }
+            bytes += num_blocks * sizeof(Type);
+            level_items = num_blocks;
+            first_level = false;
+        } while(level_items > 1u);
+        return bytes;
+    }
+
     template <bool FIND_MIN, NumericT Type4Byte, typename CompareOp>
     void dispatch_arg_extremum(CommandList&          cmdlist,
                                BufferView<uint>      temp_storage,
@@ -604,8 +611,9 @@ class DeviceReduce : public LuisaModule
             GridEvenShared even_share;
             even_share.DispatchInit(num_items, max_blocks, tile_items);
             cmdlist << (*ms_reduce_ptr)(arr_in, temp_buffer_level, num_items, even_share).dispatch(m_block_size * num_tiles);
+            uint next_level_offset = static_cast<uint>(aligned_temp_storage_count<Type>(num_tiles));
             lcpp_check(reduce_array_recursive<Type>(
-                           cmdlist, temp_buffer_level, temp_buffer_level, arr_out, num_tiles, num_tiles, level + 1, reduce_op, init, transform_op),
+                           cmdlist, temp_buffer_level, temp_buffer_level, arr_out, num_tiles, next_level_offset, level + 1, reduce_op, init, transform_op),
                        cmdlist,
                        debug_stream());
         }

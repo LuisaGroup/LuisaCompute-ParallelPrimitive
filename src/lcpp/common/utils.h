@@ -170,6 +170,24 @@ inline size_t align_up_uint(size_t byte_offset, size_t alignment)
     return (byte_offset + alignment - 1) / alignment * alignment;
 }
 
+// Vulkan guarantees minStorageBufferOffsetAlignment is at most 256 bytes.
+// Keeping internal scratch-buffer views on this boundary also remains valid
+// for backends with less restrictive storage-buffer alignment requirements.
+inline constexpr size_t TEMP_STORAGE_VIEW_ALIGNMENT = 256u;
+
+inline size_t align_up_temp_storage(size_t byte_offset)
+{
+    return align_up_uint(byte_offset, TEMP_STORAGE_VIEW_ALIGNMENT);
+}
+
+template <typename T>
+inline size_t aligned_temp_storage_count(size_t element_count)
+{
+    static_assert(TEMP_STORAGE_VIEW_ALIGNMENT % sizeof(T) == 0u,
+                  "Temporary-storage element size must divide the portable view alignment.");
+    return align_up_temp_storage(element_count * sizeof(T)) / sizeof(T);
+}
+
 // Helper: convert byte size to uint element count (round up)
 inline size_t bytes_to_uint_count(size_t byte_size)
 {
@@ -184,7 +202,15 @@ template <typename T>
     requires(!KeyValuePairType<T>)
 luisa::compute::Var<T> WarpReadLane(const luisa::compute::Var<T>& input, luisa::compute::UInt source_lane)
 {
-    return compute::warp_read_lane(input, source_lane);
+    if constexpr(std::is_same_v<T, double>)
+    {
+        auto bits = input.template as<luisa::ulong>();
+        return compute::warp_read_lane(bits, source_lane).template as<double>();
+    }
+    else
+    {
+        return compute::warp_read_lane(input, source_lane);
+    }
 }
 
 template <NumericT KeyType, NumericT ValueType>
@@ -192,8 +218,29 @@ luisa::compute::Var<KeyValuePair<KeyType, ValueType>> WarpReadLane(
     const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& input, luisa::compute::UInt source_lane)
 {
     luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
-    result.key   = compute::warp_read_lane(input.key, source_lane);
-    result.value = compute::warp_read_lane(input.value, source_lane);
+    result.key   = WarpReadLane(input.key, source_lane);
+    result.value = WarpReadLane(input.value, source_lane);
+    return result;
+}
+
+template <typename T>
+    requires(!KeyValuePairType<T>)
+luisa::compute::Var<T> Select(const luisa::compute::Var<T>& false_value,
+                              const luisa::compute::Var<T>& true_value,
+                              luisa::compute::Bool          predicate)
+{
+    return compute::select(false_value, true_value, predicate);
+}
+
+template <NumericT KeyType, NumericT ValueType>
+luisa::compute::Var<KeyValuePair<KeyType, ValueType>> Select(
+    const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& false_value,
+    const luisa::compute::Var<KeyValuePair<KeyType, ValueType>>& true_value,
+    luisa::compute::Bool                                         predicate)
+{
+    luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
+    result.key   = compute::select(false_value.key, true_value.key, predicate);
+    result.value = compute::select(false_value.value, true_value.value, predicate);
     return result;
 }
 
@@ -203,7 +250,7 @@ luisa::compute::Var<Type4Byte> ShuffleUp(luisa::compute::Var<Type4Byte>& input,
                                          luisa::compute::UInt            offset,
                                          luisa::compute::UInt            first_lane = 0u)
 {
-    luisa::compute::Var<Type4Byte> result = compute::warp_read_lane(input, curr_lane_id - offset);
+    luisa::compute::Var<Type4Byte> result = WarpReadLane(input, curr_lane_id - offset);
 
     $if(compute::Int(curr_lane_id - offset) < compute::Int(first_lane))
     {
@@ -223,8 +270,8 @@ luisa::compute::Var<KeyValuePair<KeyType, ValueType>> ShuffleUp(luisa::compute::
     luisa::compute::UInt                                  src_lane = curr_lane_id - offset;
     $if(src_lane >= first_lane)
     {
-        result.key   = compute::warp_read_lane(input.key, src_lane);
-        result.value = compute::warp_read_lane(input.value, src_lane);
+        result.key   = WarpReadLane(input.key, src_lane);
+        result.value = WarpReadLane(input.value, src_lane);
     }
     $else
     {
@@ -240,7 +287,7 @@ luisa::compute::Var<Type4Byte> ShuffleDown(luisa::compute::Var<Type4Byte>& input
                                            luisa::compute::UInt            last_lane = 32u)
 {
     luisa::compute::UInt           src_lane = curr_lane_id + offset;
-    luisa::compute::Var<Type4Byte> result   = compute::warp_read_lane(input, src_lane);
+    luisa::compute::Var<Type4Byte> result   = WarpReadLane(input, src_lane);
     $if(src_lane > last_lane)
     {
         result = input;
@@ -257,8 +304,8 @@ luisa::compute::Var<KeyValuePair<KeyType, ValueType>> ShuffleDown(luisa::compute
 {
     luisa::compute::Var<KeyValuePair<KeyType, ValueType>> result;
     luisa::compute::UInt                                  src_lane = curr_lane_id + offset;
-    result.key   = compute::warp_read_lane(input.key, src_lane);
-    result.value = compute::warp_read_lane(input.value, src_lane);
+    result.key   = WarpReadLane(input.key, src_lane);
+    result.value = WarpReadLane(input.value, src_lane);
     $if(src_lane > last_lane)
     {
         result = input;

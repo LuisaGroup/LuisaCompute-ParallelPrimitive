@@ -82,7 +82,7 @@ namespace details
             Var<Type4Byte> previous = exclusive_from_inclusive(inclusive_output, thread_input);
             UInt           lane     = logical_lane();
             Var<Type4Byte> prefixed = scan_op(initial_value, previous);
-            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+            exclusive_output        = Select(initial_value, prefixed, lane > 0u);
         }
 
         template <typename ScanOp>
@@ -107,7 +107,7 @@ namespace details
             Var<Type4Byte> previous = exclusive_from_inclusive(inclusive_output, thread_input);
             UInt           lane     = logical_lane();
             Var<Type4Byte> prefixed = scan_op(initial_value, previous);
-            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+            exclusive_output        = Select(initial_value, prefixed, lane > 0u);
             warp_aggregate          = aggregate(inclusive_output);
         }
 
@@ -134,7 +134,7 @@ namespace details
             Var<Type4Byte> previous = exclusive_from_inclusive(output, thread_input);
             UInt           lane     = logical_lane();
             Var<Type4Byte> prefixed = scan_op(initial_value, previous);
-            exclusive_output        = compute::select(initial_value, prefixed, lane > 0u);
+            exclusive_output        = Select(initial_value, prefixed, lane > 0u);
         }
 
         template <typename ScanOp>
@@ -171,7 +171,7 @@ namespace details
                     compute::select(physical_lane, physical_lane - UInt(offset), lane >= UInt(offset));
                 Var<Type4Byte> candidate = WarpReadLane(result, source_lane);
                 Var<Type4Byte> combined  = scan_op(candidate, result);
-                result                   = compute::select(result, combined, lane >= UInt(offset));
+                result                   = Select(result, combined, lane >= UInt(offset));
             }
             return result;
         }
@@ -201,7 +201,7 @@ namespace details
             UInt           lane          = physical_lane - warp_base;
             UInt           source_lane = compute::select(warp_base, physical_lane - 1u, lane > 0u);
             Var<Type4Byte> previous    = WarpReadLane(inclusive_output, source_lane);
-            return compute::select(lane_zero_fallback, previous, lane > 0u);
+            return Select(lane_zero_fallback, previous, lane > 0u);
         }
 
         static Var<Type4Byte> aggregate(const Var<Type4Byte>& inclusive_output)

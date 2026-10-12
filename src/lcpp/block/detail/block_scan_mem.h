@@ -1,5 +1,6 @@
 #pragma once
 
+#include <lcpp/common/utils.h>
 #include <lcpp/runtime/core.h>
 
 #include <luisa/dsl/builtin.h>
@@ -144,7 +145,7 @@ struct BlockScanMem
         compute::Var<Type4Byte> prefix = (*shared_mem)[0u];
         if(exclusive)
         {
-            output = compute::select(prefix, scan_op(prefix, output), tid > 0u);
+            output = Select(prefix, scan_op(prefix, output), tid > 0u);
         }
         else
         {
