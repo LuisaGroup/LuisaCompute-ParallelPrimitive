@@ -366,7 +366,7 @@ class DeviceScan : public LuisaModule
 
 
         size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
-        auto   init_key = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto   init_key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto   ms_tile_state_init_it = ms_scan_key.find(init_key);
         if(ms_tile_state_init_it == ms_scan_key.end())
         {
@@ -456,7 +456,7 @@ class DeviceScan : public LuisaModule
         if(ms_scan_by_it
            == (is_inclusive ? ms_inclusive_scan_by_key_map : ms_exclusive_scan_by_key_map).end())
         {
-            LUISA_INFO("Compiling Scan By Key shader for key: {}", key);
+            LUISA_INFO("Compiling Scan By Key shader (cache miss)");
             if(is_inclusive)
             {
                 auto shader = ScanByKeyShader().template compile<true>(m_device, m_shared_mem_size, scan_op);
@@ -481,12 +481,12 @@ class DeviceScan : public LuisaModule
         return 0;
     }
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_key;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_inclusive_scan_map;
+    detail::ShaderCacheMap ms_scan_key;
+    detail::ShaderCacheMap ms_exclusive_scan_map;
+    detail::ShaderCacheMap ms_inclusive_scan_map;
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_by_key_tile_state_init_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_by_key_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_inclusive_scan_by_key_map;
+    detail::ShaderCacheMap ms_scan_by_key_tile_state_init_map;
+    detail::ShaderCacheMap ms_exclusive_scan_by_key_map;
+    detail::ShaderCacheMap ms_inclusive_scan_by_key_map;
 };
 }  // namespace luisa::parallel_primitive

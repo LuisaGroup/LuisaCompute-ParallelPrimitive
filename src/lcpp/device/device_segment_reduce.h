@@ -437,7 +437,7 @@ class DeviceSegmentReduce : public LuisaModule
     {
         using ArgReduce          = details::ArgSegmentReduceModule<Type4Byte, BLOCK_SIZE>;
         using ArgConstructShader = ArgReduce::ArgConstructShaderT;
-        auto key = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto ms_arg_construct_it = ms_arg_construct_map.find(key);
         if(ms_arg_construct_it == ms_arg_construct_map.end())
         {
@@ -465,7 +465,7 @@ class DeviceSegmentReduce : public LuisaModule
     {
         using ArgReduce       = details::ArgSegmentReduceModule<Type4Byte, WARP_NUMS>;
         using ArgAssignShader = ArgReduce::ArgAssignShaderT;
-        auto key              = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto key              = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto ms_arg_assign_it = ms_arg_assign_map.find(key);
         if(ms_arg_assign_it == ms_arg_assign_map.end())
         {
@@ -495,7 +495,7 @@ class DeviceSegmentReduce : public LuisaModule
         const auto num_segments_per_invocation = static_cast<uint>(std::numeric_limits<int32_t>::max());
         const auto num_invocations = ceil_div(num_segments, num_segments_per_invocation);
 
-        auto key              = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto key              = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto ms_arg_assign_it = ms_arg_fixed_size_assign_map.find(key);
         if(ms_arg_assign_it == ms_arg_fixed_size_assign_map.end())
         {
@@ -512,11 +512,11 @@ class DeviceSegmentReduce : public LuisaModule
     }
 
   private:
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_segment_reduce_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_fixed_segment_reduce_map;
+    detail::ShaderCacheMap ms_segment_reduce_map;
+    detail::ShaderCacheMap ms_fixed_segment_reduce_map;
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_construct_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_assign_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_fixed_size_assign_map;
+    detail::ShaderCacheMap ms_arg_construct_map;
+    detail::ShaderCacheMap ms_arg_assign_map;
+    detail::ShaderCacheMap ms_arg_fixed_size_assign_map;
 };
 }  // namespace luisa::parallel_primitive

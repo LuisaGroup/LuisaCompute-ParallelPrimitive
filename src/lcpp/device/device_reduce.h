@@ -24,6 +24,7 @@
 #include <lcpp/runtime/core.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/util_type.h>
+#include <lcpp/common/shader_cache.h>
 #include <lcpp/common/thread_operators.h>
 #include <lcpp/block/block_reduce.h>
 #include <lcpp/block/block_scan.h>
@@ -353,7 +354,7 @@ class DeviceReduce : public LuisaModule
     {
         using ArgReduce          = details::ArgReduce<Type4Byte, BLOCK_SIZE>;
         using ArgConstructShader = ArgReduce::ArgConstructShaderT;
-        auto key = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto ms_arg_construct_it = ms_arg_construct_map.find(key);
         if(ms_arg_construct_it == ms_arg_construct_map.end())
         {
@@ -377,7 +378,7 @@ class DeviceReduce : public LuisaModule
     {
         using ArgReduce       = details::ArgReduce<Type4Byte, BLOCK_SIZE>;
         using ArgAssignShader = ArgReduce::ArgAssignShaderT;
-        auto key              = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto key              = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto ms_arg_assign_it = ms_arg_assign_map.find(key);
         if(ms_arg_assign_it == ms_arg_assign_map.end())
         {
@@ -515,14 +516,14 @@ class DeviceReduce : public LuisaModule
     };
 
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_reduce_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_single_reduce_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_transform_reduce_map;
+    detail::ShaderCacheMap ms_reduce_map;
+    detail::ShaderCacheMap ms_single_reduce_map;
+    detail::ShaderCacheMap ms_transform_reduce_map;
     // for arg reduce
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_construct_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_arg_assign_map;
+    detail::ShaderCacheMap ms_arg_construct_map;
+    detail::ShaderCacheMap ms_arg_assign_map;
     // for reduce by key
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_reduce_by_key_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_tile_state_init_map;
+    detail::ShaderCacheMap ms_reduce_by_key_map;
+    detail::ShaderCacheMap ms_scan_tile_state_init_map;
 };
 }  // namespace luisa::parallel_primitive

@@ -239,8 +239,7 @@ class DeviceRadixSort : public LuisaModule
         size_t ctrs_count = (size_t)num_portions * num_passes;
         auto d_ctrs_view = temp_storage.subview(offset_bytes / sizeof(uint), ctrs_count);
 
-        auto radix_sort_key = get_type_and_op_desc<KeyType, ValueType>()
-                              + luisa::string(IS_DESCENDING ? "_desc" : "_asc");
+        auto radix_sort_key = get_radix_sort_key<KeyType, ValueType, KEY_ONLY, IS_DESCENDING>();
 
 
         // reset keys
@@ -381,9 +380,9 @@ class DeviceRadixSort : public LuisaModule
     }
 
   private:
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_histogram_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_exclusive_sum_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_one_sweep_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_reset_map;
+    detail::ShaderCacheMap ms_radix_sort_histogram_map;
+    detail::ShaderCacheMap ms_radix_sort_exclusive_sum_map;
+    detail::ShaderCacheMap ms_radix_sort_one_sweep_map;
+    detail::ShaderCacheMap ms_radix_sort_reset_map;
 };
 }  // namespace luisa::parallel_primitive

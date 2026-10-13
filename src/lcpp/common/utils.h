@@ -13,6 +13,7 @@
 #include <luisa/dsl/builtin.h>
 #include <luisa/dsl/var.h>
 #include <lcpp/common/util_type.h>
+#include <lcpp/common/shader_cache.h>
 #include <lcpp/runtime/core.h>
 
 namespace luisa::parallel_primitive
@@ -65,74 +66,85 @@ struct Log2<N, 0, COUNT>
 };
 
 
-template <NumericT Type4Byte, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
-{
-    luisa::string_view key_desc       = luisa::compute::Type::of<Type4Byte>()->description();
-    luisa::string_view reduce_op_desc = std::type_index(typeid(op)).name();
+// The following overloads produce a cheap ShaderCacheKey for the per-module
+// shader caches.  The overload *signatures* (template parameters, concept
+// constraints and argument lists) are kept identical to the previous
+// string-returning versions so that every existing call site resolves to the
+// same overload and discriminates the same set of (data-type, operator)
+// combinations -- only the key representation changed, from a rebuilt
+// luisa::string to a few O(1) identity pointers.  See shader_cache.h.
+//
+// Note the data-type component uses the actual data element type the shader is
+// templated on (Type4Byte / KeyValueType / KeyType+ValueType) rather than the
+// KeyValuePair's inner value type, which is strictly finer than the old key and
+// can never merge two different element types onto one cached shader.
 
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc);
+template <NumericT Type4Byte, typename ReduceOp>
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
+{
+    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(), detail::op_ptr(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    using ValueType                   = value_type_of_t<KeyValueType>;
-    luisa::string_view key_desc       = luisa::compute::Type::of<ValueType>()->description();
-    luisa::string_view reduce_op_desc = std::type_index(typeid(op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc);
+    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(), detail::op_ptr(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    using ValueType                      = value_type_of_t<KeyValueType>;
-    luisa::string_view key_desc          = luisa::compute::Type::of<ValueType>()->description();
-    luisa::string_view reduce_op_desc    = std::type_index(typeid(op)).name();
-    luisa::string_view transform_op_desc = std::type_index(typeid(transform_op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc) + "+" + luisa::string(transform_op_desc);
+    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(),
+                                         detail::op_ptr(op),
+                                         detail::op_ptr(transform_op));
 }
 
 template <typename KeyType, typename ValueType>
-luisa::string get_type_and_op_desc()
+detail::ShaderCacheKey get_type_and_op_desc()
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
-
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc);
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(), detail::type_ptr<ValueType>());
 }
 
 template <typename KeyType, typename ValueType, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
-
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc) + "+"
-           + std::type_index(typeid(op)).name();
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         detail::op_ptr(op));
 }
 
 template <NumericT Type4Byte, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    luisa::string_view reduce_op_desc    = std::type_index(typeid(op)).name();
-    luisa::string_view key_desc          = luisa::compute::Type::of<Type4Byte>()->description();
-    luisa::string_view transform_op_desc = std::type_index(typeid(transform_op)).name();
-
-    return luisa::string(key_desc) + "+" + luisa::string(reduce_op_desc) + "+" + luisa::string(transform_op_desc);
+    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
+                                         detail::op_ptr(op),
+                                         detail::op_ptr(transform_op));
 }
 
 
 template <typename KeyType, typename ValueType, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         detail::op_ptr(op),
+                                         detail::op_ptr(transform_op));
+}
 
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc) + "+"
-           + std::type_index(typeid(op)).name() + "+" + std::type_index(typeid(transform_op)).name();
+// Radix-sort cache key: the four per-call maps in DeviceRadixSort are all keyed
+// by (key type, value type, descending) in the original code.  KEY_ONLY is an
+// additional template parameter that only changes the one-sweep shader; it was
+// not encoded before (a latent collision when SortKeys<T> and SortPairs<T,T>
+// share an instance).  Encoding it here is strictly safer and costs at most one
+// extra identical compile for the key-independent reset/histogram/exclusive-sum
+// shaders.
+template <typename KeyType, typename ValueType, bool KEY_ONLY, bool IS_DESCENDING>
+detail::ShaderCacheKey get_radix_sort_key()
+{
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         detail::bool_ptr(KEY_ONLY),
+                                         detail::bool_ptr(IS_DESCENDING));
 }
 
 static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items)
