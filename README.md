@@ -263,6 +263,7 @@ build and GPU test runs.
 - [x] `DeviceScan::InclusiveScanByKey` - Segmented inclusive scan with keys
 - [x] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
 - [x] `DeviceScan::InclusiveScanInit` - Inclusive scan with an explicit initial value
+- [x] `DeviceScanCudaParity` - CUDA packed warp-transpose policy tuned for CUB parity (`320` threads, `25` items/thread)
 - [x] Custom key equality and distinct key/value types
 
 ### Priority 2: Sorting and Merging

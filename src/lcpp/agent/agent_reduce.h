@@ -28,7 +28,13 @@ namespace luisa::parallel_primitive
 namespace details
 {
     using namespace luisa::compute;
-    template <typename Type4Byte, typename ReduceOp, typename TransformOp, typename CollectiveReduceT, bool IsWarpReduction, size_t BLOCK_SIZE, size_t ITEMS_PER_THREAD>
+    template <typename Type4Byte,
+              typename ReduceOp,
+              typename TransformOp,
+              typename CollectiveReduceT,
+              bool IsWarpReduction,
+              size_t BLOCK_SIZE,
+              size_t ITEMS_PER_THREAD>
     class AgentReduceImpl : public LuisaModule
     {
         static_assert(std::is_invocable_r_v<Var<Type4Byte>, ReduceOp, const Var<Type4Byte>&, const Var<Type4Byte>&>,
@@ -167,13 +173,32 @@ namespace details
         BufferVar<Type4Byte>& m_in_data;
     };
 
-    template <typename Type4Byte, typename ReduceOp, typename TransformOp, size_t BLOCK_SIZE, size_t ITEMS_PER_THREAD, size_t WARP_SIZE = details::WARP_SIZE, BlockReduceAlgorithm BLOCK_ALGORITHM = BlockReduceAlgorithm::WARP_SHUFFLE>
+    template <typename Type4Byte,
+              typename ReduceOp,
+              typename TransformOp,
+              size_t BLOCK_SIZE,
+              size_t ITEMS_PER_THREAD,
+              size_t WARP_SIZE = details::WARP_SIZE,
+              BlockReduceAlgorithm BLOCK_ALGORITHM = BlockReduceAlgorithm::WARP_SHUFFLE,
+              bool CUDA_WARP_REDUX = false>
     class AgentReduce
-        : public AgentReduceImpl<Type4Byte, ReduceOp, TransformOp, BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM>, false, BLOCK_SIZE, ITEMS_PER_THREAD>
+        : public AgentReduceImpl<Type4Byte,
+                                 ReduceOp,
+                                 TransformOp,
+                                 BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM, CUDA_WARP_REDUX>,
+                                 false,
+                                 BLOCK_SIZE,
+                                 ITEMS_PER_THREAD>
     {
       public:
         using Base =
-            AgentReduceImpl<Type4Byte, ReduceOp, TransformOp, BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM>, false, BLOCK_SIZE, ITEMS_PER_THREAD>;
+            AgentReduceImpl<Type4Byte,
+                            ReduceOp,
+                            TransformOp,
+                            BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM, CUDA_WARP_REDUX>,
+                            false,
+                            BLOCK_SIZE,
+                            ITEMS_PER_THREAD>;
         AgentReduce(SmemTypePtr<Type4Byte>& smem_data,
                     BufferVar<Type4Byte>&   in,
                     ReduceOp                reduce_op,

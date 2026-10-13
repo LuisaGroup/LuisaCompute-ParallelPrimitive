@@ -223,7 +223,11 @@ class BlockRadixRankMatchEarlyCounts : public LuisaModule
     using BlockScanT = luisa::parallel_primitive::BlockScan<uint, BLOCK_THREADS, BINS_PER_THREAD, WARP_SIZE>;
 
   public:
-    BlockRadixRankMatchEarlyCounts() {}
+    BlockRadixRankMatchEarlyCounts() = default;
+    explicit BlockRadixRankMatchEarlyCounts(SmemTypePtr<uint> warp_offsets)
+        : m_warp_offsets(warp_offsets)
+    {
+    }
     ~BlockRadixRankMatchEarlyCounts() = default;
 
     template <typename UnsignedBits, uint KEY_PER_THREAD, typename DigitExtractorT, typename CountsCallback>
@@ -236,13 +240,15 @@ class BlockRadixRankMatchEarlyCounts : public LuisaModule
         UInt              m_warp;
         UInt              m_lane;
 
-        BlockRadixRankMatchInternal(DigitExtractorT digit_extractor, CountsCallback callback)
+        BlockRadixRankMatchInternal(DigitExtractorT digit_extractor,
+                                    CountsCallback    callback,
+                                    SmemTypePtr<uint> warp_offsets)
             : m_digit_extractor(digit_extractor)
             , m_counts_callback(callback)
             , m_warp(thread_id().x / WARP_SIZE)
             , m_lane(warp_lane_id())
         {
-            m_warp_offsets = new SmemType<uint>(BLOCK_WARPS * RADIX_DIGITS * NUM_PARTS);
+            m_warp_offsets = warp_offsets != nullptr ? warp_offsets : new SmemType<uint>(BLOCK_WARPS * RADIX_DIGITS * NUM_PARTS);
             m_match_masks  = new SmemType<uint>(MATCH_MASKS_ALLOC_SIZE * RADIX_DIGITS);
         }
 
@@ -450,7 +456,7 @@ class BlockRadixRankMatchEarlyCounts : public LuisaModule
                   CountsCallback                                         counts_callback)
     {
         BlockRadixRankMatchInternal<UnsignedBits, KEY_PER_THREAD, DigitExtractorT, CountsCallback> internal(
-            digit_extractor, counts_callback);
+            digit_extractor, counts_callback, m_warp_offsets);
         internal.RankKeys(keys, ranks, exclusive_digit_prefix);
     }
 
@@ -462,7 +468,7 @@ class BlockRadixRankMatchEarlyCounts : public LuisaModule
     {
         using CountsCallback = BlockRadixRankEmptyCallback<BINS_PER_THREAD>;
         BlockRadixRankMatchInternal<UnsignedBits, KEY_PER_THREAD, DigitExtractorT, CountsCallback> internal(
-            digit_extractor, CountsCallback());
+            digit_extractor, CountsCallback(), m_warp_offsets);
         internal.RankKeys(keys, ranks, exclusive_digit_prefix);
     }
 
@@ -474,5 +480,8 @@ class BlockRadixRankMatchEarlyCounts : public LuisaModule
         compute::ArrayVar<int, BINS_PER_THREAD> exclusive_digit_prefix;
         RankKeys(keys, ranks, digit_extractor, exclusive_digit_prefix);
     }
+
+  private:
+    SmemTypePtr<uint> m_warp_offsets = nullptr;
 };
 }  // namespace luisa::parallel_primitive
