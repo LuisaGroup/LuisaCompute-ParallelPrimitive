@@ -315,10 +315,10 @@ int main(int argc, char **argv) {
     // GPU name for the report. On the vk backend, backend_device_names() must
     // NOT be called before device creation (volk global dispatch tables) nor
     // while a device is live, so vk simply reports "unknown".
-    const char *gpu_name = "unknown";
+    std::string gpu_name = "unknown";
     if (std::string_view{backend_name} != "vk") {
         const auto gpu_names = context.backend_device_names(backend_name);
-        if (!gpu_names.empty()) { gpu_name = gpu_names.front().c_str(); }
+        if (!gpu_names.empty()) { gpu_name = gpu_names.front(); }
     }
     Device device = context.create_device(backend_name);
     if (!device) {
@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
     }
 
     std::printf("gpu=%s backend=%s cub=%d items=%zu reps=%d\n",
-                gpu_name,
+                gpu_name.c_str(),
                 device.backend_name().data(), cub_bench_version(), num_items, repetitions);
     std::printf("operation,items,lcpp_median_ms,lcpp_min_ms,lcpp_max_ms,cub_median_ms,cub_min_ms,cub_max_ms,lcpp_over_cub\n");
 
