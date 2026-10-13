@@ -352,9 +352,12 @@ class DeviceRadixSort : public LuisaModule
                                d_bins_view.subview(0, RADIX_DIGITS),  // dummy: last portion, bins_out unused but must be valid-sized
                            ByteBufferView{d_keys.current().subview(portion * PORTION_SIZE, portion_num_items)},
                            ByteBufferView{d_keys.alternate()},
-                           KEY_ONLY ? d_values.current().subview(0, 0) :
+                           // KEY_ONLY: pass a 1-element dummy view instead of an empty one --
+                           // Vulkan forbids empty storage-buffer descriptors, and the
+                           // values are never read/written when KEY_ONLY is true.
+                           KEY_ONLY ? d_values.current().subview(0, 1) :
                                       d_values.current().subview(portion * PORTION_SIZE, portion_num_items),
-                           KEY_ONLY ? d_values.alternate().subview(0, 0) :
+                           KEY_ONLY ? d_values.alternate().subview(0, 1) :
                                       d_values.alternate().subview(portion * PORTION_SIZE, portion_num_items),
                            portion_num_items,
                            current_bit,

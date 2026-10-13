@@ -98,9 +98,9 @@ class DeviceScan : public LuisaModule
 
         size_t bytes = 0;
         bytes += tile_count * sizeof(uint);                  // tile_status
-        bytes  = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
         bytes += tile_count * sizeof(FlagValuePairT);        // tile_partial
-        bytes  = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
         bytes += tile_count * sizeof(FlagValuePairT);        // tile_inclusive
         bytes  = align_up_uint(bytes, alignof(KeyType));
         bytes += num_tiles * sizeof(KeyType);                // d_prev_keys_in
@@ -221,13 +221,13 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
@@ -272,13 +272,13 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);

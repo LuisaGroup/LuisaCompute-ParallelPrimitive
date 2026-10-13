@@ -100,9 +100,9 @@ class DeviceReduce : public LuisaModule
         get_temp_size_scan(reduce_temp_count, BLOCK_SIZE, ITEMS_PER_THREAD, num_item);
         size_t bytes = 0;
         bytes += reduce_temp_count * sizeof(IVP);          // reduce temp
-        bytes  = align_up_uint(bytes, alignof(IVP));
+        bytes  = align_up_uint(bytes, sizeof(IVP));
         bytes += num_item * sizeof(IVP);                   // d_in_kv
-        bytes  = align_up_uint(bytes, alignof(IVP));
+        bytes  = align_up_uint(bytes, sizeof(IVP));
         bytes += 1 * sizeof(IVP);                          // d_out_kv
         return bytes;
     }
@@ -117,9 +117,9 @@ class DeviceReduce : public LuisaModule
 
         size_t bytes = 0;
         bytes += tile_count * sizeof(uint);               // tile_states
-        bytes  = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
         bytes += tile_count * sizeof(FlagValuePairT);     // tile_partial
-        bytes  = align_up_uint(bytes, alignof(FlagValuePairT));
+        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
         bytes += tile_count * sizeof(FlagValuePairT);     // tile_inclusive
         return bytes;
     }
@@ -201,13 +201,13 @@ class DeviceReduce : public LuisaModule
         size_t reduce_temp_uint_count = reduce_temp_count * sizeof(IVP) / sizeof(uint);
         auto reduce_temp = temp_storage.subview(offset_bytes / sizeof(uint), reduce_temp_uint_count).template as<IVP>();
         offset_bytes += reduce_temp_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(IVP));
 
         // d_in_kv
         size_t in_kv_uint_count = num_item * sizeof(IVP) / sizeof(uint);
         auto d_in_kv = temp_storage.subview(offset_bytes / sizeof(uint), in_kv_uint_count).template as<IVP>();
         offset_bytes += in_kv_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(IVP));
 
         // d_out_kv
         size_t out_kv_uint_count = 1 * sizeof(IVP) / sizeof(uint);
@@ -246,13 +246,13 @@ class DeviceReduce : public LuisaModule
         size_t reduce_temp_uint_count = reduce_temp_count * sizeof(IVP) / sizeof(uint);
         auto reduce_temp = temp_storage.subview(offset_bytes / sizeof(uint), reduce_temp_uint_count).template as<IVP>();
         offset_bytes += reduce_temp_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(IVP));
 
         // d_in_kv
         size_t in_kv_uint_count = num_item * sizeof(IVP) / sizeof(uint);
         auto d_in_kv = temp_storage.subview(offset_bytes / sizeof(uint), in_kv_uint_count).template as<IVP>();
         offset_bytes += in_kv_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(IVP));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(IVP));
 
         // d_out_kv
         size_t out_kv_uint_count = 1 * sizeof(IVP) / sizeof(uint);
@@ -299,13 +299,13 @@ class DeviceReduce : public LuisaModule
         // tile_states: tile_count * uint
         auto tile_states = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_partial: tile_count * FlagValuePairT
         size_t partial_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(FlagValuePairT));
+        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
 
         // tile_inclusive: tile_count * FlagValuePairT
         size_t inclusive_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);

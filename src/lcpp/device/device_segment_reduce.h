@@ -82,7 +82,7 @@ class DeviceSegmentReduce : public LuisaModule
         using IVP = IndexValuePairT<Type4Byte>;
         size_t bytes = 0;
         bytes += num_item * sizeof(IVP);            // d_in_kv
-        bytes  = align_up_uint(bytes, alignof(IVP));
+        bytes  = align_up_uint(bytes, sizeof(IVP));
         bytes += num_segments * sizeof(IVP);        // d_out_kv
         return bytes;
     }
