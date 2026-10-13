@@ -12,6 +12,8 @@
 #include <luisa/dsl/builtin.h>
 #include <lcpp/runtime/core.h>
 #include <lcpp/warp/warp_reduce.h>
+#include <lcpp/common/thread_operators.h>
+#include <type_traits>
 
 namespace luisa::parallel_primitive
 {
@@ -22,7 +24,10 @@ namespace details
     template <typename T>
     using SmemTypePtr = luisa::compute::Shared<T>*;
 
-    template <typename Type4Byte, size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_SIZE = details::WARP_SIZE>
+    template <typename Type4Byte,
+              size_t BLOCK_SIZE = details::BLOCK_SIZE,
+              size_t WARP_SIZE = details::WARP_SIZE,
+              bool   CUDA_WARP_REDUX = false>
     struct BlockReduceShfl
     {
         template <bool IS_FULL_TILE, typename ReduceOp>
@@ -42,8 +47,18 @@ namespace details
             UInt remaining = compute::select(0u, tile_valid - warp_offset, tile_valid > warp_offset);
             UInt warp_valid_num = compute::min(compute::UInt(WARP_SIZE), remaining);
 
-            Var<Type4Byte> warp_aggregate =
-                WarpReduce<Type4Byte, WARP_SIZE>().Reduce(thread_data, reduce_op, warp_valid_num);
+            Var<Type4Byte> warp_aggregate;
+            if constexpr(CUDA_WARP_REDUX && IS_FULL_TILE &&
+                         std::is_same_v<std::remove_cvref_t<ReduceOp>, SumOp> &&
+                         (std::is_same_v<Type4Byte, int> || std::is_same_v<Type4Byte, uint>))
+            {
+                warp_aggregate = details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.ReduceAddSync(thread_data);
+            }
+            else
+            {
+                warp_aggregate =
+                    WarpReduce<Type4Byte, WARP_SIZE>().Reduce(thread_data, reduce_op, warp_valid_num);
+            }
 
             // write warp result to shared memory
             $if(lane_id == 0u & warp_valid_num > 0u)

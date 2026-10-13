@@ -37,7 +37,12 @@ namespace luisa::parallel_primitive
 {
 
 using namespace luisa::compute;
-template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE,
+          size_t WARP_NUMS = details::WARP_SIZE,
+          size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD,
+          // Keep CUB's tuned 32-bit key-only onesweep policy by default while
+          // allowing callers to benchmark a single policy end to end.
+          bool CUB_SMALL_KEY_POLICY = true>
 class DeviceRadixSort : public LuisaModule
 {
     enum class RadixSortAlgorithm
@@ -208,7 +213,30 @@ class DeviceRadixSort : public LuisaModule
     template <typename KeyType>
     static size_t GetSortKeysTempStorageBytes(uint num_items)
     {
-        return GetSortPairsTempStorageBytes<KeyType, KeyType>(num_items);
+        constexpr uint onesweep_block_threads =
+            CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 384u : BLOCK_SIZE;
+        constexpr uint onesweep_items_per_thread =
+            CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 20u : ITEMS_PER_THREAD;
+        const uint radix_bits = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
+        const uint radix_digits = 1u << radix_bits;
+        const uint onesweep_tile_items = onesweep_items_per_thread * onesweep_block_threads;
+        const auto portion_size = ((1u << 28u) - 1u) / onesweep_tile_items * onesweep_tile_items;
+        const auto num_passes = ceil_div(static_cast<uint>(sizeof(KeyType) * 8u), radix_bits);
+        const auto num_portions = ceil_div(num_items, portion_size);
+        const auto max_num_blocks = ceil_div(std::min(num_items, portion_size), onesweep_tile_items);
+
+        size_t bytes = 0u;
+        bytes += static_cast<size_t>(num_portions) * num_passes * radix_digits * sizeof(uint);
+        bytes += static_cast<size_t>(max_num_blocks) * radix_digits * sizeof(uint);
+        if(num_passes > 1u)
+        {
+            bytes = align_up_uint(bytes, alignof(KeyType));
+            bytes += static_cast<size_t>(num_items) * sizeof(KeyType);
+            bytes = align_up_uint(bytes, alignof(KeyType));
+            bytes += static_cast<size_t>(num_items) * sizeof(KeyType);
+        }
+        bytes += static_cast<size_t>(num_portions) * num_passes * sizeof(uint);
+        return bytes;
     }
 
 
@@ -877,9 +905,11 @@ class DeviceRadixSort : public LuisaModule
     {
         const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
         const uint RADIX_DIGITS = 1 << RADIX_BITS;
-        const uint ONESWEEP_ITMES_PER_THREADS = ITEMS_PER_THREAD;
-        const uint ONESWEEP_BLOCK_THREADS     = m_block_size;
-        const uint ONESWEEP_TILE_ITEMS        = ONESWEEP_ITMES_PER_THREADS * ONESWEEP_BLOCK_THREADS;
+        constexpr uint ONESWEEP_BLOCK_THREADS =
+            KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 384u : BLOCK_SIZE;
+        constexpr uint ONESWEEP_ITEMS_PER_THREAD =
+            KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 20u : ITEMS_PER_THREAD;
+        constexpr uint ONESWEEP_TILE_ITEMS = ONESWEEP_ITEMS_PER_THREAD * ONESWEEP_BLOCK_THREADS;
 
         const auto PORTION_SIZE = ((1u << 28u) - 1u) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
 
@@ -1023,7 +1053,14 @@ class DeviceRadixSort : public LuisaModule
         }
 
         using RadixSortOneSweep =
-            details::RadixSortOneSweepModule<KeyType, ValueType, KEY_ONLY, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS, ONESWEEP_ITMES_PER_THREADS>;
+            details::RadixSortOneSweepModule<KeyType,
+                                             ValueType,
+                                             KEY_ONLY,
+                                             IS_DESCENDING,
+                                             RADIX_BITS,
+                                             ONESWEEP_BLOCK_THREADS,
+                                             WARP_NUMS,
+                                             ONESWEEP_ITEMS_PER_THREAD>;
         using RadixSortOneSweepKernel = RadixSortOneSweep::RadixSortOneSweepKernel;
 
         auto onesweep_radix_sort_key   = radix_sort_key + (KEY_ONLY ? "_keys" : "_pairs");

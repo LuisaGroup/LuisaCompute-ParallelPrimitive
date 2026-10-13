@@ -127,6 +127,33 @@ int main(int argc, char* argv[])
         expect((array_size - 1) * (array_size - 1) == result[0]);
     };
 
+    "transform_reduce_applies_transform_once_at_every_size"_test = [&]
+    {
+        for(size_t size : {1u, 31u, 256u, 1023u, 1024u, 1025u, 1048577u, 4194304u})
+        {
+            luisa::vector<int> host_input(size);
+            int expected = 17;
+            for(size_t i = 0u; i < size; ++i)
+            {
+                host_input[i] = static_cast<int>(i % 13u) - 6;
+                expected += 2 * host_input[i] + 1;
+            }
+            auto input = device.create_buffer<int>(size);
+            auto output = device.create_buffer<int>(1u);
+            auto temp = device.create_buffer<uint>(
+                bytes_to_uint_count(DeviceReduce<>::GetTempStorageBytes<int>(size)));
+            luisa::vector<int> actual(1u, -12345);
+            stream << input.copy_from(luisa::span{host_input})
+                   << output.copy_from(luisa::span{actual}) << synchronize();
+
+            CommandList commands;
+            reducer.TransformReduce(commands, temp.view(), input.view(), output.view(),
+                                    size, SumOp(), [](const Int& value) { return 2 * value + 1; }, 17);
+            stream << commands.commit() << output.copy_to(luisa::span{actual}) << synchronize();
+            expect(actual[0] == expected);
+        }
+    };
+
     //reduce(min)
     "reduce_min"_test = [&]
     {

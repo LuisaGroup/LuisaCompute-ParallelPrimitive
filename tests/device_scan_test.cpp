@@ -137,6 +137,116 @@ int main(int argc, char* argv[])
         }
     };
 
+    "cuda_tile_state_access_preserves_words"_test = [&]
+    {
+        if(backend_name != "cuda")
+        {
+            return;
+        }
+        constexpr uint count = 1024u;
+        Kernel1D roundtrip = [](BufferVar<uint> words, BufferVar<compute::ulong> wide_words, BufferVar<compute::ulong> output)
+        {
+            UInt index = dispatch_id().x;
+            UInt word = index ^ 0xa5a5a5a5u;
+            ULong wide_word = (ULong(index) << 32u) | 0xfedcba98ull;
+            details::cuda_tile_state_store<uint>(words, index, word);
+            details::cuda_tile_state_store<compute::ulong>(wide_words, index, wide_word);
+            output.write(index, details::cuda_tile_state_load(wide_words, index) +
+                                   ULong(details::cuda_tile_state_load(words, index)));
+        };
+        auto shader = device.compile(roundtrip);
+        auto words = device.create_buffer<uint>(count);
+        auto wide_words = device.create_buffer<compute::ulong>(count);
+        auto output = device.create_buffer<compute::ulong>(count);
+        luisa::vector<compute::ulong> result(count);
+        stream << shader(words, wide_words, output).dispatch(count)
+               << output.copy_to(luisa::span{result}) << synchronize();
+        for(uint index = 0u; index < count; ++index)
+        {
+            const compute::ulong expected = (static_cast<compute::ulong>(index) << 32u | 0xfedcba98ull) +
+                                            (index ^ 0xa5a5a5a5u);
+            expect(result[index] == expected);
+        }
+    };
+
+    "warp_transpose_scan_matches_cub_policy"_test = [&]
+    {
+        if(backend_name != "cuda")
+        {
+            return;
+        }
+        constexpr size_t block_size = 384u;
+        constexpr size_t items_per_thread = 22u;
+        constexpr size_t array_size = block_size * items_per_thread * 3u + 17u;
+        using WarpTransposeScanner = DeviceScan<
+            block_size,
+            WARP_NUMS,
+            items_per_thread,
+            BlockLoadAlgorithm::BLOCK_LOAD_WARP_TRANSPOSE,
+            BlockStoreAlgorithm::BLOCK_STORE_WARP_TRANSPOSE,
+            true>;
+
+        luisa::vector<int> input_data(array_size);
+        luisa::vector<int> expected(array_size);
+        int running_sum = 0;
+        for(size_t index = 0u; index < array_size; ++index)
+        {
+            input_data[index] = static_cast<int>(index % 7u) - 3;
+            running_sum += input_data[index];
+            expected[index] = running_sum;
+        }
+
+        auto input = device.create_buffer<int>(array_size);
+        auto output = device.create_buffer<int>(array_size);
+        auto temp = device.create_buffer<uint>(bytes_to_uint_count(
+            WarpTransposeScanner::GetTempStorageBytes<int>(array_size)));
+        WarpTransposeScanner warp_scanner;
+        warp_scanner.create(device, &stream);
+        CommandList commands;
+        warp_scanner.InclusiveSum(commands, temp.view(), input.view(), output.view(), array_size);
+
+        luisa::vector<int> result(array_size);
+        stream << input.copy_from(luisa::span{input_data}) << commands.commit()
+               << output.copy_to(luisa::span{result}) << synchronize();
+        expect(std::equal(result.begin(), result.end(), expected.begin()));
+    };
+
+    "packed_warp_transpose_scan_matches_cub_tile_state"_test = [&]
+    {
+        if(backend_name != "cuda")
+        {
+            return;
+        }
+        constexpr size_t block_size         = 320u;
+        constexpr size_t items_per_thread   = 25u;
+        constexpr size_t array_size         = block_size * items_per_thread * 3u + 17u;
+        using PackedWarpTransposeScanner = DeviceScanCudaParity;
+
+        luisa::vector<int> input_data(array_size);
+        luisa::vector<int> expected(array_size);
+        int running_sum = 0;
+        for(size_t index = 0u; index < array_size; ++index)
+        {
+            input_data[index] = static_cast<int>(index % 7u) - 3;
+            running_sum += input_data[index];
+            expected[index] = running_sum;
+        }
+
+        auto input = device.create_buffer<int>(array_size);
+        auto output = device.create_buffer<int>(array_size);
+        auto temp = device.create_buffer<uint>(bytes_to_uint_count(
+            PackedWarpTransposeScanner::GetTempStorageBytes<int>(array_size)));
+        PackedWarpTransposeScanner packed_scanner;
+        packed_scanner.create(device, &stream);
+        CommandList commands;
+        packed_scanner.InclusiveSum(commands, temp.view(), input.view(), output.view(), array_size);
+
+        luisa::vector<int> result(array_size);
+        stream << input.copy_from(luisa::span{input_data}) << commands.commit()
+               << output.copy_to(luisa::span{result}) << synchronize();
+        expect(std::equal(result.begin(), result.end(), expected.begin()));
+    };
+
     "device_scan_aligns_temporary_storage_for_double_values"_test = [&]
     {
         constexpr size_t      array_size = 17u;

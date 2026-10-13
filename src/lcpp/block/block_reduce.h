@@ -31,7 +31,8 @@ template <typename Type4Byte,
           size_t               BLOCK_SIZE       = details::BLOCK_SIZE,
           size_t               ITEMS_PER_THREAD = details::ITEMS_PER_THREAD,
           size_t               WARP_SIZE        = details::WARP_SIZE,
-          BlockReduceAlgorithm Algorithm        = BlockReduceAlgorithm::WARP_SHUFFLE>
+          BlockReduceAlgorithm Algorithm        = BlockReduceAlgorithm::WARP_SHUFFLE,
+          bool                 CUDA_WARP_REDUX  = false>
 class BlockReduce : public LuisaModule
 {
     static_assert(BLOCK_SIZE > 0u);
@@ -65,7 +66,7 @@ class BlockReduce : public LuisaModule
         Var<Type4Byte> result;
         if constexpr(USE_WARP_SHUFFLE)
         {
-            result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE>().template Reduce<true>(
+            result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE, CUDA_WARP_REDUX>().template Reduce<true>(
                 m_shared_mem, thread_data, reduce_op, compute::block_size().x);
         }
         else
@@ -84,12 +85,12 @@ class BlockReduce : public LuisaModule
         {
             $if(num_item >= compute::block_size().x)
             {
-                result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE>().template Reduce<true>(
+                result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE, CUDA_WARP_REDUX>().template Reduce<true>(
                     m_shared_mem, thread_data, reduce_op, num_item);
             }
             $else
             {
-                result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE>().template Reduce<false>(
+                result = details::BlockReduceShfl<Type4Byte, BLOCK_SIZE, WARP_SIZE, CUDA_WARP_REDUX>().template Reduce<false>(
                     m_shared_mem, thread_data, reduce_op, num_item);
             };
         }

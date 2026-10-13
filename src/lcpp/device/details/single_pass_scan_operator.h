@@ -14,6 +14,7 @@
 #include <luisa/dsl/resource.h>
 #include <luisa/dsl/struct.h>
 #include <lcpp/common/type_trait.h>
+#include <lcpp/common/cuda_tile_state.h>
 #include <lcpp/common/util_type.h>
 #include <lcpp/common/thread_operators.h>
 #include <lcpp/runtime/core.h>
@@ -111,6 +112,65 @@ struct ScanTileStateViewer
         };
     };
 };
+
+// CUB packs the status and 4-byte tile prefix into one descriptor.  Keeping
+// the pair together makes the publication and polling operation a single
+// 64-bit transaction on CUDA instead of two independent buffer accesses.
+template <typename T>
+struct PackedScanTileStateViewer
+{
+    static_assert(sizeof(T) == sizeof(compute::uint), "Packed scan tile state requires a 4-byte value.");
+
+    using StatusWordT = compute::uint;
+
+    constexpr static size_t TILE_STATUS_PADDING = details::WARP_SIZE;
+
+    compute::BufferVar<compute::ulong>& d_tile_state;
+
+    explicit PackedScanTileStateViewer(compute::BufferVar<compute::ulong>& tile_state)
+        : d_tile_state(tile_state) {}
+
+    // Use CUDA relaxed scalar accesses for both publication and polling; the
+    // descriptor is a single 64-bit state word, matching CUB's look-back path.
+    void SetInclusive(compute::Int tile_index, const compute::Var<T>& tile_inclusive) noexcept
+    {
+        details::cuda_tile_state_store<compute::ulong>(d_tile_state,
+            compute::UInt(TILE_STATUS_PADDING) + compute::UInt(tile_index),
+            compute::make_uint2(compute::def(StatusWordT(ScanTileStatus::SCAN_TILE_INCLUSIVE)),
+                                compute::as<compute::uint>(tile_inclusive))
+                .template as<compute::ulong>());
+    }
+
+    void SetPartial(compute::Int tile_index, const compute::Var<T>& tile_partial) noexcept
+    {
+        details::cuda_tile_state_store<compute::ulong>(d_tile_state,
+            compute::UInt(TILE_STATUS_PADDING) + compute::UInt(tile_index),
+            compute::make_uint2(compute::def(StatusWordT(ScanTileStatus::SCAN_TILE_PARTIAL)),
+                                compute::as<compute::uint>(tile_partial))
+                .template as<compute::ulong>());
+    }
+
+    template <typename DelayT>
+    void WaitForValid(compute::Int tile_index,
+                      compute::Var<StatusWordT>& out_status,
+                      compute::Var<T>&           out_value,
+                      DelayT                     delay) noexcept
+    {
+        compute::Var<compute::ulong> encoded =
+            details::cuda_tile_state_load(d_tile_state, compute::UInt(TILE_STATUS_PADDING) + compute::UInt(tile_index));
+        compute::Var<compute::uint2> state = encoded.template as<compute::uint2>();
+        out_status = state.x;
+        $while(compute::warp_active_any(out_status == StatusWordT(ScanTileStatus::SCAN_TILE_INVALID)))
+        {
+            delay();
+            encoded   = details::cuda_tile_state_load(d_tile_state, compute::UInt(TILE_STATUS_PADDING) + compute::UInt(tile_index));
+            state     = encoded.template as<compute::uint2>();
+            out_status = state.x;
+        };
+        out_value = compute::as<T>(state.y);
+    };
+};
+
 static void InitializeWardStatus(compute::UInt num_tile, compute::BufferVar<compute::uint>& d_tile_status) noexcept
 {
     compute::UInt tile_idx = compute::dispatch_id().x;
@@ -122,6 +182,27 @@ static void InitializeWardStatus(compute::UInt num_tile, compute::BufferVar<comp
     $if(compute::block_id().x == 0 & compute::thread_x() < compute::UInt(ScanTileStateViewer<int>::TILE_STATUS_PADDING))
     {
         d_tile_status.write(compute::thread_x(), compute::def(ScanTileStateViewer<int>::StatusWordT(ScanTileStatus::SCAN_TILE_OBB)));
+    };
+};
+
+static void InitializePackedWardStatus(compute::UInt num_tile, compute::BufferVar<compute::ulong>& d_tile_state) noexcept
+{
+    compute::UInt tile_idx = compute::dispatch_id().x;
+    $if(tile_idx < num_tile)
+    {
+        d_tile_state.write(
+            compute::UInt(PackedScanTileStateViewer<int>::TILE_STATUS_PADDING) + tile_idx,
+            compute::make_uint2(
+                compute::def(PackedScanTileStateViewer<int>::StatusWordT(ScanTileStatus::SCAN_TILE_INVALID)), compute::UInt(0u))
+                .template as<compute::ulong>());
+    };
+    $if(compute::block_id().x == 0 & compute::thread_x() < compute::UInt(PackedScanTileStateViewer<int>::TILE_STATUS_PADDING))
+    {
+        d_tile_state.write(
+            compute::thread_x(),
+            compute::make_uint2(
+                compute::def(PackedScanTileStateViewer<int>::StatusWordT(ScanTileStatus::SCAN_TILE_OBB)), compute::UInt(0u))
+                .template as<compute::ulong>());
     };
 };
 

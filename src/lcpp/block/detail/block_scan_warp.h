@@ -203,9 +203,9 @@ namespace details
             Var<Type4Byte> warp_prefix;
             block_aggregate = (*m_shared_mem)[0];
 
-            $for(item, compute::UInt(1u), compute::UInt(BLOCK_SIZE / WARP_SIZE))
+            for(size_t item = 1u; item < BLOCK_SIZE / WARP_SIZE; ++item)
             {
-                $if(warp_id == item)
+                $if(warp_id == compute::UInt(item))
                 {
                     warp_prefix = block_aggregate;
                 };

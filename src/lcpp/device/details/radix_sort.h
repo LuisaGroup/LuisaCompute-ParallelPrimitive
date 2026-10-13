@@ -152,12 +152,14 @@ namespace details
                     set_block_size(BLOCK_SIZE);
                     set_warp_size(WARP_SIZE);
 
-                    using RadixSortOneSweepPolicy = AgentRadixSortOneSweepPolicy<1u, 8u, KeyType, 1u, RADIX_BIT>;
+                    using RadixSortOneSweepPolicy =
+                        AgentRadixSortOneSweepPolicy<BLOCK_SIZE, ITEMS_PER_THREAD, KeyType, 1u, RADIX_BIT>;
                     using AgentT =
                         AgentRadixSortOneSweep<KeyType, ValueType, KEY_ONLY, RADIX_BIT, RadixSortOneSweepPolicy::RANK_NUM_PARTS, IS_DESCENDING, BLOCK_SIZE, WARP_SIZE, ITEMS_PER_THREAD>;
 
                     AgentT agent(
-                        d_lookback, d_ctrs, d_bins_in, d_bins_out, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, current_bit, num_bits);
+                        d_lookback, d_ctrs, d_bins_in, d_bins_out, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, current_bit, num_bits,
+                        device.backend_name() == "cuda");
                     agent.Process();
                 });
             return ms_radix_sort_onesweep_kernel;

@@ -2,6 +2,7 @@
 
 #include <lcpp/runtime/core.h>
 
+#include <luisa/dsl/func.h>
 #include <luisa/dsl/builtin.h>
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/var.h>
@@ -11,7 +12,14 @@
 namespace luisa::parallel_primitive
 {
 
-template <typename T, size_t BLOCK_DIM_X, size_t ITEMS_PER_THREAD, size_t BLOCK_DIM_Y = 1u, size_t BLOCK_DIM_Z = 1u, bool WARP_TIME_SLICING = false>
+template <typename T,
+          size_t BLOCK_DIM_X,
+          size_t ITEMS_PER_THREAD,
+          size_t BLOCK_DIM_Y = 1u,
+          size_t BLOCK_DIM_Z = 1u,
+          bool WARP_TIME_SLICING = false,
+          // CUDA-only opt-in: use __syncwarp for warp-local transpose.
+          bool WARP_SYNC        = false>
 class BlockExchange : public LuisaModule
 {
     static constexpr size_t BLOCK_THREADS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
@@ -187,7 +195,7 @@ class BlockExchange : public LuisaModule
     {
         constexpr size_t WARP_THREADS = details::WARP_SIZE;
         compute::UInt    tid          = linear_thread_id();
-        compute::UInt    lane         = tid % compute::UInt(WARP_THREADS);
+        compute::UInt    lane         = compute::warp_lane_id();
         compute::UInt    warp_offset =
             tid / compute::UInt(WARP_THREADS) * compute::UInt(WARP_THREADS * ITEMS_PER_THREAD);
         for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
@@ -197,7 +205,15 @@ class BlockExchange : public LuisaModule
                                 warp_offset + lane + compute::UInt(item * WARP_THREADS);
             (*m_shared_mem)[index] = input_items[item];
         }
-        compute::sync_block();
+        if constexpr(WARP_SYNC)
+        {
+            static compute::ExternalCallable<void(uint)> syncwarp{"__syncwarp"};
+            syncwarp(compute::UInt(0xffffffffu));
+        }
+        else
+        {
+            compute::sync_block();
+        }
         for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
         {
             compute::UInt index =
@@ -205,7 +221,10 @@ class BlockExchange : public LuisaModule
                                 warp_offset + lane * compute::UInt(ITEMS_PER_THREAD) + compute::UInt(item);
             output_items[item] = (*m_shared_mem)[index];
         }
-        compute::sync_block();
+        if constexpr(!WARP_SYNC)
+        {
+            compute::sync_block();
+        }
     }
 
     template <typename OutputArray, typename RankArray>

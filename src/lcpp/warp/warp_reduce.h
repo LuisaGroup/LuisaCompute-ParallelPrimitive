@@ -47,7 +47,21 @@ class WarpReduce : public LuisaModule
     // only support power of 2 warp size
     // and only lane_id == 0 will get the correct result
     template <typename ReduceOp>
-    Var<Type4Byte> Reduce(const Var<Type4Byte>& d_in, ReduceOp op, compute::UInt valid_item = WARP_SIZE)
+    Var<Type4Byte> Reduce(const Var<Type4Byte>& d_in, ReduceOp op)
+    {
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
+        {
+            return details::WarpReduceSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.Reduce(
+                d_in, op, compute::UInt(WARP_SIZE));
+        }
+        else
+        {
+            return details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.Reduce(d_in, op);
+        }
+    }
+
+    template <typename ReduceOp>
+    Var<Type4Byte> Reduce(const Var<Type4Byte>& d_in, ReduceOp op, compute::UInt valid_item)
     {
         if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
@@ -148,8 +162,24 @@ class WarpReduce : public LuisaModule
     template <typename FlagT, typename ReduceOp>
     Var<Type4Byte> TailSegmentedReduce(const Var<Type4Byte>& d_in,
                                        const Var<FlagT>&     flag,
+                                       ReduceOp              redecu_op)
+    {
+        if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
+        {
+            return details::WarpReduceSmem<Type4Byte, WARP_SIZE>{m_shared_mem}.template SegmentReduce<false>(
+                d_in, flag, redecu_op, compute::UInt(WARP_SIZE));
+        }
+        else
+        {
+            return details::WarpReduceShfl<Type4Byte, WARP_SIZE>{}.SegmentReduceFull(d_in, flag, redecu_op);
+        }
+    }
+
+    template <typename FlagT, typename ReduceOp>
+    Var<Type4Byte> TailSegmentedReduce(const Var<Type4Byte>& d_in,
+                                       const Var<FlagT>&     flag,
                                        ReduceOp              redecu_op,
-                                       compute::UInt         valid_item = WARP_SIZE)
+                                       compute::UInt         valid_item)
     {
         if constexpr(WarpReduceMethod == WarpReduceAlgorithm::WARP_SHARED_MEMORY)
         {
