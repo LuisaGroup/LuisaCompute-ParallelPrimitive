@@ -33,7 +33,9 @@ void StoreDirectWarpStriped(compute::UInt                               linear_t
                             compute::UInt                               global_offset,
                             const compute::ArrayVar<T, ItemsPerThread>& items)
 {
-    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt tid;
+    if constexpr(WARP_SIZE == details::WARP_SIZE) { tid = compute::warp_lane_id(); }
+    else { tid = linear_tid % compute::UInt(WARP_SIZE); }
     compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
@@ -51,7 +53,9 @@ void StoreDirectWarpStriped(compute::UInt                               linear_t
                             compute::UInt                               global_offset,
                             const compute::ArrayVar<T, ItemsPerThread>& items)
 {
-    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt tid;
+    if constexpr(WARP_SIZE == details::WARP_SIZE) { tid = compute::warp_lane_id(); }
+    else { tid = linear_tid % compute::UInt(WARP_SIZE); }
     compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
@@ -71,7 +75,9 @@ void StoreDirectWarpStriped(compute::UInt                               linear_t
                             const compute::ArrayVar<T, ItemsPerThread>& items,
                             compute::UInt                               valid_item)
 {
-    compute::UInt tid         = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt tid;
+    if constexpr(WARP_SIZE == details::WARP_SIZE) { tid = compute::warp_lane_id(); }
+    else { tid = linear_tid % compute::UInt(WARP_SIZE); }
     compute::UInt wid         = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
 
@@ -93,7 +99,9 @@ void StoreDirectWarpStriped(compute::UInt                               linear_t
                             const compute::ArrayVar<T, ItemsPerThread>& items,
                             compute::UInt                               valid_item)
 {
-    compute::UInt tid           = linear_tid % compute::UInt(WARP_SIZE);
+    compute::UInt tid;
+    if constexpr(WARP_SIZE == details::WARP_SIZE) { tid = compute::warp_lane_id(); }
+    else { tid = linear_tid % compute::UInt(WARP_SIZE); }
     compute::UInt wid           = linear_tid / compute::UInt(WARP_SIZE);
     compute::UInt warp_offset   = wid * compute::UInt(WARP_SIZE * ItemsPerThread);
     compute::UInt thread_offset = global_offset + warp_offset + tid;
@@ -110,7 +118,11 @@ void StoreDirectWarpStriped(compute::UInt                               linear_t
 }
 
 
-template <typename Type4Byte, size_t BlockSize = details::BLOCK_SIZE, size_t ITEMS_PER_THREAD = 2, BlockStoreAlgorithm DefaultStoreAlgorithm = BlockStoreAlgorithm::BLOCK_STORE_DIRECT>
+template <typename Type4Byte,
+          size_t BlockSize = details::BLOCK_SIZE,
+          size_t ITEMS_PER_THREAD = 2,
+          BlockStoreAlgorithm DefaultStoreAlgorithm = BlockStoreAlgorithm::BLOCK_STORE_DIRECT,
+          bool WARP_SYNC = false>
 class BlockStore : public LuisaModule
 {
   public:
@@ -136,7 +148,27 @@ class BlockStore : public LuisaModule
                const compute::BufferVar<Type4Byte>&                  d_out,
                compute::UInt                                         block_item_start)
     {
-        Store(thread_data, d_out, block_item_start, compute::UInt(BlockSize * ITEMS_PER_THREAD));
+        if constexpr(DefaultStoreAlgorithm == BlockStoreAlgorithm::BLOCK_STORE_WARP_TRANSPOSE
+                     || DefaultStoreAlgorithm == BlockStoreAlgorithm::BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED)
+        {
+            static_assert(BlockSize % details::WARP_SIZE == 0u);
+            compute::set_block_size(BlockSize);
+            compute::Var<compute::uint> tid = compute::thread_id().x;
+            compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> warp_striped_items;
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD, 1u, 1u, false, WARP_SYNC>(m_shared_mem).BlockedToWarpStriped(
+                thread_data, warp_striped_items);
+            compute::Var<compute::uint> base = block_item_start +
+                tid / compute::UInt(details::WARP_SIZE) * compute::UInt(details::WARP_SIZE * ITEMS_PER_THREAD) +
+                compute::warp_lane_id();
+            for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
+            {
+                d_out.write(base + compute::UInt(item * details::WARP_SIZE), warp_striped_items[item]);
+            }
+        }
+        else
+        {
+            Store(thread_data, d_out, block_item_start, compute::UInt(BlockSize * ITEMS_PER_THREAD));
+        }
     }
 
     void Store(const compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD>& thread_data,
@@ -158,14 +190,16 @@ class BlockStore : public LuisaModule
         else if constexpr(DefaultStoreAlgorithm == BlockStoreAlgorithm::BLOCK_STORE_TRANSPOSE)
         {
             compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> striped_items;
-            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).BlockedToStriped(thread_data, striped_items);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD, 1u, 1u, false, WARP_SYNC>(m_shared_mem).BlockedToStriped(
+                thread_data, striped_items);
             store_striped(striped_items, d_out, block_item_start, block_item_end, tid);
         }
         else
         {
             static_assert(BlockSize % details::WARP_SIZE == 0u);
             compute::ArrayVar<Type4Byte, ITEMS_PER_THREAD> warp_striped_items;
-            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD>(m_shared_mem).BlockedToWarpStriped(thread_data, warp_striped_items);
+            BlockExchange<Type4Byte, BlockSize, ITEMS_PER_THREAD, 1u, 1u, false, WARP_SYNC>(m_shared_mem).BlockedToWarpStriped(
+                thread_data, warp_striped_items);
             store_warp_striped(warp_striped_items, d_out, block_item_start, block_item_end, tid);
         }
     }
@@ -209,7 +243,7 @@ class BlockStore : public LuisaModule
                                    compute::UInt valid_items,
                                    compute::UInt tid)
     {
-        compute::UInt lane        = tid % compute::UInt(details::WARP_SIZE);
+        compute::UInt lane        = compute::warp_lane_id();
         compute::UInt warp_offset = tid / compute::UInt(details::WARP_SIZE)
                                     * compute::UInt(details::WARP_SIZE * ITEMS_PER_THREAD);
         for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)

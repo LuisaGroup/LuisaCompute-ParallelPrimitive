@@ -40,7 +40,15 @@ namespace luisa::parallel_primitive
 
 using namespace luisa::compute;
 
-template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE,
+          size_t WARP_NUMS = details::WARP_SIZE,
+          size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD,
+          // Force the CUDA redux variant when true; the default also selects
+          // it automatically after create() when the backend is CUDA.
+          bool   CUDA_WARP_REDUX = false,
+          // Use the larger CUDA tile for large scalar reductions while
+          // retaining the caller's policy for small inputs and other backends.
+          bool   AUTO_CUDA_TUNED_POLICY = true>
 class DeviceReduce : public LuisaModule
 {
   private:
@@ -51,6 +59,13 @@ class DeviceReduce : public LuisaModule
     Device m_device;
 
     bool m_created = false;
+
+    template <size_t PolicyBlockSize, size_t PolicyItemsPerThread>
+    [[nodiscard]] static constexpr size_t policy_shared_mem_size() noexcept
+    {
+        constexpr size_t tile_items = PolicyBlockSize * PolicyItemsPerThread;
+        return tile_items + tile_items / WARP_NUMS;
+    }
 
   public:
     DeviceReduce()  = default;
@@ -569,6 +584,91 @@ class DeviceReduce : public LuisaModule
         return 0;
     }
 
+    template <bool USE_CUDA_WARP_REDUX,
+              size_t PolicyBlockSize = BLOCK_SIZE,
+              size_t PolicyItemsPerThread = ITEMS_PER_THREAD,
+              NumericTOrKeyValuePairT Type,
+              typename ReduceOp,
+              typename TransformOp = IdentityOp>
+    [[nodiscard]] int reduce_array_recursive_impl(luisa::compute::CommandList& cmdlist,
+                                                  BufferView<Type>             temp_storage,
+                                                  BufferView<Type>             arr_in,
+                                                  BufferView<Type>             arr_out,
+                                                  uint                         num_items,
+                                                  uint                         offset,
+                                                  uint                         level,
+                                                  ReduceOp                     reduce_op,
+                                                  Type                         init,
+                                                  TransformOp transform_op = IdentityOp()) noexcept
+    {
+        constexpr uint policy_block_size = static_cast<uint>(PolicyBlockSize);
+        constexpr uint policy_items_per_thread = static_cast<uint>(PolicyItemsPerThread);
+        uint tile_items = policy_block_size * policy_items_per_thread;
+        uint num_tiles  = std::max(1u, ceil_div(num_items, tile_items));
+
+        // reduce_device_occupancy × subscription_factor
+        // reduce_device_occupancy = sm_occupancy × sm_count
+        // sm_occupancy = 8 sm_count = 128, subscription_factor = 5
+        constexpr auto max_blocks = PolicyBlockSize * 8 * 5;
+
+        using ReduceShader = details::ReduceModule<Type, PolicyBlockSize, PolicyItemsPerThread, CUDA_WARP_REDUX>;
+        using ReduceKernel           = ReduceShader::ReduceShaderKernel;
+        using ReduceSingleTileShader = ReduceShader::ReduceSingleTileShaderKernel;
+        constexpr auto shader_shared_mem_size = policy_shared_mem_size<PolicyBlockSize, PolicyItemsPerThread>();
+
+        size_t           size_elements     = temp_storage.size() - offset;
+        BufferView<Type> temp_buffer_level = temp_storage.subview(offset, size_elements);
+
+        if(num_tiles > 1)
+        {
+            auto key = get_type_and_op_desc<Type>(reduce_op, transform_op)
+                       + luisa::format("+policy:{}x{}", PolicyBlockSize, PolicyItemsPerThread);
+            auto ms_reduce_it = ms_reduce_map.find(key);
+            if(ms_reduce_it == ms_reduce_map.end())
+            {
+                auto shader = ReduceShader().compile(m_device, shader_shared_mem_size, reduce_op, transform_op);
+                ms_reduce_map.try_emplace(key, std::move(shader));
+                ms_reduce_it = ms_reduce_map.find(key);
+            }
+            auto ms_reduce_ptr = reinterpret_cast<ReduceKernel*>(&(*ms_reduce_it->second));
+
+            GridEvenShared even_share;
+            even_share.DispatchInit(num_items, max_blocks, tile_items);
+            cmdlist << (*ms_reduce_ptr)(arr_in, temp_buffer_level, num_items, even_share)
+                           .dispatch(policy_block_size * num_tiles);
+            uint next_level_offset = static_cast<uint>(aligned_temp_storage_count<Type>(num_tiles));
+            lcpp_check(reduce_array_recursive_impl<USE_CUDA_WARP_REDUX, PolicyBlockSize, PolicyItemsPerThread, Type>(
+                           cmdlist,
+                           temp_buffer_level,
+                           temp_buffer_level,
+                           arr_out,
+                           num_tiles,
+                           next_level_offset,
+                           level + 1,
+                           reduce_op,
+                           init,
+                           IdentityOp()),
+                       cmdlist,
+                       debug_stream());
+        }
+        else
+        {
+            auto key = get_type_and_op_desc<Type>(reduce_op, transform_op)
+                       + luisa::format("+policy:{}x{}", PolicyBlockSize, PolicyItemsPerThread);
+            auto ms_reduce_it = ms_single_reduce_map.find(key);
+            if(ms_reduce_it == ms_single_reduce_map.end())
+            {
+                auto shader = ReduceShader().compile_single_tile(m_device, shader_shared_mem_size, reduce_op, transform_op);
+                ms_single_reduce_map.try_emplace(key, std::move(shader));
+                ms_reduce_it = ms_single_reduce_map.find(key);
+            }
+            auto ms_reduce_ptr = reinterpret_cast<ReduceSingleTileShader*>(&(*ms_reduce_it->second));
+            // non-recursive
+            cmdlist << (*ms_reduce_ptr)(arr_in, arr_out, num_items, init).dispatch(policy_block_size);
+        }
+        return 0;
+    };
+
     template <NumericTOrKeyValuePairT Type, typename ReduceOp, typename TransformOp = IdentityOp>
     [[nodiscard]] int reduce_array_recursive(luisa::compute::CommandList& cmdlist,
                                              BufferView<Type>             temp_storage,
@@ -581,59 +681,33 @@ class DeviceReduce : public LuisaModule
                                              Type                         init,
                                              TransformOp transform_op = IdentityOp()) noexcept
     {
-        uint tile_items = m_block_size * ITEMS_PER_THREAD;
-        uint num_tiles  = std::max(1u, ceil_div(num_items, tile_items));
-
-        // reduce_device_occupancy × subscription_factor
-        // reduce_device_occupancy = sm_occupancy × sm_count
-        // sm_occupancy = 8 sm_count = 128, subscription_factor = 5
-        constexpr auto max_blocks = BLOCK_SIZE * 8 * 5;
-
-        using ReduceShader           = details::ReduceModule<Type, BLOCK_SIZE, ITEMS_PER_THREAD>;
-        using ReduceKernel           = ReduceShader::ReduceShaderKernel;
-        using ReduceSingleTileShader = ReduceShader::ReduceSingleTileShaderKernel;
-
-        size_t           size_elements     = temp_storage.size() - offset;
-        BufferView<Type> temp_buffer_level = temp_storage.subview(offset, size_elements);
-
-        if(num_tiles > 1)
+        // CUB's integer-sum path uses the SM native redux instruction.  Keep
+        // that optimization in a CUDA-only shader variant; other backends
+        // retain the portable shuffle implementation.
+        if constexpr(CUDA_WARP_REDUX)
         {
-            auto key          = get_type_and_op_desc<Type>(reduce_op, transform_op);
-            auto ms_reduce_it = ms_reduce_map.find(key);
-            if(ms_reduce_it == ms_reduce_map.end())
+            return reduce_array_recursive_impl<true, BLOCK_SIZE, ITEMS_PER_THREAD, Type>(
+                cmdlist, temp_storage, arr_in, arr_out, num_items, offset, level, reduce_op, init, transform_op);
+        }
+        else if(m_device.backend_name() == "cuda")
+        {
+            if constexpr(AUTO_CUDA_TUNED_POLICY && NumericT<Type> && sizeof(Type) == sizeof(uint))
             {
-                auto shader = ReduceShader().compile(m_device, m_shared_mem_size, reduce_op, transform_op);
-                ms_reduce_map.try_emplace(key, std::move(shader));
-                ms_reduce_it = ms_reduce_map.find(key);
+                if(num_items >= 2u * 1024u * 1024u &&
+                   BLOCK_SIZE == details::BLOCK_SIZE && ITEMS_PER_THREAD == details::ITEMS_PER_THREAD)
+                {
+                    return reduce_array_recursive_impl<true, details::BLOCK_SIZE, 8u, Type>(
+                        cmdlist, temp_storage, arr_in, arr_out, num_items, offset, level, reduce_op, init, transform_op);
+                }
             }
-            auto ms_reduce_ptr = reinterpret_cast<ReduceKernel*>(&(*ms_reduce_it->second));
-
-            GridEvenShared even_share;
-            even_share.DispatchInit(num_items, max_blocks, tile_items);
-            cmdlist << (*ms_reduce_ptr)(arr_in, temp_buffer_level, num_items, even_share).dispatch(m_block_size * num_tiles);
-            uint next_level_offset = static_cast<uint>(aligned_temp_storage_count<Type>(num_tiles));
-            lcpp_check(reduce_array_recursive<Type>(
-                           cmdlist, temp_buffer_level, temp_buffer_level, arr_out, num_tiles, next_level_offset, level + 1, reduce_op, init, transform_op),
-                       cmdlist,
-                       debug_stream());
+            return reduce_array_recursive_impl<true, BLOCK_SIZE, ITEMS_PER_THREAD, Type>(
+                cmdlist, temp_storage, arr_in, arr_out, num_items, offset, level, reduce_op, init, transform_op);
         }
         else
         {
-            auto key          = get_type_and_op_desc<Type>(reduce_op, IdentityOp());
-            auto ms_reduce_it = ms_single_reduce_map.find(key);
-            if(ms_reduce_it == ms_single_reduce_map.end())
-            {
-                auto shader =
-                    ReduceShader().compile_single_tile(m_device, m_shared_mem_size, reduce_op, IdentityOp());
-                ms_single_reduce_map.try_emplace(key, std::move(shader));
-                ms_reduce_it = ms_single_reduce_map.find(key);
-            }
-            auto ms_reduce_ptr = reinterpret_cast<ReduceSingleTileShader*>(&(*ms_reduce_it->second));
-            // non-recursive
-            cmdlist << (*ms_reduce_ptr)(arr_in, temp_buffer_level, num_items, init).dispatch(m_block_size);
-            cmdlist << arr_out.copy_from(temp_buffer_level);
+            return reduce_array_recursive_impl<false, BLOCK_SIZE, ITEMS_PER_THREAD, Type>(
+                cmdlist, temp_storage, arr_in, arr_out, num_items, offset, level, reduce_op, init, transform_op);
         }
-        return 0;
     };
 
 
