@@ -129,6 +129,7 @@ void print_stats(std::string_view name, const Stats &lcpp, const Stats &cub, siz
                 cub.minimum(),
                 cub.maximum(),
                 lcpp_median / cub_median);
+    std::fflush(stdout);  // keep results visible even if teardown aborts
 }
 
 // ---------------------------------------------------------------------------
