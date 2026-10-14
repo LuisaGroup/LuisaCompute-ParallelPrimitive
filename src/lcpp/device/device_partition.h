@@ -7,6 +7,7 @@
 #include <limits>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/utils.h>
+#include <lcpp/device/details/compact.h>
 #include <lcpp/device/device_scan.h>
 #include <lcpp/runtime/core.h>
 
@@ -19,14 +20,20 @@ class DevicePartition : public LuisaModule
 {
   private:
     using ScanT = DeviceScan<BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
+    using CompactT =
+        details::CompactModule<BLOCK_SIZE == details::BLOCK_SIZE ? 384u : BLOCK_SIZE,
+                               ITEMS_PER_THREAD == details::ITEMS_PER_THREAD ? 15u : ITEMS_PER_THREAD>;
 
     Device _device;
     ScanT  _scan;
+    CompactT _compact;
     bool   _created = false;
 
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _flag_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _predicate_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _scatter_shaders;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _predicate_scatter_shaders;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _flag_scatter_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _three_way_flag_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> _three_way_scatter_shaders;
     luisa::shared_ptr<luisa::compute::Resource> _zero_count_shader;
@@ -41,6 +48,7 @@ class DevicePartition : public LuisaModule
         _device  = device;
         _created = true;
         _scan.create(device);
+        _compact.create(device);
     }
 
     [[nodiscard]] static size_t GetTempStorageBytes(size_t num_items)
@@ -78,10 +86,29 @@ class DevicePartition : public LuisaModule
             return;
         }
 
+        Callable<bool(FlagT)> flag_predicate = [](Var<FlagT> flag) noexcept
+        { return flag != FlagT{}; };
+        if constexpr(sizeof(T) == sizeof(uint) && sizeof(FlagT) == sizeof(uint))
+        {
+            if(_device.backend_name() == "cuda" && input.handle() != output.handle()
+               && details::can_batch_callable(flag_predicate.function()))
+            {
+                _compact.template Flagged<true>(
+                    cmdlist, temp_storage, input, selection_flags, output, num_selected_out, num_items, flag_predicate);
+                return;
+            }
+        }
         auto [flags, positions, scan_temp] = _temp_views(temp_storage, num_items);
-        _dispatch_flags(cmdlist, selection_flags, flags, num_items);
-        _scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
-        _dispatch_scatter(cmdlist, input, output, flags, positions, num_selected_out, num_items);
+        if constexpr(sizeof(FlagT) == sizeof(uint))
+        {
+            _scan.ExclusiveSumTransform(cmdlist, scan_temp, selection_flags, positions, num_items, flag_predicate);
+        }
+        else
+        {
+            _dispatch_flags(cmdlist, selection_flags, flags, num_items);
+            _scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
+        }
+        _dispatch_flag_scatter(cmdlist, input, selection_flags, positions, output, num_selected_out, num_items);
     }
 
     template <NumericT T>
@@ -100,10 +127,26 @@ class DevicePartition : public LuisaModule
             return;
         }
 
+        if constexpr(sizeof(T) == sizeof(uint))
+        {
+            if(_device.backend_name() == "cuda" && input.handle() != output.handle()
+               && details::can_batch_callable(predicate.function()))
+            {
+                _compact.template If<true>(cmdlist, temp_storage, input, output, num_selected_out, num_items, predicate);
+                return;
+            }
+        }
         auto [flags, positions, scan_temp] = _temp_views(temp_storage, num_items);
-        _dispatch_predicate(cmdlist, input, flags, num_items, predicate);
-        _scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
-        _dispatch_scatter(cmdlist, input, output, flags, positions, num_selected_out, num_items);
+        if constexpr(sizeof(T) == sizeof(uint))
+        {
+            _scan.ExclusiveSumTransform(cmdlist, scan_temp, input, positions, num_items, predicate);
+        }
+        else
+        {
+            _dispatch_predicate(cmdlist, input, flags, num_items, predicate);
+            _scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
+        }
+        _dispatch_predicate_scatter(cmdlist, input, predicate, positions, output, num_selected_out, num_items);
     }
 
     template <NumericT T>
@@ -362,6 +405,109 @@ class DevicePartition : public LuisaModule
         }
         auto shader = reinterpret_cast<FlagShader*>(&(*shader_it->second));
         cmdlist << (*shader)(input, flags).dispatch(num_items);
+    }
+
+    template <NumericT T>
+    void _dispatch_predicate_scatter(CommandList&             cmdlist,
+                                     BufferView<T>            input,
+                                     const Callable<bool(T)>& predicate,
+                                     BufferView<uint>         positions,
+                                     BufferView<T>            output,
+                                     BufferView<uint>         num_selected_out,
+                                     size_t                   num_items)
+    {
+        using ScatterShader = Shader<1, Buffer<T>, Buffer<T>, Buffer<uint>, Buffer<uint>, uint>;
+        auto key            = _shader_key<T>("partition_predicate_scatter");
+        key += luisa::format("+{}", predicate.function().hash());
+        auto shader_it = _predicate_scatter_shaders.find(key);
+        if(shader_it == _predicate_scatter_shaders.end())
+        {
+            U<ScatterShader> shader = nullptr;
+            lazy_compile(_device,
+                         shader,
+                         [predicate](BufferVar<T>    input_buffer,
+                                     BufferVar<T>    output_buffer,
+                                     BufferVar<uint> positions_buffer,
+                                     BufferVar<uint> count_output,
+                                     UInt            num_items_var) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt index    = dispatch_id().x;
+                             UInt selected = select(0u, 1u, predicate(input_buffer.read(index)));
+                             UInt selected_before = positions_buffer.read(index);
+                             $if(selected != 0u)
+                             {
+                                 output_buffer.write(selected_before, input_buffer.read(index));
+                             }
+                             $else
+                             {
+                                 UInt unselected_before = index - selected_before;
+                                 output_buffer.write(num_items_var - 1u - unselected_before,
+                                                     input_buffer.read(index));
+                             };
+                             $if(index + 1u == num_items_var)
+                             {
+                                 count_output.write(0u, selected_before + selected);
+                             };
+                         });
+            _predicate_scatter_shaders.try_emplace(key, std::move(shader));
+            shader_it = _predicate_scatter_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<ScatterShader*>(&(*shader_it->second));
+        cmdlist
+            << (*shader)(input, output, positions, num_selected_out, static_cast<uint>(num_items)).dispatch(num_items);
+    }
+
+    template <NumericT T, NumericT FlagT>
+    void _dispatch_flag_scatter(CommandList&      cmdlist,
+                                BufferView<T>     input,
+                                BufferView<FlagT> flags,
+                                BufferView<uint>  positions,
+                                BufferView<T>     output,
+                                BufferView<uint>  num_selected_out,
+                                size_t            num_items)
+    {
+        using ScatterShader =
+            Shader<1, Buffer<T>, Buffer<FlagT>, Buffer<T>, Buffer<uint>, Buffer<uint>, uint>;
+        auto key       = _shader_key<T, FlagT>("partition_flag_scatter");
+        auto shader_it = _flag_scatter_shaders.find(key);
+        if(shader_it == _flag_scatter_shaders.end())
+        {
+            U<ScatterShader> shader = nullptr;
+            lazy_compile(_device,
+                         shader,
+                         [](BufferVar<T>     input_buffer,
+                            BufferVar<FlagT> flags_buffer,
+                            BufferVar<T>     output_buffer,
+                            BufferVar<uint>  positions_buffer,
+                            BufferVar<uint>  count_output,
+                            UInt             num_items_var) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt index    = dispatch_id().x;
+                             UInt selected = select(0u, 1u, flags_buffer.read(index) != FlagT{});
+                             UInt selected_before = positions_buffer.read(index);
+                             $if(selected != 0u)
+                             {
+                                 output_buffer.write(selected_before, input_buffer.read(index));
+                             }
+                             $else
+                             {
+                                 UInt unselected_before = index - selected_before;
+                                 output_buffer.write(num_items_var - 1u - unselected_before,
+                                                     input_buffer.read(index));
+                             };
+                             $if(index + 1u == num_items_var)
+                             {
+                                 count_output.write(0u, selected_before + selected);
+                             };
+                         });
+            _flag_scatter_shaders.try_emplace(key, std::move(shader));
+            shader_it = _flag_scatter_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<ScatterShader*>(&(*shader_it->second));
+        cmdlist << (*shader)(input, flags, output, positions, num_selected_out, static_cast<uint>(num_items))
+                       .dispatch(num_items);
     }
 
     template <NumericT T>

@@ -27,6 +27,8 @@ class DeviceHistogram : public LuisaModule
     luisa::unordered_map<luisa::string, luisa::shared_ptr<Resource>> m_even_shaders;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<Resource>> m_range_shaders;
 
+    static constexpr size_t FAST_EVEN_BINS = 256u;
+
   public:
     DeviceHistogram()  = default;
     ~DeviceHistogram() = default;
@@ -350,6 +352,87 @@ class DeviceHistogram : public LuisaModule
         return cast<uint>(quotient);
     }
 
+    template <size_t BINS, size_t FAST_BLOCK_SIZE, NumericT SampleT, NumericT CounterT, NumericT LevelT>
+    void histogram_even_contiguous(CommandList&         cmdlist,
+                                   BufferView<SampleT>  samples,
+                                   BufferView<CounterT> histogram,
+                                   LevelT               lower_level,
+                                   LevelT               upper_level,
+                                   size_t               num_samples)
+    {
+        // Aggregate samples in shared memory before the global histogram update.
+        using CommonT = std::common_type_t<SampleT, LevelT>;
+        static_assert(std::is_integral_v<CommonT>);
+        using FastEvenShader = Shader<1, Buffer<SampleT>, Buffer<CounterT>, uint, LevelT, LevelT>;
+        auto key             = shader_key<SampleT, CounterT, LevelT>("histogram_even_contiguous");
+        auto shader_it       = m_even_shaders.find(key);
+        if(shader_it == m_even_shaders.end())
+        {
+            U<FastEvenShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [](BufferVar<SampleT>  samples_buffer,
+                            BufferVar<CounterT> histogram_buffer,
+                            UInt                num_samples_var,
+                            Var<LevelT>         lower_level_var,
+                            Var<LevelT>         upper_level_var) noexcept
+                         {
+                             constexpr size_t fast_items_per_thread =
+                                 ITEMS_PER_THREAD == details::ITEMS_PER_THREAD ? 16u : ITEMS_PER_THREAD;
+                             set_block_size(FAST_BLOCK_SIZE);
+                             SmemTypePtr<CounterT> local_histogram = new SmemType<CounterT>{BINS};
+                             UInt                  thread          = thread_id().x;
+                             $for(init_bin, thread, UInt(BINS), UInt(FAST_BLOCK_SIZE))
+                             {
+                                 local_histogram->write(init_bin, CounterT{});
+                             };
+                             sync_block();
+
+                             UInt tile_start = block_id().x * UInt(FAST_BLOCK_SIZE * fast_items_per_thread);
+                             UInt valid_items = min(UInt(FAST_BLOCK_SIZE * fast_items_per_thread),
+                                                    num_samples_var - tile_start);
+                             for(size_t item = 0u; item < fast_items_per_thread; ++item)
+                             {
+                                 UInt local = thread + UInt(item * FAST_BLOCK_SIZE);
+                                 $if(local < valid_items)
+                                 {
+                                     UInt index = tile_start + local;
+                                     Var<CommonT> sample = cast<CommonT>(samples_buffer.read(index));
+                                     Var<CommonT> lower = cast<CommonT>(lower_level_var);
+                                     Var<CommonT> upper = cast<CommonT>(upper_level_var);
+                                     $if(sample >= lower & sample < upper)
+                                     {
+                                         UInt sample_bin = cast<uint>(sample - lower);
+                                         local_histogram->atomic(sample_bin).fetch_add(CounterT{1});
+                                     };
+                                 };
+                             }
+                             sync_block();
+                             $for(flush_bin, thread, UInt(BINS), UInt(FAST_BLOCK_SIZE))
+                             {
+                                 Var<CounterT> count = local_histogram->read(flush_bin);
+                                 $if(count != CounterT{})
+                                 {
+                                     histogram_buffer.atomic(flush_bin).fetch_add(count);
+                                 };
+                             };
+                         });
+            m_even_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_even_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<FastEvenShader*>(&(*shader_it->second));
+        LUISA_ASSERT(shader != nullptr, "Failed to compile contiguous even-histogram shader.");
+        constexpr size_t fast_items_per_thread =
+            ITEMS_PER_THREAD == details::ITEMS_PER_THREAD ? 16u : ITEMS_PER_THREAD;
+        size_t tile_items =
+            checked_multiply(FAST_BLOCK_SIZE, fast_items_per_thread, "Histogram tile size overflows.");
+        size_t blocks = num_samples / tile_items + static_cast<size_t>(num_samples % tile_items != 0u);
+        size_t dispatch_threads =
+            checked_multiply(blocks, FAST_BLOCK_SIZE, "Histogram dispatch size overflows.");
+        cmdlist << (*shader)(samples, histogram, static_cast<uint>(num_samples), lower_level, upper_level)
+                       .dispatch(dispatch_threads);
+    }
+
     template <NumericT SampleT, NumericT CounterT, NumericT LevelT>
     void histogram_even(CommandList&         cmdlist,
                         BufferView<SampleT>  samples,
@@ -378,6 +461,23 @@ class DeviceHistogram : public LuisaModule
         if(logical_samples == 0u)
         {
             return;
+        }
+
+        if constexpr(std::is_integral_v<CommonT>
+                     && (std::is_same_v<CounterT, uint> || std::is_same_v<CounterT, int>))
+        {
+            const CommonT lower = static_cast<CommonT>(lower_level);
+            const CommonT upper = static_cast<CommonT>(upper_level);
+            // Unsigned subtraction is exact even when signed bounds straddle zero.
+            const bool unit_width = static_cast<ulong>(upper) - static_cast<ulong>(lower) == FAST_EVEN_BINS;
+            if(m_device.backend_name() == "cuda" && num_levels == FAST_EVEN_BINS + 1u && sample_stride == 1u
+               && channel == 0u && row_stride_samples == num_row_samples && unit_width)
+            {
+                constexpr size_t fast_block_size = BLOCK_SIZE == details::BLOCK_SIZE ? 512u : BLOCK_SIZE;
+                histogram_even_contiguous<FAST_EVEN_BINS, fast_block_size>(
+                    cmdlist, samples, histogram, lower_level, upper_level, logical_samples);
+                return;
+            }
         }
 
         using EvenShader =

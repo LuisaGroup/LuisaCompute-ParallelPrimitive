@@ -122,6 +122,93 @@ int main(int argc, char* argv[])
         }
     };
 
+    "device_partition_preserves_wide_values_and_boolean_flags"_test = [&]
+    {
+        constexpr uint count = 17u;
+        std::array<luisa::ulong, count> values{};
+        std::array<bool, count> flags{};
+        for(uint i = 0u; i < count; ++i) { values[i] = (luisa::ulong{1} << 40u) + i; flags[i] = i % 3u == 1u; }
+        auto in = device.create_buffer<luisa::ulong>(count);
+        auto flag = device.create_buffer<bool>(count);
+        auto out = device.create_buffer<luisa::ulong>(count);
+        auto selected = device.create_buffer<uint>(1u);
+        auto temp = device.create_buffer<uint>(bytes_to_uint_count(DevicePartition<>::GetTempStorageBytes(count)));
+        Callable<bool(luisa::ulong)> even = [](Var<luisa::ulong> value) noexcept { return value % luisa::ulong{2} == luisa::ulong{0}; };
+        stream << in.copy_from(luisa::span{values}) << flag.copy_from(luisa::span{flags});
+        for(uint mode = 0u; mode < 2u; ++mode)
+        {
+            luisa::vector<luisa::ulong> expected;
+            for(uint i = 0u; i < count; ++i)
+            {
+                if(mode == 0u ? flags[i] : values[i] % 2u == 0u) { expected.emplace_back(values[i]); }
+            }
+            auto expected_count = expected.size();
+            for(uint i = count; i > 0u; --i)
+            {
+                if(!(mode == 0u ? flags[i - 1u] : values[i - 1u] % 2u == 0u)) { expected.emplace_back(values[i - 1u]); }
+            }
+            CommandList commands;
+            if(mode == 0u) { partition.Flagged(commands, temp.view(), in.view(), flag.view(), out.view(), selected.view(), count); }
+            else { partition.If(commands, temp.view(), in.view(), out.view(), selected.view(), count, even); }
+            luisa::vector<luisa::ulong> result(count);
+            uint size = 0u;
+            stream << commands.commit() << out.copy_to(luisa::span{result}) << selected.copy_to(luisa::span{&size, 1u}) << synchronize();
+            expect(size == expected_count);
+            expect(result == expected);
+        }
+    };
+
+    "device_partition_multitile_reverse_rejects_and_empty_tiles"_test = [&]
+    {
+        constexpr uint      count = 230413u;
+        luisa::vector<int>  input(count);
+        luisa::vector<uint> flags(count);
+        for(uint i = 0u; i < count; ++i)
+        {
+            input[i] = static_cast<int>(i);
+        }
+        auto in             = device.create_buffer<int>(count);
+        auto flag           = device.create_buffer<uint>(count);
+        auto out            = device.create_buffer<int>(count);
+        auto selected_count = device.create_buffer<uint>(1u);
+        auto temp =
+            device.create_buffer<uint>(bytes_to_uint_count(DevicePartition<>::GetTempStorageBytes(count)));
+        stream << in.copy_from(luisa::span{input});
+        for(uint pattern = 0u; pattern < 4u; ++pattern)
+        {
+            luisa::vector<int> expected;
+            for(uint i = 0u; i < count; ++i)
+            {
+                flags[i] = pattern == 0u ? 0u :
+                           pattern == 1u ? 1u :
+                           pattern == 2u ? i % 3u :
+                                           uint(i < 11u || i > 200000u);
+                if(flags[i] != 0u)
+                {
+                    expected.emplace_back(input[i]);
+                }
+            }
+            auto expected_count = expected.size();
+            for(uint i = count; i > 0u; --i)
+            {
+                if(flags[i - 1u] == 0u)
+                {
+                    expected.emplace_back(input[i - 1u]);
+                }
+            }
+            CommandList commands;
+            partition.Flagged(
+                commands, temp.view(), in.view(), flag.view(), out.view(), selected_count.view(), count);
+            stream << flag.copy_from(luisa::span{flags}) << commands.commit();
+            luisa::vector<int> result(count);
+            uint               selected = 0u;
+            stream << out.copy_to(luisa::span{result})
+                   << selected_count.copy_to(luisa::span{&selected, 1u}) << synchronize();
+            expect(selected == expected_count);
+            expect(result == expected);
+        }
+    };
+
     "device_partition_three_way_preserves_category_order"_test = [&]
     {
         constexpr uint32_t     item_count = 12u;

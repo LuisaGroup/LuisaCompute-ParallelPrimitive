@@ -2,6 +2,7 @@
 // Covers key and pair merging, duplicate keys, custom ordering, and empty inputs.
 
 #include <lcpp/parallel_primitive.h>
+#include <algorithm>
 
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
@@ -85,6 +86,74 @@ int main(int argc, char* argv[])
         for(size_t index = 0u; index < expected_descending.size(); ++index)
         {
             expect(descending_result[index] == expected_descending[index]);
+        }
+    };
+
+    "device_merge_tiled_boundaries_duplicates_and_skew"_test = [&]
+    {
+        for(size_t count : {2047u, 2048u, 2049u, 70003u})
+        {
+            for(size_t left_count : {size_t{1u}, count / 2u, count - 1u})
+            {
+                for(bool descending : {false, true})
+                {
+                    luisa::vector<int> left(left_count);
+                    luisa::vector<int> right(count - left_count);
+                    for(size_t i = 0u; i < left.size(); ++i)
+                    {
+                        left[i] = static_cast<int>(i / 7u);
+                    }
+                    for(size_t i = 0u; i < right.size(); ++i)
+                    {
+                        right[i] = static_cast<int>(i / 3u);
+                    }
+                    if(descending)
+                    {
+                        std::reverse(left.begin(), left.end());
+                        std::reverse(right.begin(), right.end());
+                    }
+                    luisa::vector<int> expected(count);
+                    std::merge(left.begin(),
+                               left.end(),
+                               right.begin(),
+                               right.end(),
+                               expected.begin(),
+                               [descending](int lhs, int rhs)
+                               { return descending ? lhs > rhs : lhs < rhs; });
+                    auto        in_left  = device.create_buffer<int>(left.size());
+                    auto        in_right = device.create_buffer<int>(right.size());
+                    auto        out      = device.create_buffer<int>(count);
+                    CommandList commands;
+                    if(descending)
+                    {
+                        auto greater = [](const Int& lhs, const Int& rhs) noexcept
+                        { return lhs > rhs; };
+                        merge.MergeKeys(commands,
+                                        BufferView<uint>{},
+                                        in_left.view(),
+                                        left.size(),
+                                        in_right.view(),
+                                        right.size(),
+                                        out.view(),
+                                        greater);
+                    }
+                    else
+                    {
+                        merge.MergeKeys(commands,
+                                        BufferView<uint>{},
+                                        in_left.view(),
+                                        left.size(),
+                                        in_right.view(),
+                                        right.size(),
+                                        out.view());
+                    }
+                    luisa::vector<int> result(count);
+                    stream << in_left.copy_from(luisa::span{left})
+                           << in_right.copy_from(luisa::span{right}) << commands.commit()
+                           << out.copy_to(luisa::span{result}) << synchronize();
+                    expect(result == expected);
+                }
+            }
         }
     };
 

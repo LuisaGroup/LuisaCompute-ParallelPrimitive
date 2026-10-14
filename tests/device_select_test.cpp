@@ -4,6 +4,7 @@
 #include <lcpp/parallel_primitive.h>
 
 #include <array>
+#include <algorithm>
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
 #include <luisa/runtime/stream.h>
@@ -37,6 +38,146 @@ int main(int argc, char* argv[])
 
     DeviceSelect<> selector;
     selector.create(device);
+
+    "deviceselect_preserves_wide_values_and_boolean_flags"_test = [&]
+    {
+        constexpr uint                  count = 17u;
+        std::array<luisa::ulong, count> values{};
+        std::array<bool, count>         flags{};
+        luisa::vector<luisa::ulong>     expected_flagged, expected_if, expected_unique;
+        for(uint i = 0u; i < count; ++i)
+        {
+            values[i] = luisa::ulong{1} << 40u | luisa::ulong(i / 3u);
+            flags[i]  = i % 3u == 1u;
+            if(flags[i])
+            {
+                expected_flagged.emplace_back(values[i]);
+            }
+            if(values[i] % 2u == 0u)
+            {
+                expected_if.emplace_back(values[i]);
+            }
+            if(i % 3u == 0u)
+            {
+                expected_unique.emplace_back(values[i]);
+            }
+        }
+        auto in       = device.create_buffer<luisa::ulong>(count);
+        auto flag     = device.create_buffer<bool>(count);
+        auto out      = device.create_buffer<luisa::ulong>(count);
+        auto selected = device.create_buffer<uint>(1u);
+        auto temp =
+            device.create_buffer<uint>(bytes_to_uint_count(DeviceSelect<>::GetTempStorageBytes(count)));
+        Callable<bool(luisa::ulong)> even = [](Var<luisa::ulong> value) noexcept
+        { return value % luisa::ulong{2} == luisa::ulong{0}; };
+        stream << in.copy_from(luisa::span{values}) << flag.copy_from(luisa::span{flags});
+        for(uint mode = 0u; mode < 3u; ++mode)
+        {
+            CommandList commands;
+            if(mode == 0u)
+            {
+                selector.Flagged(commands, temp.view(), in.view(), flag.view(), out.view(), selected.view(), count);
+            }
+            else if(mode == 1u)
+            {
+                selector.If(commands, temp.view(), in.view(), out.view(), selected.view(), count, even);
+            }
+            else
+            {
+                selector.Unique(commands, temp.view(), in.view(), out.view(), selected.view(), count);
+            }
+            luisa::vector<luisa::ulong> result(count);
+            uint                        size = 0u;
+            stream << commands.commit() << out.copy_to(luisa::span{result})
+                   << selected.copy_to(luisa::span{&size, 1u}) << synchronize();
+            const auto& expected = mode == 0u ? expected_flagged :
+                                   mode == 1u ? expected_if :
+                                                expected_unique;
+            expect(size == expected.size());
+            result.resize(expected.size());
+            expect(result == expected);
+        }
+    };
+
+    "deviceselect_fused_multitile_tails_and_empty_tiles"_test = [&]
+    {
+        for(uint count : {1u, 5759u, 5760u, 5761u, 230413u})
+        {
+            luisa::vector<int>  input(count + 3u);
+            luisa::vector<uint> flags(count);
+            auto                input_buffer  = device.create_buffer<int>(input.size());
+            auto                flag_buffer   = device.create_buffer<uint>(count);
+            auto                output_buffer = device.create_buffer<int>(count + 2u);
+            auto                count_buffer  = device.create_buffer<uint>(2u);
+            auto                bytes         = DeviceSelect<>::GetTempStorageBytes(count);
+            auto scratch = device.create_buffer<uint>(bytes_to_uint_count(bytes) + 64u);
+            auto temp    = scratch.view().subview(64u, bytes_to_uint_count(bytes));
+            luisa::vector<uint> poison(scratch.size(), 99u);
+            for(uint pattern = 0u; pattern < 4u; ++pattern)
+            {
+                luisa::vector<int> expected;
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i + 3u] = static_cast<int>(i);
+                    flags[i]      = pattern == 0u ? 0u :
+                                    pattern == 1u ? 1u :
+                                    pattern == 2u ? i % 3u :
+                                                    uint(i < 11u || i > 200000u);
+                    if(flags[i] != 0u)
+                    {
+                        expected.emplace_back(input[i + 3u]);
+                    }
+                }
+                CommandList commands;
+                selector.Flagged(commands,
+                                 temp,
+                                 input_buffer.view().subview(3u, count),
+                                 flag_buffer.view(),
+                                 output_buffer.view().subview(2u, count),
+                                 count_buffer.view().subview(1u, 1u),
+                                 count);
+                stream << scratch.copy_from(luisa::span{poison})
+                       << input_buffer.copy_from(luisa::span{input})
+                       << flag_buffer.copy_from(luisa::span{flags}) << commands.commit();
+                luisa::vector<int> result(count + 2u);
+                uint               selected = 0u;
+                stream << output_buffer.copy_to(luisa::span{result})
+                       << count_buffer.view().subview(1u, 1u).copy_to(luisa::span{&selected, 1u})
+                       << synchronize();
+                expect(selected == expected.size());
+                expect(std::equal(expected.begin(), expected.end(), result.begin() + 2u));
+            }
+
+            for(uint run_length : {1u, 17u, 18001u, count})
+            {
+                luisa::vector<int> expected;
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i + 3u] = static_cast<int>(i / run_length);
+                    if(i % run_length == 0u)
+                    {
+                        expected.emplace_back(input[i + 3u]);
+                    }
+                }
+                CommandList commands;
+                selector.Unique(commands,
+                                temp,
+                                input_buffer.view().subview(3u, count),
+                                output_buffer.view().subview(2u, count),
+                                count_buffer.view().subview(1u, 1u),
+                                count);
+                stream << scratch.copy_from(luisa::span{poison})
+                       << input_buffer.copy_from(luisa::span{input}) << commands.commit();
+                luisa::vector<int> result(count + 2u);
+                uint               selected = 0u;
+                stream << output_buffer.copy_to(luisa::span{result})
+                       << count_buffer.view().subview(1u, 1u).copy_to(luisa::span{&selected, 1u})
+                       << synchronize();
+                expect(selected == expected.size());
+                expect(std::equal(expected.begin(), expected.end(), result.begin() + 2u));
+            }
+        }
+    };
 
     "deviceselect_flagged_and_if_are_stable"_test = [&]
     {
