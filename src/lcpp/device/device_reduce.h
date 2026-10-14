@@ -453,7 +453,8 @@ class DeviceReduce : public LuisaModule
                      size_t                num_elements)
     {
         using FlagValuePairT = KeyValuePair<int, ValueType>;
-        auto ptr = luisa::allocate_with_allocator<luisa::uint>(0); // retain until the cmdlist commit
+        auto ptr = luisa::allocate_with_allocator<luisa::uint>(1u); // retain until the cmdlist commit
+        *ptr = 0u;                                                  // default num_runs to 0; the empty-input path below returns before any kernel writes it
         cmdlist << g_num_runs_out.copy_from(luisa::span<luisa::uint>({ptr, 1}));
         cmdlist.add_dtor_callback([ptr] {
             luisa::deallocate_with_allocator(ptr);
@@ -761,13 +762,17 @@ class DeviceReduce : public LuisaModule
         // for every wider / order-sensitive element type -- simply the same one
         // the DSL path uses, with no extra instantiation.
         //
-        // Only a plain (identity-transform) reduction may change tile: the
-        // single-tile terminal kernel is compiled with IdentityOp, so a
-        // non-identity transform is only applied while the recursion is
-        // multi-tile (pre-existing lcpp behaviour, documented by
-        // vk_cuda_interop_reduce_test).  Transforming reductions therefore keep
-        // the portable tile so both dispatch paths keep the same recursion
-        // structure -- and the same result.
+        // Only a plain (identity-transform) reduction may change tile.  A
+        // transforming reduction applies the transform exactly once per element,
+        // at the level that reads the real input (the leaf) -- whether that leaf
+        // is a single tile or multi-tile -- and the recursion then continues with
+        // IdentityOp so already-transformed partial aggregates are never
+        // re-transformed.  Because changing the tile re-groups the leaf loads and
+        // hence the recursion structure of a transforming reduction, those keep
+        // the portable tile so both dispatch paths keep the same structure, the
+        // transform is applied exactly once per element, and the result matches
+        // CUB's transform_reduce on every size (device_reduce_test:
+        // transform_reduce_applies_transform_once_at_every_size).
         constexpr bool   kInteropWide  = reduce_interop_wide_tile_v<Type> &&
                                          std::is_same_v<TransformOp, IdentityOp>;
         constexpr size_t kInteropItems = kInteropWide ? REDUCE_INTEROP_ITEMS_PER_THREAD
@@ -853,7 +858,7 @@ class DeviceReduce : public LuisaModule
                 }
                 else
                 {
-                    auto key = get_type_and_op_desc<Type>(reduce_op, IdentityOp());
+                    auto key = get_type_and_op_desc<Type>(reduce_op, transform_op);
                     auto it  = ms_single_reduce_interop_map.find(key);
                     if(it == ms_single_reduce_interop_map.end())
                     {
@@ -862,7 +867,7 @@ class DeviceReduce : public LuisaModule
                             ms_single_reduce_interop_map,
                             key,
                             InteropReduceShader().compile_single_tile(
-                                m_interop->cuda_device(), m_interop_shared_mem_size, reduce_op, IdentityOp()));
+                                m_interop->cuda_device(), m_interop_shared_mem_size, reduce_op, transform_op));
                     }
                     if(it != ms_single_reduce_interop_map.end())
                     {
@@ -915,12 +920,12 @@ class DeviceReduce : public LuisaModule
             }
             else
             {
-                auto key          = get_type_and_op_desc<Type>(reduce_op, IdentityOp());
+                auto key          = get_type_and_op_desc<Type>(reduce_op, transform_op);
                 auto ms_reduce_it = ms_single_reduce_map.find(key);
                 if(ms_reduce_it == ms_single_reduce_map.end())
                 {
                     auto shader =
-                        ReduceShader().compile_single_tile(m_device, m_shared_mem_size, reduce_op, IdentityOp());
+                        ReduceShader().compile_single_tile(m_device, m_shared_mem_size, reduce_op, transform_op);
                     ms_single_reduce_map.try_emplace(key, std::move(shader));
                     ms_reduce_it = ms_single_reduce_map.find(key);
                 }
@@ -939,7 +944,7 @@ class DeviceReduce : public LuisaModule
         {
             lcpp_check(
                 reduce_array_recursive<Type>(
-                    cmdlist, temp_buffer_level, temp_buffer_level, arr_out, num_tiles, num_tiles, level + 1, reduce_op, init, transform_op),
+                    cmdlist, temp_buffer_level, temp_buffer_level, arr_out, num_tiles, num_tiles, level + 1, reduce_op, init, IdentityOp()),
                 cmdlist, debug_stream());
         }
         return 0;
