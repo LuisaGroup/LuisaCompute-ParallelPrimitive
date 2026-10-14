@@ -22,16 +22,19 @@
 
 #pragma once
 
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <typeinfo>
-#include <utility>
+  #include <array>
+  #include <cstddef>
+  #include <cstdint>
+  #include <cstdio>
+  #include <functional>
+  #include <typeinfo>
+  #include <utility>
 
-#include <luisa/ast/type.h>
-#include <luisa/core/stl/unordered_map.h>
-#include <luisa/dsl/resource.h>
+  #include <luisa/ast/type.h>
+  #include <luisa/core/stl/format.h>
+  #include <luisa/core/stl/string.h>
+  #include <luisa/core/stl/unordered_map.h>
+  #include <luisa/dsl/resource.h>
 
 namespace luisa::parallel_primitive::detail
 {
@@ -127,4 +130,38 @@ namespace luisa::parallel_primitive::detail
                              luisa::shared_ptr<luisa::compute::Resource>,
                              ShaderCacheKeyHash>;
 
+    /// Stable string form of a key, for the few call sites (inherited from the
+    /// string-keyed design) that embed the key in a larger luisa::format key.
+    [[nodiscard]] inline luisa::string to_string(const ShaderCacheKey& k)
+    {
+        auto out = luisa::string{"ShaderCacheKey("};
+        for(int i = 0; i < k.count; ++i)
+        {
+            if(i != 0) { out += ','; }
+            char buf[2 + 2 * sizeof(void*)];
+            std::snprintf(buf, sizeof(buf), "%p", k.ptrs[i]);
+            out += buf;
+        }
+        out += ')';
+        return out;
+    }
+
 }  // namespace luisa::parallel_primitive::detail
+
+// fmt support so luisa::format can embed a ShaderCacheKey directly; keeps the
+// remote string-keyed call sites compiling against the local pointer-key type.
+template <>
+struct fmt::formatter<luisa::parallel_primitive::detail::ShaderCacheKey>
+{
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+    template <typename FormatContext>
+    auto format(const luisa::parallel_primitive::detail::ShaderCacheKey& k,
+                FormatContext& ctx) const
+    {
+        auto out = ctx.out();
+        auto s   = luisa::parallel_primitive::detail::to_string(k);
+        for(char c : s) { *out++ = c; }
+        return out;
+    }
+};
