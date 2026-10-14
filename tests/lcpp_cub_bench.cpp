@@ -200,16 +200,26 @@ struct CudaStreamTimer final : LcppTimer {
 };
 
 // Non-CUDA backends (dx/vk/...): wall-clock timing around enqueue + synchronize.
+// A full stream synchronize() on these backends costs ~100+ us, which would
+// drown the GPU time of small ops, so we amortize: `batch` enqueues are
+// submitted back-to-back and bracketed by a single synchronize pair, and the
+// elapsed wall time is divided by the batch (per-op average throughput,
+// comparable to how the CUB side is timed with GPU events on its own stream).
+// Epoch-0/1 numbers used batch=1 (LCPP_BENCH_BATCH=1 reproduces them).
 struct HostSyncTimer final : LcppTimer {
     Stream *stream;
+    int batch = [] {
+        const char *env = std::getenv("LCPP_BENCH_BATCH");
+        return env ? std::max(1, std::atoi(env)) : 10;
+    }();
     explicit HostSyncTimer(Stream &s) : stream(&s) {}
     float measure(const char *, const std::function<void()> &enqueue) override {
         stream->synchronize();
         const auto t0 = std::chrono::steady_clock::now();
-        enqueue();
+        for (int i = 0; i < batch; ++i) { enqueue(); }
         stream->synchronize();
         const auto t1 = std::chrono::steady_clock::now();
-        return std::chrono::duration<float, std::milli>(t1 - t0).count();
+        return std::chrono::duration<float, std::milli>(t1 - t0).count() / static_cast<float>(batch);
     }
 };
 
