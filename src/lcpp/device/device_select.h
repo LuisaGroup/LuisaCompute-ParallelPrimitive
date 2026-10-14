@@ -5,6 +5,7 @@
 #pragma once
 
 #include <limits>
+#include <type_traits>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/utils.h>
 #include <lcpp/device/details/compact.h>
@@ -131,10 +132,11 @@ class DeviceSelect : public LuisaModule
             return;
         }
 
+        const bool can_batch_predicate = details::can_batch_callable(predicate.function());
         if constexpr(sizeof(T) == sizeof(uint))
         {
             if(m_device.backend_name() == "cuda" && input.handle() != output.handle()
-               && details::can_batch_callable(predicate.function()))
+               && can_batch_predicate)
             {
                 m_compact.If(cmdlist, temp_storage, input, output, num_selected_out, num_items, predicate);
                 return;
@@ -143,14 +145,16 @@ class DeviceSelect : public LuisaModule
         auto [flags, positions, scan_temp] = temp_views(temp_storage, num_items);
         if constexpr(sizeof(T) == sizeof(uint))
         {
-            m_scan.ExclusiveSumTransform(cmdlist, scan_temp, input, positions, num_items, predicate);
+            if(can_batch_predicate)
+            {
+                m_scan.ExclusiveSumTransform(cmdlist, scan_temp, input, positions, num_items, predicate);
+                dispatch_predicate_scatter(cmdlist, input, predicate, positions, output, num_selected_out, num_items);
+                return;
+            }
         }
-        else
-        {
-            dispatch_predicate(cmdlist, input, flags, num_items, predicate);
-            m_scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
-        }
-        dispatch_predicate_scatter(cmdlist, input, predicate, positions, output, num_selected_out, num_items);
+        dispatch_predicate(cmdlist, input, flags, num_items, predicate);
+        m_scan.ExclusiveSum(cmdlist, scan_temp, flags, positions, num_items);
+        dispatch_scatter(cmdlist, input, output, flags, positions, num_selected_out, num_items);
     }
 
     template <NumericT T>
@@ -425,6 +429,19 @@ class DeviceSelect : public LuisaModule
         using PredicateShader = Shader<1, Buffer<T>, Buffer<uint>>;
         auto key              = shader_key<T>("select_predicate");
         key += luisa::format("+{}", predicate.function().hash());
+        // Structural function hashes do not include captured resource bindings.
+        for(const auto& binding : predicate.function().bound_arguments())
+        {
+            luisa::visit(
+                [&key](const auto& resource)
+                {
+                    if constexpr(!std::is_same_v<std::remove_cvref_t<decltype(resource)>, luisa::monostate>)
+                    {
+                        key += luisa::format("+{}", resource.hash());
+                    }
+                },
+                binding);
+        }
         auto shader_it = m_predicate_shaders.find(key);
         if(shader_it == m_predicate_shaders.end())
         {

@@ -3,6 +3,7 @@
 
 #include <lcpp/parallel_primitive.h>
 
+#include <algorithm>
 #include <array>
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
@@ -37,6 +38,86 @@ int main(int argc, char* argv[])
 
     DevicePartition<> partition;
     partition.create(device);
+
+    "device_partition_if_preserves_pointwise_predicates"_test = [&]
+    {
+        auto check_predicates = [&]<typename T>(T)
+        {
+            for(uint count : {1u, 33u, 4099u})
+            {
+                luisa::vector<T> input(count);
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i] = static_cast<T>(i);
+                }
+                auto in       = device.create_buffer<T>(count);
+                auto out      = device.create_buffer<T>(count);
+                auto selected = device.create_buffer<uint>(1u);
+                auto calls    = device.create_buffer<uint>(count);
+                auto temp = device.create_buffer<uint>(
+                    bytes_to_uint_count(DevicePartition<>::GetTempStorageBytes(count)));
+                Callable<bool(T)> indexed = [count](Var<T> value) noexcept
+                {
+                    return (cast<uint>(value) == dispatch_id().x)
+                           & (dispatch_size().x == count) & (dispatch_id().x % 3u == 0u);
+                };
+                Callable<bool(T)> collective = [](Var<T> value) noexcept
+                { return warp_prefix_sum(cast<uint>(value)) % 7u == 0u; };
+                Callable<bool(T)> atomic = [&calls](Var<T> value) noexcept
+                {
+                    UInt index    = cast<uint>(value);
+                    UInt previous = calls->atomic(index).fetch_add(1u);
+                    return (previous == 0u) & (index % 3u == 1u);
+                };
+                stream << in.copy_from(luisa::span{input});
+                for(uint mode = 0u; mode < 3u; ++mode)
+                {
+                    luisa::vector<T> expected;
+                    luisa::vector<uint> flags(count);
+                    for(uint i = 0u; i < count; ++i)
+                    {
+                        uint lane = i % 32u;
+                        uint prefix = lane * (i - lane)
+                                      + (lane == 0u ? 0u : lane * (lane - 1u) / 2u);
+                        flags[i] = mode == 1u ? prefix % 7u == 0u :
+                                               i % 3u == (mode == 0u ? 0u : 1u);
+                        if(flags[i] != 0u)
+                        {
+                            expected.emplace_back(input[i]);
+                        }
+                    }
+                    auto expected_count = expected.size();
+                    for(uint i = count; i > 0u; --i)
+                    {
+                        if(flags[i - 1u] == 0u)
+                        {
+                            expected.emplace_back(input[i - 1u]);
+                        }
+                    }
+                    const auto& predicate = mode == 0u ? indexed : mode == 1u ? collective : atomic;
+                    CommandList commands;
+                    partition.If(commands, temp.view(), in.view(), out.view(), selected.view(), count, predicate);
+                    luisa::vector<T> result(count, static_cast<T>(-1));
+                    luisa::vector<uint> call_counts(count, 0u);
+                    uint size = 99u;
+                    stream << out.copy_from(luisa::span{result})
+                           << calls.copy_from(luisa::span{call_counts}) << commands.commit()
+                           << out.copy_to(luisa::span{result})
+                           << selected.copy_to(luisa::span{&size, 1u})
+                           << calls.copy_to(luisa::span{call_counts}) << synchronize();
+                    expect(size == expected_count);
+                    expect(result == expected);
+                    if(mode == 2u)
+                    {
+                        expect(std::all_of(call_counts.begin(), call_counts.end(),
+                                           [](uint calls) { return calls == 1u; }));
+                    }
+                }
+            }
+        };
+        check_predicates(int{});
+        check_predicates(luisa::ulong{});
+    };
 
     "device_partition_flagged_and_if_ordering"_test = [&]
     {

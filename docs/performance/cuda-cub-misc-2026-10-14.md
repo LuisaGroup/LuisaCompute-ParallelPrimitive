@@ -123,3 +123,15 @@ The new cases cover partial tiles, more than 32 tiles, empty/all-selected tiles,
 Compute Sanitizer memcheck passed Select, RLE, and Merge with zero errors. Select also passed synccheck with zero errors. Logs are /tmp/device_select_test_delivery_memcheck.log, /tmp/device_run_length_encode_test_delivery_memcheck.log, /tmp/device_merge_test_delivery_memcheck.log, and /tmp/device_select_test_delivery_synccheck.log.
 
 git diff --check passed. A full repository build/test, other-backend validation, and an application end-to-end benchmark were not run.
+
+## PR #5 review follow-up
+
+The Select.If and two-way Partition.If fallbacks now materialize pointwise flags when the predicate cannot be batched. Scan and scatter consume those same flags instead of invoking the predicate in different execution contexts. The wide-input fallback also reuses flags, so side effects run once per item. Eligible pure 32-bit predicates retain the fused CUDA path.
+
+The predicate-flag shader caches in these two modules include captured resource bindings in their keys. LuisaCompute's structural function hash excludes binding payloads; using it alone could reuse a shader bound to a previously released buffer when an otherwise identical atomic predicate captured a new buffer.
+
+Two new regression tests cover dispatch_id/dispatch_size, warp prefix sums, and stateful atomic predicates for both 32-bit and 64-bit inputs at 1, 33, and 4,099 items. They check selected counts, complete stable selection or selected-first/reverse-rejected partition output, and one atomic invocation per item. Captured buffers change across input sizes. The unchanged tests failed on the original implementation with count/output/call-count assertions and an invalid-memory-access abort. After the fixes, Select passed 209 assertions in 7 tests and Partition passed 96 assertions in 6 tests, totaling 305 assertions. The initial eight-target results above describe the pre-review performance commit; this follow-up rebuilt and reran these two affected targets.
+
+Compute Sanitizer memcheck and synccheck both passed both targets with zero errors. Before/after logs are /tmp/lcpp_pr5_select_before.log, /tmp/lcpp_pr5_partition_before.log, /tmp/lcpp_pr5_select_after.log, and /tmp/lcpp_pr5_partition_after.log. Sanitizer logs are /tmp/lcpp_pr5_select_memcheck.log, /tmp/lcpp_pr5_partition_memcheck.log, /tmp/lcpp_pr5_select_synccheck.log, and /tmp/lcpp_pr5_partition_synccheck.log.
+
+The benchmark was rebuilt after the fixes. One additional unprofiled 4M, 60-sample process passed all 13 CPU/LCPP/CUB case validations. Select.If measured 0.9690x CUB and Partition.Flagged measured 1.0780x; both retain two kernel nodes. This replay is a smoke check, not a replacement for the five-process tables above. Its log is /tmp/lcpp_pr5_benchmark_after_4m.log. Full repository build/test, other backends, and end-to-end application performance were not rerun for this follow-up.
