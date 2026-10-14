@@ -49,10 +49,13 @@ with scan and radix ~2.4x / ~1.8x faster than at epoch 0.**
 - Full `xmake build` (all targets) OK.
 
 ## What remains (documented, out of scope)
-- **vk radix sort (5.9x CUB)**: per-phase breakdown shows the one-sweep kernel
-  itself is ~90% of the time; its volatile lookback spin-polling and MatchAny
-  rank are expensive on the XIR→SPIR-V path — a backend codegen characteristic,
-  not a policy knob (epoch-3 doc).
+- **vk radix sort on the XIR→SPIR-V path (5.9x CUB)**: per-phase breakdown shows
+  the one-sweep kernel itself is ~90% of the time; its volatile lookback
+  spin-polling and MatchAny rank are expensive on that codegen route — a backend
+  characteristic, not a policy knob (epoch-3 doc). **Update (epoch 5):** with
+  `lc_vk_backend_use_xir_spirv=false` (legacy HLSL/DXC path) the same kernel runs
+  3.5x faster (0.71 ms, 1.68x CUB), so the gap is specific to the XIR→SPIR-V
+  codegen, not the algorithm. Both vk routes now pass the full suite.
 - dx/vk residual ratios for scan/radix partly reflect cross-backend comparison
   (CUB runs natively on CUDA on the same GPU) plus dx/vk dispatch overhead.
 - `LCPP_BENCH_GRAPH=1` (CUDA graph capture) exists for submit-overhead-free
