@@ -94,7 +94,9 @@ class DeviceRadixSort : public LuisaModule
     {
         const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
         const uint RADIX_DIGITS = 1 << RADIX_BITS;
-        const uint ONESWEEP_TILE_ITEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
+        // Effective tile: scaled down for >4-byte keys (see radix_effective_items_v).
+        const uint ONESWEEP_TILE_ITEMS =
+            static_cast<uint>(radix_effective_items_v<ITEMS_PER_THREAD, KeyType> * BLOCK_SIZE);
         const auto PORTION_SIZE = ((1u << 28u) - 1u) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
 
         auto num_passes     = ceil_div((uint)(sizeof(KeyType) * 8), RADIX_BITS);
@@ -205,7 +207,9 @@ class DeviceRadixSort : public LuisaModule
     {
         const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
         const uint RADIX_DIGITS = 1 << RADIX_BITS;
-        const uint ONESWEEP_ITMES_PER_THREADS = ITEMS_PER_THREAD;
+        // Effective tile: scaled down for >4-byte keys (see radix_effective_items_v).
+        const uint ONESWEEP_ITMES_PER_THREADS =
+            static_cast<uint>(radix_effective_items_v<ITEMS_PER_THREAD, KeyType>);
         const uint ONESWEEP_BLOCK_THREADS     = m_block_size;
         const uint ONESWEEP_TILE_ITEMS        = ONESWEEP_ITMES_PER_THREADS * ONESWEEP_BLOCK_THREADS;
 
@@ -272,7 +276,8 @@ class DeviceRadixSort : public LuisaModule
 
         // radix sort histogram
         using RadixSortHistogram =
-            details::RadixSortHistogramModule<KeyType, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
+            details::RadixSortHistogramModule<KeyType, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS,
+                                          radix_effective_items_v<ITEMS_PER_THREAD, KeyType>>;
         using RadixSortHistogramKernel  = RadixSortHistogram::RadixSortHistogramKernel;
         auto ms_radix_sort_histogram_it = ms_radix_sort_histogram_map.find(radix_sort_key);
         if(ms_radix_sort_histogram_it == ms_radix_sort_histogram_map.end())

@@ -150,6 +150,38 @@ int main(int argc, char* argv[])
         }
     };
 
+    "radix sort key ulong default policy (dx-safe shared footprint)"_test = [&]
+    {
+        // DeviceRadixSort<> defaults to ITEMS_PER_THREAD=16 (epoch-3 tuning);
+        // radix_effective_items_v must scale it down for 8-byte keys so the
+        // block shared usage stays under the 32 KiB HLSL/DX codegen floor.
+        using DefaultRadixSorterT = DeviceRadixSort<>;
+        DefaultRadixSorterT device_radix_sort;
+        device_radix_sort.create(device, &stream);
+        const uint          num_items  = 65536;
+        Buffer<ulong>       d_keys_in  = device.create_buffer<ulong>(num_items);
+        Buffer<ulong>       d_keys_out = device.create_buffer<ulong>(num_items);
+        luisa::vector<ulong> host_keys(num_items);
+        for(uint i = 0; i < num_items; ++i)
+        {
+            host_keys[i] = static_cast<ulong>((num_items - i - 1) * 2654435761ull);
+        }
+        stream << d_keys_in.copy_from(host_keys.data()) << synchronize();
+
+        size_t temp_bytes  = DefaultRadixSorterT::GetSortKeysTempStorageBytes<ulong>(num_items);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+
+        CommandList cmdlist;
+        device_radix_sort.SortKeys(cmdlist, temp_buffer.view(), d_keys_in.view(), d_keys_out.view(), num_items);
+        stream << cmdlist.commit() << synchronize();
+        luisa::vector<ulong> host_keys_out(num_items);
+        stream << d_keys_out.copy_to(host_keys_out.data()) << synchronize();
+
+        std::sort(host_keys.begin(), host_keys.end());
+        bool pass = std::equal(host_keys_out.begin(), host_keys_out.end(), host_keys.begin());
+        expect(pass) << "Radix sort ulong key ascending failed";
+    };
+
     "radix sort pair(uint-float)"_test = [&]
     {
         constexpr int32_t array_size = 524288;
