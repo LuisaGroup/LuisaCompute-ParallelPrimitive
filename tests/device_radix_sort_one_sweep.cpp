@@ -18,7 +18,8 @@
 using namespace luisa;
 using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
-using namespace boost::ut;
+using boost::ut::expect;
+using boost::ut::operator""_test;
 
 
 int main(int argc, char* argv[])
@@ -92,7 +93,7 @@ int main(int argc, char* argv[])
             }
 
             auto input_key_buffer = device.create_buffer<radix_sort_type>(array_size);
-            stream << input_key_buffer.copy_from(input_key.data()) << synchronize();
+            stream << input_key_buffer.copy_from(luisa::span{input_key}) << synchronize();
 
             auto output_key_buffer = device.create_buffer<radix_sort_type>(array_size);
 
@@ -105,11 +106,11 @@ int main(int argc, char* argv[])
             stream << cmdlist.commit() << synchronize();
 
             luisa::vector<radix_sort_type> result(array_size);
-            stream << output_key_buffer.copy_to(result.data()) << synchronize();
+            stream << output_key_buffer.copy_to(luisa::span{result}) << synchronize();
 
             // desc
             auto input_to_desc_key_buffer = device.create_buffer<radix_sort_type>(array_size);
-            stream << input_to_desc_key_buffer.copy_from(input_to_desc_key.data()) << synchronize();
+            stream << input_to_desc_key_buffer.copy_from(luisa::span{input_to_desc_key}) << synchronize();
 
             auto out_desc_key_buffer = device.create_buffer<radix_sort_type>(array_size);
 
@@ -122,7 +123,7 @@ int main(int argc, char* argv[])
             stream << cmdlist.commit() << synchronize();
 
             luisa::vector<radix_sort_type> desc_result(array_size);
-            stream << out_desc_key_buffer.copy_to(desc_result.data()) << synchronize();
+            stream << out_desc_key_buffer.copy_to(luisa::span{desc_result}) << synchronize();
 
             std::sort(input_key.begin(), input_key.end());
             std::sort(input_to_desc_key.begin(), input_to_desc_key.end(), std::greater<radix_sort_type>());
@@ -153,7 +154,7 @@ int main(int argc, char* argv[])
             {
                 host_keys[i] = num_items - i - 1;
             }
-            stream << d_keys_in.copy_from(host_keys.data()) << synchronize();
+            stream << d_keys_in.copy_from(luisa::span{host_keys}) << synchronize();
 
             // CUB-style: get temp storage size
             size_t temp_bytes = DefaultRadixSorterT::GetSortKeysTempStorageBytes<uint>(num_items);
@@ -163,7 +164,7 @@ int main(int argc, char* argv[])
             device_radix_sort.SortKeys(cmdlist, temp_buffer.view(), d_keys_in.view(), d_keys_out.view(), num_items);
             stream << cmdlist.commit() << synchronize();
             luisa::vector<uint> host_keys_out(num_items);
-            stream << d_keys_out.copy_to(host_keys_out.data()) << synchronize();
+            stream << d_keys_out.copy_to(luisa::span{host_keys_out}) << synchronize();
 
             std::sort(host_keys.begin(), host_keys.end());
             bool pass = std::equal(host_keys_out.begin(), host_keys_out.end(), host_keys.begin());
@@ -237,10 +238,10 @@ int main(int argc, char* argv[])
 
 
         auto key_buffer = device.create_buffer<radix_key_type>(array_size);
-        stream << key_buffer.copy_from(input_key.data()) << synchronize();
+        stream << key_buffer.copy_from(luisa::span{input_key}) << synchronize();
 
         auto value_buffer = device.create_buffer<radix_value_type>(array_size);
-        stream << value_buffer.copy_from(input_value.data()) << synchronize();
+        stream << value_buffer.copy_from(luisa::span{input_value}) << synchronize();
 
         auto key_out_buffer   = device.create_buffer<radix_key_type>(array_size);
         auto value_out_buffer = device.create_buffer<radix_value_type>(array_size);
@@ -260,17 +261,17 @@ int main(int argc, char* argv[])
 
         // sec
         luisa::vector<radix_key_type> result(array_size);
-        stream << key_out_buffer.copy_to(result.data()) << synchronize();
+        stream << key_out_buffer.copy_to(luisa::span{result}) << synchronize();
         luisa::vector<radix_value_type> value_result(array_size);
-        stream << value_out_buffer.copy_to(value_result.data()) << synchronize();
+        stream << value_out_buffer.copy_to(luisa::span{value_result}) << synchronize();
 
         auto dec_key_in_buffer = device.create_buffer<radix_key_type>(array_size);
-        stream << dec_key_in_buffer.copy_from(input_dec_key.data()) << synchronize();
+        stream << dec_key_in_buffer.copy_from(luisa::span{input_dec_key}) << synchronize();
         auto dec_key_out_buffer = device.create_buffer<radix_key_type>(array_size);
 
         // desc
         auto dec_value_buffer = device.create_buffer<radix_value_type>(array_size);
-        stream << dec_value_buffer.copy_from(input_dec_value.data()) << synchronize();
+        stream << dec_value_buffer.copy_from(luisa::span{input_dec_value}) << synchronize();
         auto dec_value_out_buffer = device.create_buffer<radix_value_type>(array_size);
 
         // Reuse temp buffer (same type/size)
@@ -284,9 +285,9 @@ int main(int argc, char* argv[])
         stream << cmdlist.commit() << synchronize();
 
         luisa::vector<radix_key_type> desc_result(array_size);
-        stream << dec_key_out_buffer.copy_to(desc_result.data()) << synchronize();
+        stream << dec_key_out_buffer.copy_to(luisa::span{desc_result}) << synchronize();
         luisa::vector<radix_value_type> desc_value_result(array_size);
-        stream << dec_value_out_buffer.copy_to(desc_value_result.data()) << synchronize();
+        stream << dec_value_out_buffer.copy_to(luisa::span{desc_value_result}) << synchronize();
 
         // expect
         std::sort(key_value_pairs.begin(),

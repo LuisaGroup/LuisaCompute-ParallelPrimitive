@@ -1,0 +1,328 @@
+/*
+ * @Author: Ligo
+ * @Date: 2026-08-30
+ */
+#pragma once
+
+#include <cstddef>
+#include <limits>
+#include <lcpp/common/type_trait.h>
+#include <lcpp/common/utils.h>
+#include <lcpp/device/details/scan.h>
+#include <lcpp/runtime/core.h>
+
+namespace luisa::parallel_primitive
+{
+using namespace luisa::compute;
+
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE>
+class DeviceAdjacentDifference : public LuisaModule
+{
+  private:
+    Device m_device;
+    bool   m_created = false;
+
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_difference_shaders;
+
+  public:
+    DeviceAdjacentDifference()  = default;
+    ~DeviceAdjacentDifference() = default;
+
+    void create(Device& device)
+    {
+        m_device  = device;
+        m_created = true;
+    }
+
+    template <NumericT T>
+    [[nodiscard]] static size_t GetTempStorageBytes(size_t num_items)
+    {
+        LUISA_ASSERT(num_items <= std::numeric_limits<size_t>::max() / sizeof(T),
+                     "DeviceAdjacentDifference temporary storage size overflow.");
+        return num_items * sizeof(T);
+    }
+
+    template <NumericT T>
+    [[nodiscard]] static constexpr size_t GetCopyTempStorageBytes(size_t) noexcept
+    {
+        return 0u;
+    }
+
+    template <NumericT T>
+    void SubtractLeftCopy(CommandList&     cmdlist,
+                          BufferView<uint> temp_storage,
+                          BufferView<T>    input,
+                          BufferView<T>    output,
+                          size_t           num_items)
+    {
+        Callable<T(T, T)> difference = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs - rhs; };
+        SubtractLeftCopy(cmdlist, temp_storage, input, output, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractLeftCopy(CommandList&             cmdlist,
+                          BufferView<uint>         temp_storage,
+                          BufferView<T>            input,
+                          BufferView<T>            output,
+                          size_t                   num_items,
+                          const Callable<T(T, T)>& difference)
+    {
+        static_cast<void>(temp_storage);
+        validate_copy_views(input, output, num_items);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        dispatch_difference<true>(cmdlist, input, output, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractRightCopy(CommandList&     cmdlist,
+                           BufferView<uint> temp_storage,
+                           BufferView<T>    input,
+                           BufferView<T>    output,
+                           size_t           num_items)
+    {
+        Callable<T(T, T)> difference = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs - rhs; };
+        SubtractRightCopy(cmdlist, temp_storage, input, output, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractRightCopy(CommandList&             cmdlist,
+                           BufferView<uint>         temp_storage,
+                           BufferView<T>            input,
+                           BufferView<T>            output,
+                           size_t                   num_items,
+                           const Callable<T(T, T)>& difference)
+    {
+        static_cast<void>(temp_storage);
+        validate_copy_views(input, output, num_items);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        dispatch_difference<false>(cmdlist, input, output, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractLeft(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<T> data, size_t num_items)
+    {
+        Callable<T(T, T)> difference = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs - rhs; };
+        SubtractLeft(cmdlist, temp_storage, data, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractLeft(CommandList&             cmdlist,
+                      BufferView<uint>         temp_storage,
+                      BufferView<T>            data,
+                      size_t                   num_items,
+                      const Callable<T(T, T)>& difference)
+    {
+        dispatch_in_place<true>(cmdlist, temp_storage, data, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractRight(CommandList& cmdlist, BufferView<uint> temp_storage, BufferView<T> data, size_t num_items)
+    {
+        Callable<T(T, T)> difference = [](Var<T> lhs, Var<T> rhs) noexcept { return lhs - rhs; };
+        SubtractRight(cmdlist, temp_storage, data, num_items, difference);
+    }
+
+    template <NumericT T>
+    void SubtractRight(CommandList&             cmdlist,
+                       BufferView<uint>         temp_storage,
+                       BufferView<T>            data,
+                       size_t                   num_items,
+                       const Callable<T(T, T)>& difference)
+    {
+        dispatch_in_place<false>(cmdlist, temp_storage, data, num_items, difference);
+    }
+
+  private:
+    template <NumericT T>
+    void validate_copy_views(BufferView<T> input, BufferView<T> output, size_t num_items) const
+    {
+        LUISA_ASSERT(m_created, "DeviceAdjacentDifference::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(), "Too many items for DeviceAdjacentDifference.");
+        if(num_items == 0u)
+        {
+            return;
+        }
+        LUISA_ASSERT(input.size() >= num_items, "DeviceAdjacentDifference input view is too small.");
+        LUISA_ASSERT(output.size() >= num_items, "DeviceAdjacentDifference output view is too small.");
+    }
+
+    template <bool READ_LEFT, NumericT T>
+    void dispatch_in_place(CommandList&             cmdlist,
+                           BufferView<uint>         temp_storage,
+                           BufferView<T>            data,
+                           size_t                   num_items,
+                           const Callable<T(T, T)>& difference)
+    {
+        validate_copy_views(data, data, num_items);
+        if(num_items == 0u)
+        {
+            return;
+        }
+        auto temp_uint_count = bytes_to_uint_count(GetTempStorageBytes<T>(num_items));
+        LUISA_ASSERT(temp_storage.size() >= temp_uint_count,
+                     "DeviceAdjacentDifference temporary storage is too small.");
+        auto scratch = temp_storage.subview(0u, temp_uint_count).template as<T>().subview(0u, num_items);
+        dispatch_difference<READ_LEFT>(cmdlist, data, scratch, num_items, difference);
+        cmdlist << data.subview(0u, num_items).copy_from(scratch);
+    }
+
+    template <bool READ_LEFT, NumericT T>
+    void dispatch_difference(CommandList&             cmdlist,
+                             BufferView<T>            input,
+                             BufferView<T>            output,
+                             size_t                   num_items,
+                             const Callable<T(T, T)>& difference)
+    {
+        using DifferenceShader = Shader<1, Buffer<T>, Buffer<T>, uint>;
+        size_t items_per_thread =
+            m_device.backend_name() == "cuda" && details::can_batch_callable(difference.function()) ? 16u : 1u;
+        if constexpr(sizeof(T) == 4u && luisa::is_scalar_v<T>)
+        {
+            if(items_per_thread > 1u && num_items % 4u == 0u && input.offset_bytes() % 16u == 0u
+               && output.offset_bytes() % 16u == 0u && input.stride() == sizeof(T)
+               && output.stride() == sizeof(T))
+            {
+                dispatch_vector_difference<READ_LEFT>(cmdlist, input, output, num_items, difference);
+                return;
+            }
+        }
+        luisa::string key{READ_LEFT ? "adjacent_difference_left" : "adjacent_difference_right"};
+        key += "+";
+        key += Type::of<T>()->description();
+        key += luisa::format("+{}+{}", difference.function().hash(), items_per_thread);
+        auto shader_it = m_difference_shaders.find(key);
+        if(shader_it == m_difference_shaders.end())
+        {
+            U<DifferenceShader> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [difference, items_per_thread](BufferVar<T> input_buffer, BufferVar<T> output_buffer, UInt num_items_var) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt tile_start = block_id().x * UInt(BLOCK_SIZE * items_per_thread);
+                             UInt valid_items =
+                                 min(UInt(BLOCK_SIZE * items_per_thread), num_items_var - tile_start);
+                             for(size_t item = 0u; item < items_per_thread; ++item)
+                             {
+                                 UInt local = thread_id().x + UInt(item * BLOCK_SIZE);
+                                 $if(local < valid_items)
+                                 {
+                                     UInt   index  = tile_start + local;
+                                     Var<T> result = input_buffer.read(index);
+                                     if constexpr(READ_LEFT)
+                                     {
+                                         $if(index > 0u)
+                                         {
+                                             result = difference(result, input_buffer.read(index - 1u));
+                                         };
+                                     }
+                                     else
+                                     {
+                                         $if(index + 1u < num_items_var)
+                                         {
+                                             result = difference(result, input_buffer.read(index + 1u));
+                                         };
+                                     }
+                                     output_buffer.write(index, result);
+                                 };
+                             }
+                         });
+            m_difference_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_difference_shaders.find(key);
+        }
+        auto shader = reinterpret_cast<DifferenceShader*>(&(*shader_it->second));
+        size_t threads = items_per_thread == 1u ?
+                             num_items :
+                             ceil_div(num_items, BLOCK_SIZE * items_per_thread) * BLOCK_SIZE;
+        cmdlist << (*shader)(input, output, static_cast<uint>(num_items)).dispatch(threads);
+    }
+
+    template <bool READ_LEFT, NumericT T>
+    void dispatch_vector_difference(CommandList&             cmdlist,
+                                    BufferView<T>            input,
+                                    BufferView<T>            output,
+                                    size_t                   num_items,
+                                    const Callable<T(T, T)>& difference)
+    {
+        using Packet   = luisa::Vector<T, 4u>;
+        using Kernel   = Shader<1, Buffer<Packet>, Buffer<T>, Buffer<Packet>, uint>;
+        auto key       = luisa::format("adjacent_difference_vector4+{}+{}+{}",
+                                 READ_LEFT,
+                                 Type::of<T>()->description(),
+                                 difference.function().hash());
+        auto shader_it = m_difference_shaders.find(key);
+        if(shader_it == m_difference_shaders.end())
+        {
+            U<Kernel> shader = nullptr;
+            lazy_compile(
+                m_device,
+                shader,
+                [difference](BufferVar<Packet> input_packets, BufferVar<T> input_buffer, BufferVar<Packet> output_packets, UInt packets) noexcept
+                {
+                    set_block_size(BLOCK_SIZE);
+                    UInt tile_start = block_id().x * UInt(BLOCK_SIZE * 4u);
+                    UInt valid      = min(UInt(BLOCK_SIZE * 4u), packets - tile_start);
+                    for(size_t item = 0u; item < 4u; ++item)
+                    {
+                        UInt local = thread_id().x + UInt(item * BLOCK_SIZE);
+                        $if(local < valid)
+                        {
+                            UInt        index  = tile_start + local;
+                            Var<Packet> values = input_packets.read(index);
+                            Var<Packet> result = values;
+                            for(size_t component = 0u; component < 4u; ++component)
+                            {
+                                if constexpr(READ_LEFT)
+                                {
+                                    if(component > 0u)
+                                    {
+                                        result[component] =
+                                            difference(values[component], values[component - 1u]);
+                                    }
+                                    else
+                                    {
+                                        $if(index > 0u)
+                                        {
+                                            result[0u] =
+                                                difference(values[0u], input_buffer.read(index * 4u - 1u));
+                                        };
+                                    }
+                                }
+                                else
+                                {
+                                    if(component < 3u)
+                                    {
+                                        result[component] =
+                                            difference(values[component], values[component + 1u]);
+                                    }
+                                    else
+                                    {
+                                        $if(index + 1u < packets)
+                                        {
+                                            result[3u] =
+                                                difference(values[3u], input_buffer.read(index * 4u + 4u));
+                                        };
+                                    }
+                                }
+                            }
+                            output_packets.write(index, result);
+                        };
+                    }
+                });
+            m_difference_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_difference_shaders.find(key);
+        }
+        auto   shader  = reinterpret_cast<Kernel*>(&(*shader_it->second));
+        size_t packets = num_items / 4u;
+        cmdlist << (*shader)(input.template as<Packet>(), input, output.template as<Packet>(), static_cast<uint>(packets))
+                       .dispatch(ceil_div(packets, BLOCK_SIZE * 4u) * BLOCK_SIZE);
+    }
+};
+
+}  // namespace luisa::parallel_primitive

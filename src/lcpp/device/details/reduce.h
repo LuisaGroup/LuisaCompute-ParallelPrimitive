@@ -73,7 +73,10 @@ namespace details
     };
 
 
-    template <NumericTOrKeyValuePairT DataType, size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+    template <NumericTOrKeyValuePairT DataType,
+              size_t BLOCK_SIZE = details::BLOCK_SIZE,
+              size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD,
+              bool CUDA_WARP_REDUX = false>
     class ReduceModule : public LuisaModule
     {
         //   public:
@@ -183,7 +186,8 @@ namespace details
       public:
         template <typename ReduceOp, typename TransformOp>
         using AgentReduceT =
-            AgentReduce<DataType, ReduceOp, TransformOp, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE>;
+            AgentReduce<DataType, ReduceOp, TransformOp, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE,
+                        BlockReduceAlgorithm::WARP_SHUFFLE, CUDA_WARP_REDUX>;
 
         using ReduceShaderKernel = Shader<1, Buffer<DataType>, Buffer<DataType>, uint, GridEvenShared>;
 

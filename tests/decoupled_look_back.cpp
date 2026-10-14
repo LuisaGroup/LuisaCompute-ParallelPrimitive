@@ -15,7 +15,8 @@
 using namespace luisa;
 using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
-using namespace boost::ut;
+using boost::ut::expect;
+using boost::ut::operator""_test;
 
 int main(int argc, char* argv[])
 {
@@ -147,8 +148,8 @@ const size_t num_blocks = ceil_div(NUM_TILES, BLOCK_SIZE);
 
         luisa::vector<int> exclusive_result(NUM_TILES);
         luisa::vector<int> inclusive_result(NUM_TILES);
-        stream << exclusive_buffer.copy_to(exclusive_result.data())
-               << inclusive_buffer.copy_to(inclusive_result.data()) << synchronize();
+        stream << exclusive_buffer.copy_to(luisa::span{exclusive_result})
+               << inclusive_buffer.copy_to(luisa::span{inclusive_result}) << synchronize();
 
         luisa::vector<int> data(NUM_TILES);
         for(auto i = 0; i < NUM_TILES; i++)
@@ -277,8 +278,8 @@ const size_t num_blocks = ceil_div(NUM_TILES, BLOCK_SIZE);
 
         luisa::vector<KVP> exclusive_result(NUM_TILES);
         luisa::vector<KVP> inclusive_result(NUM_TILES);
-        stream << exclusive_buffer.copy_to(exclusive_result.data())
-               << inclusive_buffer.copy_to(inclusive_result.data()) << synchronize();
+        stream << exclusive_buffer.copy_to(luisa::span{exclusive_result})
+               << inclusive_buffer.copy_to(luisa::span{inclusive_result}) << synchronize();
         luisa::vector<int> data(NUM_TILES);
         for(auto i = 0; i < NUM_TILES; i++)
         {

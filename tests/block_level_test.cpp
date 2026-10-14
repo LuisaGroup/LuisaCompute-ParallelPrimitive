@@ -15,7 +15,8 @@
 using namespace luisa;
 using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
-using namespace boost::ut;
+using boost::ut::expect;
+using boost::ut::operator""_test;
 
 int main(int argc, char* argv[])
 {
@@ -66,7 +67,7 @@ int main(int argc, char* argv[])
 
     "test_block_reduce"_test = [&]
     {
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
         luisa::unique_ptr<Shader<1, Buffer<int>, Buffer<int>, int>> block_reduce_shader = nullptr;
         lazy_compile(device,
                      block_reduce_shader,
@@ -87,7 +88,7 @@ int main(int argc, char* argv[])
                      });
 
         stream << (*block_reduce_shader)(in_buffer.view(), out_buffer.view(), array_size).dispatch(array_size / ITEMS_PER_THREAD);
-        stream << out_buffer.copy_to(result.data()) << synchronize();  // 输出结果
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();  // 输出结果
 
         for(auto i = 0; i < array_size / (BLOCKSIZE * ITEMS_PER_THREAD); ++i)
         {
@@ -102,7 +103,7 @@ int main(int argc, char* argv[])
 
     "test_exlusive_scan"_test = [&]
     {
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
         auto               scan_out_buffer = device.create_buffer<int32>(array_size);
         std::vector<int32> scan_result(array_size);
         luisa::unique_ptr<Shader<1, Buffer<int>, Buffer<int>, int>> block_scan_shader = nullptr;
@@ -123,7 +124,7 @@ int main(int argc, char* argv[])
                      });
 
         stream << (*block_scan_shader)(in_buffer.view(), scan_out_buffer.view(), array_size).dispatch(array_size / ITEMS_PER_THREAD);
-        stream << scan_out_buffer.copy_to(scan_result.data()) << synchronize();  // 输出结果
+        stream << scan_out_buffer.copy_to(luisa::span{scan_result}) << synchronize();  // 输出结果
         for(auto i = 0; i < array_size / (BLOCKSIZE * ITEMS_PER_THREAD); ++i)
         {
             std::vector<int> exclusive_scan_result((BLOCKSIZE * ITEMS_PER_THREAD));
@@ -147,7 +148,7 @@ int main(int argc, char* argv[])
 
     "test_inlusive_scan"_test = [&]
     {
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
         auto               scan_out_buffer = device.create_buffer<int32>(array_size);
         std::vector<int32> scan_result(array_size);
         luisa::unique_ptr<Shader<1, Buffer<int>, Buffer<int>, int>> block_scan_shader = nullptr;
@@ -168,7 +169,7 @@ int main(int argc, char* argv[])
                      });
 
         stream << (*block_scan_shader)(in_buffer.view(), scan_out_buffer.view(), array_size).dispatch(array_size / ITEMS_PER_THREAD);
-        stream << scan_out_buffer.copy_to(scan_result.data()) << synchronize();  // 输出结果
+        stream << scan_out_buffer.copy_to(luisa::span{scan_result}) << synchronize();  // 输出结果
         for(auto i = 0; i < array_size / (BLOCKSIZE * ITEMS_PER_THREAD); ++i)
         {
             std::vector<int> inclusive_scan_result((BLOCKSIZE * ITEMS_PER_THREAD));
@@ -216,7 +217,7 @@ int main(int argc, char* argv[])
 
 
     // stream << (*block_scan_item_shader)(in_buffer.view(), scan_out_buffer.view(), array_size).dispatch(array_size / ITEMS_PER_THREAD);
-    // stream << scan_out_buffer.copy_to(scan_result.data()) << synchronize();  // 输出结果
+    // stream << scan_out_buffer.copy_to(luisa::span{scan_result}) << synchronize();  // 输出结果
 
     // "test_exlusive_scan_4"_test = [&]
     // {

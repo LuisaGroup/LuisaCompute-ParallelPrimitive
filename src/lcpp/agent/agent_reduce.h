@@ -28,7 +28,13 @@ namespace luisa::parallel_primitive
 namespace details
 {
     using namespace luisa::compute;
-    template <typename Type4Byte, typename ReduceOp, typename TransformOp, typename CollectiveReduceT, bool IsWarpReduction, size_t BLOCK_SIZE, size_t ITEMS_PER_THREAD>
+    template <typename Type4Byte,
+              typename ReduceOp,
+              typename TransformOp,
+              typename CollectiveReduceT,
+              bool IsWarpReduction,
+              size_t BLOCK_SIZE,
+              size_t ITEMS_PER_THREAD>
     class AgentReduceImpl : public LuisaModule
     {
         static_assert(std::is_invocable_r_v<Var<Type4Byte>, ReduceOp, const Var<Type4Byte>&, const Var<Type4Byte>&>,
@@ -46,7 +52,7 @@ namespace details
             , m_in_data(d_in)
             , m_reduce_op(reduce_op)
             , m_transform_op(transform_op)
-            , m_land_id(land_id) {};
+            , m_land_id(land_id){};
 
       public:
         Var<Type4Byte> ConsumeRange(UInt block_offset, UInt block_end)
@@ -143,24 +149,26 @@ namespace details
         {
             ConsumeFullTile<true>(thread_aggregate, even_shared.block_offset);
 
-            $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
+            $if(even_shared.block_end - even_shared.block_offset >= even_shared.block_stride)
             {
-                return;
-            };
-            even_shared.block_offset += even_shared.block_stride;
-            $while(even_shared.block_offset <= even_shared.block_end - UInt(BLOCK_SIZE * ITEMS_PER_THREAD))
-            {
-                ConsumeFullTile<false>(thread_aggregate, even_shared.block_offset);
-                $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
-                {
-                    return;
-                };
                 even_shared.block_offset += even_shared.block_stride;
-            };
-            $if(even_shared.block_offset < even_shared.block_end)
-            {
-                UInt valid_items = even_shared.block_end - even_shared.block_offset;
-                ConsumePartialTile<false>(thread_aggregate, even_shared.block_offset, valid_items);
+                $while(even_shared.block_offset <= even_shared.block_end - UInt(TILE_SIZE))
+                {
+                    ConsumeFullTile<false>(thread_aggregate, even_shared.block_offset);
+                    $if(even_shared.block_end - even_shared.block_offset < even_shared.block_stride)
+                    {
+                        even_shared.block_offset = even_shared.block_end;
+                    }
+                    $else
+                    {
+                        even_shared.block_offset += even_shared.block_stride;
+                    };
+                };
+                $if(even_shared.block_offset < even_shared.block_end)
+                {
+                    UInt valid_items = even_shared.block_end - even_shared.block_offset;
+                    ConsumePartialTile<false>(thread_aggregate, even_shared.block_offset, valid_items);
+                };
             };
         }
 
@@ -173,18 +181,37 @@ namespace details
         BufferVar<Type4Byte>& m_in_data;
     };
 
-    template <typename Type4Byte, typename ReduceOp, typename TransformOp, size_t BLOCK_SIZE, size_t ITEMS_PER_THREAD, size_t WARP_SIZE = details::WARP_SIZE, BlockReduceAlgorithm BLOCK_ALGORITHM = BlockReduceAlgorithm::WARP_SHUFFLE>
+    template <typename Type4Byte,
+              typename ReduceOp,
+              typename TransformOp,
+              size_t BLOCK_SIZE,
+              size_t ITEMS_PER_THREAD,
+              size_t WARP_SIZE = details::WARP_SIZE,
+              BlockReduceAlgorithm BLOCK_ALGORITHM = BlockReduceAlgorithm::WARP_SHUFFLE,
+              bool CUDA_WARP_REDUX = false>
     class AgentReduce
-        : public AgentReduceImpl<Type4Byte, ReduceOp, TransformOp, BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM>, false, BLOCK_SIZE, ITEMS_PER_THREAD>
+        : public AgentReduceImpl<Type4Byte,
+                                 ReduceOp,
+                                 TransformOp,
+                                 BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM, CUDA_WARP_REDUX>,
+                                 false,
+                                 BLOCK_SIZE,
+                                 ITEMS_PER_THREAD>
     {
       public:
         using Base =
-            AgentReduceImpl<Type4Byte, ReduceOp, TransformOp, BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM>, false, BLOCK_SIZE, ITEMS_PER_THREAD>;
+            AgentReduceImpl<Type4Byte,
+                            ReduceOp,
+                            TransformOp,
+                            BlockReduce<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE, BLOCK_ALGORITHM, CUDA_WARP_REDUX>,
+                            false,
+                            BLOCK_SIZE,
+                            ITEMS_PER_THREAD>;
         AgentReduce(SmemTypePtr<Type4Byte>& smem_data,
                     BufferVar<Type4Byte>&   in,
                     ReduceOp                reduce_op,
                     TransformOp             transform_op = IdentityOp())
-            : Base(smem_data, in, reduce_op, transform_op, thread_id().x) {};
+            : Base(smem_data, in, reduce_op, transform_op, thread_id().x){};
     };
 
     template <typename Type4Byte, typename ReduceOp, typename TransformOp, size_t ITEMS_PER_THREAD, size_t WARP_SIZE = details::WARP_SIZE, WarpReduceAlgorithm WARP_ALGORITHM = WarpReduceAlgorithm::WARP_SHUFFLE>
@@ -198,7 +225,7 @@ namespace details
                         BufferVar<Type4Byte>&   in,
                         ReduceOp                reduce_op,
                         TransformOp             transform_op = IdentityOp())
-            : Base(smem_data, in, reduce_op, transform_op, thread_id().x % UInt(WARP_SIZE)) {};
+            : Base(smem_data, in, reduce_op, transform_op, thread_id().x % UInt(WARP_SIZE)){};
     };
 }  // namespace details
 

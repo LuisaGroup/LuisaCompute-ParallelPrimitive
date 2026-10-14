@@ -1,3 +1,7 @@
+// Test for DeviceReduce.
+// This test covers scalar reductions, transform reduction, arg reductions,
+// tie-breaking, floating-point extrema, and reduce-by-key.
+
 // /*
 //  * @Author: Ligo
 //  * @Date: 2025-09-19 16:04:31
@@ -10,9 +14,12 @@
 #include <luisa/core/logging.h>
 #include <luisa/vstl/config.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+
 #include <lcpp/parallel_primitive.h>
 #include <random>
 #include <vector>
@@ -20,7 +27,8 @@
 using namespace luisa;
 using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
-using namespace boost::ut;
+using boost::ut::expect;
+using boost::ut::operator""_test;
 
 int main(int argc, char* argv[])
 {
@@ -37,12 +45,16 @@ int main(int argc, char* argv[])
 #endif
 
     // Parse command-line arguments: --ctx=./dir --backend=dx
-    for (int i = 1; i < argc; ++i) {
+    for(int i = 1; i < argc; ++i)
+    {
         luisa::string_view arg(argv[i]);
-        if (arg.starts_with("--ctx=")) {
+        if(arg.starts_with("--ctx="))
+        {
             ctx_dir = arg.substr(6);
             LUISA_INFO("Use context directory from command-line: {}", ctx_dir);
-        } else if (arg.starts_with("--backend=")) {
+        }
+        else if(arg.starts_with("--backend="))
+        {
             backend_name = arg.substr(10);
             LUISA_INFO("Use backend from command-line: {}", backend_name);
         }
@@ -89,17 +101,17 @@ int main(int argc, char* argv[])
             Buffer<Type4Byte>      d_input  = device.create_buffer<Type4Byte>(num_items);
             Buffer<Type4Byte>      d_output = device.create_buffer<Type4Byte>(1);
             std::vector<Type4Byte> host_input(num_items, 1);
-            stream << d_input.copy_from(host_input.data()) << synchronize();
+            stream << d_input.copy_from(luisa::span{host_input}) << synchronize();
 
             // CUB-style: first get temp storage size, then create buffer
-            size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<Type4Byte>(num_items);
-            auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+            size_t temp_bytes  = DeviceReduce<>::GetTempStorageBytes<Type4Byte>(num_items);
+            auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
             CommandList cmdlist;
             reducer.Sum(cmdlist, temp_buffer.view(), d_input.view(), d_output.view(), num_items);
             stream << cmdlist.commit() << synchronize();
             std::vector<Type4Byte> host_output(1);
-            stream << d_output.copy_to(host_output.data()) << synchronize();
+            stream << d_output.copy_to(luisa::span{host_output}) << synchronize();
 
             LUISA_INFO("Reduce: {}", host_output[0]);
             expect(host_output[0] == num_items);
@@ -111,7 +123,7 @@ int main(int argc, char* argv[])
         luisa::vector<int32> result(1);
         auto                 in_buffer  = device.create_buffer<int32>(array_size);
         auto                 out_buffer = device.create_buffer<int32>(1);
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         auto max_reduce_op = [](const Var<int>& a, const Var<int>& b) noexcept
         { return compute::max(a, b); };
@@ -119,36 +131,63 @@ int main(int argc, char* argv[])
         auto square_op = [](const Var<int>& x) noexcept { return x * x; };
 
         // CUB-style: get temp storage size
-        size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
-        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        size_t temp_bytes  = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         CommandList cmdlist;
         reducer.TransformReduce(
             cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), in_buffer.size(), max_reduce_op, square_op, 0);
         stream << cmdlist.commit() << synchronize();
-        stream << out_buffer.copy_to(result.data()) << synchronize();  // 输出结果
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();  // 输出结果
 
         LUISA_INFO("Reduce(square) (0,1,4,...+{}): {}", (array_size - 1), (array_size - 1) * (array_size - 1));
         LUISA_INFO("Result(square): {}", result[0]);
         expect((array_size - 1) * (array_size - 1) == result[0]);
     };
 
+    "transform_reduce_applies_transform_once_at_every_size"_test = [&]
+    {
+        for(size_t size : {1u, 31u, 256u, 1023u, 1024u, 1025u, 1048577u, 4194304u})
+        {
+            luisa::vector<int> host_input(size);
+            int expected = 17;
+            for(size_t i = 0u; i < size; ++i)
+            {
+                host_input[i] = static_cast<int>(i % 13u) - 6;
+                expected += 2 * host_input[i] + 1;
+            }
+            auto input = device.create_buffer<int>(size);
+            auto output = device.create_buffer<int>(1u);
+            auto temp = device.create_buffer<uint>(
+                bytes_to_uint_count(DeviceReduce<>::GetTempStorageBytes<int>(size)));
+            luisa::vector<int> actual(1u, -12345);
+            stream << input.copy_from(luisa::span{host_input})
+                   << output.copy_from(luisa::span{actual}) << synchronize();
+
+            CommandList commands;
+            reducer.TransformReduce(commands, temp.view(), input.view(), output.view(),
+                                    size, SumOp(), [](const Int& value) { return 2 * value + 1; }, 17);
+            stream << commands.commit() << output.copy_to(luisa::span{actual}) << synchronize();
+            expect(actual[0] == expected);
+        }
+    };
+
     //reduce(min)
-    "reduce min"_test = [&]
+    "reduce_min"_test = [&]
     {
         auto                 in_buffer  = device.create_buffer<int32>(array_size);
         auto                 out_buffer = device.create_buffer<int32>(1);
         luisa::vector<int32> result(1);
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         // CUB-style: get temp storage size
-        size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
-        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        size_t temp_bytes  = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         CommandList cmdlist;
         reducer.Min(cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), in_buffer.size());
         stream << cmdlist.commit() << synchronize();
-        stream << out_buffer.copy_to(result.data()) << synchronize();  // 输出结果
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();  // 输出结果
         LUISA_INFO("Result Min(0-{}): {}",
                    (array_size - 1),
                    *std::min_element(input_data.begin(), input_data.end()));
@@ -163,46 +202,180 @@ int main(int argc, char* argv[])
         auto                 out_buffer = device.create_buffer<int32>(1);
         luisa::vector<int32> result(1);
 
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         // CUB-style: get temp storage size
-        size_t temp_bytes = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
-        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        size_t temp_bytes  = DeviceReduce<>::GetTempStorageBytes<int32>(array_size);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         CommandList cmdlist;
-        reducer.Max(cmdlist,
-                    temp_buffer.view(),
-                    in_buffer.view(),
-                    out_buffer.view(),
-                    in_buffer.size());
+        reducer.Max(cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), in_buffer.size());
         stream << cmdlist.commit() << synchronize();
-        stream << out_buffer.copy_to(result.data()) << synchronize();  // 输出结果
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();  // 输出结果
         LUISA_INFO("Result Max(0-1023): {}", *std::max_element(input_data.begin(), input_data.end()));
         LUISA_INFO("Reduce Max: {}", result[0]);
         expect(*std::max_element(input_data.begin(), input_data.end()) == result[0]);
     };
 
+    "reduce_float_max_uses_lowest_identity"_test = [&]
+    {
+        luisa::vector<float> host_input{-8.0f, -2.5f, -9.0f, -4.0f};
+        auto                 in_buffer   = device.create_buffer<float>(host_input.size());
+        auto                 out_buffer  = device.create_buffer<float>(1u);
+        auto                 temp_buffer = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceReduce<>::GetTempStorageBytes<float>(host_input.size())));
 
-    "reduce argmin"_test = [&]
+        CommandList commands;
+        reducer.Max(commands, temp_buffer.view(), in_buffer.view(), out_buffer.view(), host_input.size());
+
+        float result = 0.0f;
+        stream << in_buffer.copy_from(luisa::span{host_input}) << commands.commit()
+               << out_buffer.copy_to(luisa::span{&result, 1u}) << synchronize();
+
+        expect(std::abs(result - (-2.5f)) < 1e-6f);
+    };
+
+    "reduce_argmax_returns_first_equal_extremum"_test = [&]
+    {
+        luisa::vector<int32_t> host_input{1, 9, 4, 9, 3};
+        auto                   in_buffer    = device.create_buffer<int32_t>(host_input.size());
+        auto                   value_buffer = device.create_buffer<int32_t>(1u);
+        auto                   index_buffer = device.create_buffer<uint>(1u);
+        auto                   temp_buffer  = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceReduce<>::GetArgTempStorageBytes<int32_t>(host_input.size())));
+
+        CommandList commands;
+        reducer.ArgMax(commands,
+                       temp_buffer.view(),
+                       in_buffer.view(),
+                       value_buffer.view(),
+                       index_buffer.view(),
+                       host_input.size());
+
+        int32_t result = 0;
+        uint    index  = 0u;
+        stream << in_buffer.copy_from(luisa::span{host_input}) << commands.commit()
+               << value_buffer.copy_to(luisa::span{&result, 1u})
+               << index_buffer.copy_to(luisa::span{&index, 1u}) << synchronize();
+
+        expect(result == 9);
+        expect(index == 1u);
+    };
+
+    "reduce_float_argmax_handles_negative_values"_test = [&]
+    {
+        luisa::vector<float> host_input{-7.0f, -3.0f, -5.0f};
+        auto                 in_buffer    = device.create_buffer<float>(host_input.size());
+        auto                 value_buffer = device.create_buffer<float>(1u);
+        auto                 index_buffer = device.create_buffer<uint>(1u);
+        auto                 temp_buffer  = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceReduce<>::GetArgTempStorageBytes<float>(host_input.size())));
+
+        CommandList commands;
+        reducer.ArgMax(commands,
+                       temp_buffer.view(),
+                       in_buffer.view(),
+                       value_buffer.view(),
+                       index_buffer.view(),
+                       host_input.size());
+
+        float result = 0.0f;
+        uint  index  = 0u;
+        stream << in_buffer.copy_from(luisa::span{host_input}) << commands.commit()
+               << value_buffer.copy_to(luisa::span{&result, 1u})
+               << index_buffer.copy_to(luisa::span{&index, 1u}) << synchronize();
+
+        expect(std::abs(result - (-3.0f)) < 1e-6f);
+        expect(index == 1u);
+    };
+
+    "reduce_arg_extrema_honor_custom_comparison_and_first_ties"_test = [&]
+    {
+        luisa::vector<int> host_input{21, 11, 33, 23, 8, 28};
+        auto               input     = device.create_buffer<int>(host_input.size());
+        auto               min_value = device.create_buffer<int>(1u);
+        auto               min_index = device.create_buffer<uint>(1u);
+        auto               max_value = device.create_buffer<int>(1u);
+        auto               max_index = device.create_buffer<uint>(1u);
+        auto               temp      = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceReduce<>::GetArgTempStorageBytes<int>(host_input.size())));
+        auto last_digit_less = [](const Int& lhs, const Int& rhs) noexcept
+        { return lhs % 10 < rhs % 10; };
+
+        CommandList commands;
+        reducer.ArgMin(
+            commands, temp.view(), input.view(), min_value.view(), min_index.view(), host_input.size(), last_digit_less);
+        reducer.ArgMax(
+            commands, temp.view(), input.view(), max_value.view(), max_index.view(), host_input.size(), last_digit_less);
+
+        int  min_result       = 0;
+        uint min_index_result = 0u;
+        int  max_result       = 0;
+        uint max_index_result = 0u;
+        stream << input.copy_from(luisa::span{host_input}) << commands.commit()
+               << min_value.copy_to(luisa::span{&min_result, 1u})
+               << min_index.copy_to(luisa::span{&min_index_result, 1u})
+               << max_value.copy_to(luisa::span{&max_result, 1u})
+               << max_index.copy_to(luisa::span{&max_index_result, 1u}) << synchronize();
+
+        expect(min_result == 21);
+        expect(min_index_result == 0u);
+        expect(max_result == 8);
+        expect(max_index_result == 4u);
+    };
+
+    "reduce_custom_arg_extrema_preserve_empty_input_sentinels"_test = [&]
+    {
+        auto min_value = device.create_buffer<int>(1u);
+        auto min_index = device.create_buffer<uint>(1u);
+        auto max_value = device.create_buffer<int>(1u);
+        auto max_index = device.create_buffer<uint>(1u);
+        auto compare = [](const Int& lhs, const Int& rhs) noexcept { return lhs % 10 < rhs % 10; };
+
+        CommandList commands;
+        reducer.ArgMin(commands, BufferView<uint>{}, BufferView<int>{}, min_value.view(), min_index.view(), 0u, compare);
+        reducer.ArgMax(commands, BufferView<uint>{}, BufferView<int>{}, max_value.view(), max_index.view(), 0u, compare);
+
+        int  min_result       = 0;
+        uint min_index_result = 0u;
+        int  max_result       = 0;
+        uint max_index_result = 0u;
+        stream << commands.commit() << min_value.copy_to(luisa::span{&min_result, 1u})
+               << min_index.copy_to(luisa::span{&min_index_result, 1u})
+               << max_value.copy_to(luisa::span{&max_result, 1u})
+               << max_index.copy_to(luisa::span{&max_index_result, 1u}) << synchronize();
+
+        expect(min_result == std::numeric_limits<int>::max());
+        expect(min_index_result == 1u);
+        expect(max_result == std::numeric_limits<int>::lowest());
+        expect(max_index_result == 1u);
+    };
+
+
+    "reduce_argmin"_test = [&]
     {
         auto in_buffer  = device.create_buffer<int32>(array_size);
         auto out_buffer = device.create_buffer<int32>(1);
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         auto                       index_out_buffer = device.create_buffer<luisa::uint>(1);
         luisa::vector<int32>       result(1);
         luisa::vector<luisa::uint> index_result(1);
 
         // CUB-style: get temp storage size for ArgMin
-        size_t temp_bytes = DeviceReduce<>::GetArgTempStorageBytes<int32>(array_size);
-        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        size_t temp_bytes  = DeviceReduce<>::GetArgTempStorageBytes<int32>(array_size);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         CommandList cmdlist;
-        reducer.ArgMin(
-            cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), index_out_buffer.view(), in_buffer.size());
+        reducer.ArgMin(cmdlist,
+                       temp_buffer.view(),
+                       in_buffer.view(),
+                       out_buffer.view(),
+                       index_out_buffer.view(),
+                       in_buffer.size());
         stream << cmdlist.commit() << synchronize();
-        stream << out_buffer.copy_to(result.data()) << synchronize();              // 输出结果
-        stream << index_out_buffer.copy_to(index_result.data()) << synchronize();  // 输出结果
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();  // 输出结果
+        stream << index_out_buffer.copy_to(luisa::span{index_result}) << synchronize();  // 输出结果
         LUISA_INFO("result index:{}, value: {}", index_result[0], result[0]);
 
         LUISA_INFO("Index ArgMin: {}",
@@ -212,26 +385,30 @@ int main(int argc, char* argv[])
     };
 
     // reduce(argmax)
-    "reduce argmax"_test = [&]
+    "reduce_argmax"_test = [&]
     {
         auto in_buffer  = device.create_buffer<int32>(array_size);
         auto out_buffer = device.create_buffer<int32>(1);
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         auto                       index_out_buffer = device.create_buffer<luisa::uint>(1);
         luisa::vector<int32>       result(1);
         luisa::vector<luisa::uint> index_result(1);
 
         // CUB-style: get temp storage size for ArgMax
-        size_t temp_bytes = DeviceReduce<>::GetArgTempStorageBytes<int32>(array_size);
-        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        size_t temp_bytes  = DeviceReduce<>::GetArgTempStorageBytes<int32>(array_size);
+        auto   temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         CommandList cmdlist;
-        reducer.ArgMax(
-            cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), index_out_buffer.view(), in_buffer.size());
+        reducer.ArgMax(cmdlist,
+                       temp_buffer.view(),
+                       in_buffer.view(),
+                       out_buffer.view(),
+                       index_out_buffer.view(),
+                       in_buffer.size());
         stream << cmdlist.commit() << synchronize();
-        stream << out_buffer.copy_to(result.data()) << synchronize();
-        stream << index_out_buffer.copy_to(index_result.data()) << synchronize();
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();
+        stream << index_out_buffer.copy_to(luisa::span{index_result}) << synchronize();
 
 
         LUISA_INFO("Index ArgMax: {}",
@@ -263,8 +440,8 @@ int main(int argc, char* argv[])
         auto aggregates_buffer  = device.create_buffer<int32>(segments);
         auto num_runs_buffer    = device.create_buffer<luisa::uint>(1);
 
-        stream << key_buffer.copy_from(input_keys.data()) << synchronize();
-        stream << value_buffer.copy_from(input_data.data()) << synchronize();
+        stream << key_buffer.copy_from(luisa::span{input_keys}) << synchronize();
+        stream << value_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         // CUB-style: get temp storage size for ReduceByKey
         size_t temp_bytes = DeviceReduce<>::GetReduceByKeyTempStorageBytes<int32, int32>(array_size);
@@ -285,9 +462,9 @@ int main(int argc, char* argv[])
         luisa::vector<int32>       unique_keys(segments);
         luisa::vector<int32>       aggregates(segments);
         luisa::vector<luisa::uint> num_runs(1);
-        stream << unique_keys_buffer.copy_to(unique_keys.data()) << synchronize();  // 输出结果
-        stream << aggregates_buffer.copy_to(aggregates.data()) << synchronize();    // 输出结果
-        stream << num_runs_buffer.copy_to(num_runs.data()) << synchronize();        // 输出结果
+        stream << unique_keys_buffer.copy_to(luisa::span{unique_keys}) << synchronize();  // 输出结果
+        stream << aggregates_buffer.copy_to(luisa::span{aggregates}) << synchronize();  // 输出结果
+        stream << num_runs_buffer.copy_to(luisa::span{num_runs}) << synchronize();  // 输出结果
 
         LUISA_INFO("Reduce By Key: num_runs: {}", num_runs[0]);
 
@@ -303,5 +480,35 @@ int main(int argc, char* argv[])
             LUISA_INFO("UniqueKey: {}, AggregateValue: {}", unique_keys[i], aggregates[i]);
             expect(expected_sum == aggregates[i]);
         }
+    };
+
+    "reduce_by_key_empty_input"_test = [&]
+    {
+        auto key_buffer         = device.create_buffer<int32>(1u);
+        auto value_buffer       = device.create_buffer<int32>(1u);
+        auto unique_key_buffer  = device.create_buffer<int32>(1u);
+        auto aggregate_buffer   = device.create_buffer<int32>(1u);
+        auto num_runs_buffer    = device.create_buffer<uint>(1u);
+        auto temp_storage_bytes = DeviceReduce<>::GetReduceByKeyTempStorageBytes<int32, int32>(0u);
+        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_storage_bytes));
+
+        luisa::vector<uint> num_runs{17u};
+        stream << num_runs_buffer.copy_from(luisa::span{num_runs}) << synchronize();
+
+        CommandList cmdlist;
+        reducer.ReduceByKey(
+            cmdlist,
+            temp_buffer.view(),
+            key_buffer.view(),
+            value_buffer.view(),
+            unique_key_buffer.view(),
+            aggregate_buffer.view(),
+            num_runs_buffer.view(),
+            [](const Var<int32>& a, const Var<int32>& b) { return a + b; },
+            0u);
+        stream << cmdlist.commit() << synchronize();
+        stream << num_runs_buffer.copy_to(luisa::span{num_runs}) << synchronize();
+
+        expect(num_runs[0] == 0u);
     };
 }

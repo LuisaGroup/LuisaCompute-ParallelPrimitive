@@ -62,23 +62,36 @@ namespace details
 
                              $if(segment_begin == segment_end)
                              {
-                                 // empty segment
                                  $if(thread_id().x == 0)
                                  {
-                                     d_arr_out.write(block_id().x, initial_value);
+                                     Var<Type4Byte> empty_value = initial_value;
+                                     if constexpr(KeyValuePairType<Type4Byte>)
+                                     {
+                                         empty_value.key = segment_begin + initial_value.key;
+                                     }
+                                     d_arr_out.write(block_id().x, empty_value);
                                  };
-                                 return;
-                             };
-
-                             SmemTypePtr<Type4Byte> smem_data = new SmemType<Type4Byte>{shared_mem_size};
-                             Var<Type4Byte> block_aggregate =
-                                 AgentReduceT<ReduceOp>(
-                                     smem_data, d_arr_in, reduce_op, luisa::parallel_primitive::IdentityOp())
-                                     .ConsumeRange(segment_begin, segment_end);
-                             $if(thread_id().x == 0)
+                             }
+                             $else
                              {
-                                 // finalize and store aggregate
-                                 d_arr_out.write(block_id().x, reduce_op(initial_value, block_aggregate));
+                                 SmemTypePtr<Type4Byte> smem_data = new SmemType<Type4Byte>{shared_mem_size};
+                                 Var<Type4Byte> block_aggregate =
+                                     AgentReduceT<ReduceOp>(smem_data,
+                                                            d_arr_in,
+                                                            reduce_op,
+                                                            luisa::parallel_primitive::IdentityOp())
+                                         .ConsumeRange(segment_begin, segment_end);
+                                 $if(thread_id().x == 0)
+                                 {
+                                     if constexpr(KeyValuePairType<Type4Byte>)
+                                     {
+                                         d_arr_out.write(block_id().x, block_aggregate);
+                                     }
+                                     else
+                                     {
+                                         d_arr_out.write(block_id().x, reduce_op(initial_value, block_aggregate));
+                                     }
+                                 };
                              };
                          });
 
@@ -127,18 +140,30 @@ namespace details
                             {
                                 $if(lane_id == 0)
                                 {
-                                    d_arr_out.write(global_segment_id, initial_value);
+                                    Var<Type4Byte> empty_value = initial_value;
+                                    d_arr_out.write(global_segment_id, empty_value);
                                 };
-                            };
-
-                            SmemTypePtr<Type4Byte> smem_data = new SmemType<Type4Byte>{segments_per_small_block};
-                            Var<Type4Byte> warp_aggregate =
-                                AgentSmallReduceT<ReduceOp>(
-                                    smem_data, d_arr_in, reduce_op, luisa::parallel_primitive::IdentityOp())
-                                    .ConsumeRange(segment_begin, segment_begin + d_segment_size);
-                            $if(lane_id == 0)
+                            }
+                            $else
                             {
-                                d_arr_out.write(global_segment_id, reduce_op(initial_value, warp_aggregate));
+                                SmemTypePtr<Type4Byte> smem_data =
+                                    new SmemType<Type4Byte>{segments_per_small_block};
+                                Var<Type4Byte> warp_aggregate =
+                                    AgentSmallReduceT<ReduceOp>(
+                                        smem_data, d_arr_in, reduce_op, luisa::parallel_primitive::IdentityOp())
+                                        .ConsumeRange(segment_begin, segment_begin + d_segment_size);
+                                $if(lane_id == 0)
+                                {
+                                    if constexpr(KeyValuePairType<Type4Byte>)
+                                    {
+                                        d_arr_out.write(global_segment_id, warp_aggregate);
+                                    }
+                                    else
+                                    {
+                                        d_arr_out.write(global_segment_id,
+                                                        reduce_op(initial_value, warp_aggregate));
+                                    }
+                                };
                             };
                         };
                     }
@@ -154,8 +179,14 @@ namespace details
 
                         $if(thid == 0)
                         {
-                            // finalize and store aggregate
-                            d_arr_out.write(bid, reduce_op(initial_value, block_aggregate));
+                            if constexpr(KeyValuePairType<Type4Byte>)
+                            {
+                                d_arr_out.write(bid, block_aggregate);
+                            }
+                            else
+                            {
+                                d_arr_out.write(bid, reduce_op(initial_value, block_aggregate));
+                            }
                         };
                     };
                 });

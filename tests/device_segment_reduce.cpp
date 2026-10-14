@@ -1,3 +1,7 @@
+// Test for DeviceSegmentReduce.
+// This test covers fixed-size and offset segments, empty segments, extrema,
+// first-occurrence arg semantics, and relative segment indices.
+
 // /*
 //  * @Author: Ligo
 //  * @Date: 2025-09-19 16:04:31
@@ -16,13 +20,15 @@
 #include <cstdlib>
 #include <lcpp/parallel_primitive.h>
 #include <numeric>
+#include <limits>
 #include <random>
 #include <vector>
 #include <boost/ut.hpp>
 using namespace luisa;
 using namespace luisa::compute;
 using namespace luisa::parallel_primitive;
-using namespace boost::ut;
+using boost::ut::expect;
+using boost::ut::operator""_test;
 int main(int argc, char* argv[])
 {
     log_level_verbose();
@@ -105,13 +111,13 @@ int main(int argc, char* argv[])
         auto begin_offsets = device.create_buffer<uint>(num_segments);
         auto end_offsets   = device.create_buffer<uint>(num_segments);
 
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
-        stream << begin_offsets.copy_from(begin_offsets_array.data()) << synchronize();
-        stream << end_offsets.copy_from(end_offsets_array.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
+        stream << begin_offsets.copy_from(luisa::span{begin_offsets_array}) << synchronize();
+        stream << end_offsets.copy_from(luisa::span{end_offsets_array}) << synchronize();
 
         // CUB-style: get temp storage size
         size_t temp_bytes = DeviceSegmentReduce<>::GetTempStorageBytes<int32>(array_size);
-        auto temp_buffer  = device.create_buffer<uint>(std::max<size_t>(1, bytes_to_uint_count(temp_bytes)));
+        auto temp_buffer = device.create_buffer<uint>(std::max<size_t>(1, bytes_to_uint_count(temp_bytes)));
 
         reducer.Sum(cmdlist,
                     temp_buffer.view(),
@@ -123,7 +129,7 @@ int main(int argc, char* argv[])
         stream << cmdlist.commit() << synchronize();
 
         luisa::vector<int32> result(num_segments);
-        stream << out_buffer.copy_to(result.data()) << synchronize();
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();
         for(auto i = 0; i < array_size; i++)
         {
             if(i % items_per_segment == 0)
@@ -166,17 +172,17 @@ int main(int argc, char* argv[])
         {
             input_data[i] = i;
         }
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         // CUB-style: get temp storage size
         size_t temp_bytes = DeviceSegmentReduce<>::GetTempStorageBytes<int32>(fixed_array);
-        auto temp_buffer  = device.create_buffer<uint>(std::max<size_t>(1, bytes_to_uint_count(temp_bytes)));
+        auto temp_buffer = device.create_buffer<uint>(std::max<size_t>(1, bytes_to_uint_count(temp_bytes)));
 
         reducer.Sum(cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), num_segments, items_per_segment);
         stream << cmdlist.commit() << synchronize();
 
         luisa::vector<int32> result(num_segments);
-        stream << out_buffer.copy_to(result.data()) << synchronize();
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();
         for(auto i = 0; i < fixed_array; i++)
         {
             if(i % items_per_segment == 0)
@@ -224,16 +230,16 @@ int main(int argc, char* argv[])
         auto begin_offsets = device.create_buffer<uint>(num_segments);
         auto end_offsets   = device.create_buffer<uint>(num_segments);
 
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
-        stream << begin_offsets.copy_from(begin_offsets_array.data()) << synchronize();
-        stream << end_offsets.copy_from(end_offsets_array.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
+        stream << begin_offsets.copy_from(luisa::span{begin_offsets_array}) << synchronize();
+        stream << end_offsets.copy_from(luisa::span{end_offsets_array}) << synchronize();
 
         auto out_buffer       = device.create_buffer<int>(num_segments);
         auto index_out_buffer = device.create_buffer<uint>(num_segments);
 
         // CUB-style: get temp storage size for ArgMax
         size_t temp_bytes = DeviceSegmentReduce<>::GetArgTempStorageBytes<int32>(array_size, num_segments);
-        auto temp_buffer  = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
         reducer.ArgMax(cmdlist,
                        temp_buffer.view(),
@@ -246,7 +252,7 @@ int main(int argc, char* argv[])
         stream << cmdlist.commit() << synchronize();
 
         luisa::vector<int32> result(num_segments);
-        stream << out_buffer.copy_to(result.data()) << synchronize();
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();
         for(auto i = 0; i < array_size; i++)
         {
             if(i % items_per_segment == 0)
@@ -283,17 +289,18 @@ int main(int argc, char* argv[])
 
         std::mt19937 rng(114521);  // 固定种子
         std::shuffle(input_data.begin(), input_data.end(), rng);
-        stream << in_buffer.copy_from(input_data.data()) << synchronize();
+        stream << in_buffer.copy_from(luisa::span{input_data}) << synchronize();
 
         // CUB-style: get temp storage size for ArgMin
         size_t temp_bytes = DeviceSegmentReduce<>::GetArgTempStorageBytes<int32>(fixed_array, num_segments);
-        auto temp_buffer  = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
+        auto temp_buffer = device.create_buffer<uint>(bytes_to_uint_count(temp_bytes));
 
-        reducer.ArgMin(cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), index_out_buffer.view(), num_segments, items_per_segment);
+        reducer.ArgMin(
+            cmdlist, temp_buffer.view(), in_buffer.view(), out_buffer.view(), index_out_buffer.view(), num_segments, items_per_segment);
         stream << cmdlist.commit() << synchronize();
 
         luisa::vector<int32> result(num_segments);
-        stream << out_buffer.copy_to(result.data()) << synchronize();
+        stream << out_buffer.copy_to(luisa::span{result}) << synchronize();
         for(auto i = 0; i < fixed_array; i++)
         {
             if(i % items_per_segment == 0)
@@ -307,5 +314,118 @@ int main(int argc, char* argv[])
                 expect(*expected_min == result[i / items_per_segment]);
             }
         }
+    };
+
+    "segment_reduce_empty_segments_use_initial_value"_test = [&]
+    {
+        luisa::vector<int32_t> input{4, 6, 8, 10};
+        luisa::vector<uint>    begin_offsets{0u, 2u, 2u};
+        luisa::vector<uint>    end_offsets{2u, 2u, 4u};
+        constexpr uint         num_segments = 3u;
+
+        auto input_buffer  = device.create_buffer<int32_t>(input.size());
+        auto begin_buffer  = device.create_buffer<uint>(num_segments);
+        auto end_buffer    = device.create_buffer<uint>(num_segments);
+        auto output_buffer = device.create_buffer<int32_t>(num_segments);
+        auto temp_buffer   = device.create_buffer<uint>(1u);
+
+        CommandList commands;
+        reducer.Sum(commands,
+                    temp_buffer.view(),
+                    input_buffer.view(),
+                    output_buffer.view(),
+                    num_segments,
+                    begin_buffer.view(),
+                    end_buffer.view());
+
+        luisa::vector<int32_t> output(num_segments);
+        stream << input_buffer.copy_from(luisa::span{input})
+               << begin_buffer.copy_from(luisa::span{begin_offsets})
+               << end_buffer.copy_from(luisa::span{end_offsets}) << commands.commit()
+               << output_buffer.copy_to(luisa::span{output}) << synchronize();
+
+        expect(output[0] == 10);
+        expect(output[1] == 0);
+        expect(output[2] == 18);
+    };
+
+    "segment_argmax_handles_negative_ties_and_empty_segments"_test = [&]
+    {
+        luisa::vector<float> input{-9.0f, -2.0f, -2.0f, -8.0f, -5.0f};
+        luisa::vector<uint>  begin_offsets{0u, 1u, 4u};
+        luisa::vector<uint>  end_offsets{0u, 4u, 4u};
+        constexpr uint       num_segments = 3u;
+
+        auto input_buffer = device.create_buffer<float>(input.size());
+        auto begin_buffer = device.create_buffer<uint>(num_segments);
+        auto end_buffer   = device.create_buffer<uint>(num_segments);
+        auto value_buffer = device.create_buffer<float>(num_segments);
+        auto index_buffer = device.create_buffer<uint>(num_segments);
+        auto temp_buffer  = device.create_buffer<uint>(bytes_to_uint_count(
+            DeviceSegmentReduce<>::GetArgTempStorageBytes<float>(input.size(), num_segments)));
+
+        CommandList commands;
+        reducer.ArgMax(commands,
+                       temp_buffer.view(),
+                       input_buffer.view(),
+                       value_buffer.view(),
+                       index_buffer.view(),
+                       num_segments,
+                       begin_buffer.view(),
+                       end_buffer.view());
+
+        luisa::vector<float> values(num_segments);
+        luisa::vector<uint>  indices(num_segments);
+        stream << input_buffer.copy_from(luisa::span{input})
+               << begin_buffer.copy_from(luisa::span{begin_offsets})
+               << end_buffer.copy_from(luisa::span{end_offsets}) << commands.commit()
+               << value_buffer.copy_to(luisa::span{values})
+               << index_buffer.copy_to(luisa::span{indices}) << synchronize();
+
+        expect(values[0] == std::numeric_limits<float>::lowest());
+        expect(indices[0] == 1u);
+        expect(std::abs(values[1] - (-2.0f)) < 1e-6f);
+        expect(indices[1] == 0u);
+        expect(values[2] == std::numeric_limits<float>::lowest());
+        expect(indices[2] == 1u);
+    };
+
+    "segment_argmin_offset_overload_returns_first_relative_index"_test = [&]
+    {
+        luisa::vector<int32_t> input{7, 1, 1, 9, 4, 2};
+        luisa::vector<uint>    begin_offsets{0u, 3u};
+        luisa::vector<uint>    end_offsets{3u, 6u};
+        constexpr uint         num_segments = 2u;
+
+        auto input_buffer = device.create_buffer<int32_t>(input.size());
+        auto begin_buffer = device.create_buffer<uint>(num_segments);
+        auto end_buffer   = device.create_buffer<uint>(num_segments);
+        auto value_buffer = device.create_buffer<int32_t>(num_segments);
+        auto index_buffer = device.create_buffer<uint>(num_segments);
+        auto temp_buffer  = device.create_buffer<uint>(bytes_to_uint_count(
+            DeviceSegmentReduce<>::GetArgTempStorageBytes<int32_t>(input.size(), num_segments)));
+
+        CommandList commands;
+        reducer.ArgMin(commands,
+                       temp_buffer.view(),
+                       input_buffer.view(),
+                       value_buffer.view(),
+                       index_buffer.view(),
+                       num_segments,
+                       begin_buffer.view(),
+                       end_buffer.view());
+
+        luisa::vector<int32_t> values(num_segments);
+        luisa::vector<uint>    indices(num_segments);
+        stream << input_buffer.copy_from(luisa::span{input})
+               << begin_buffer.copy_from(luisa::span{begin_offsets})
+               << end_buffer.copy_from(luisa::span{end_offsets}) << commands.commit()
+               << value_buffer.copy_to(luisa::span{values})
+               << index_buffer.copy_to(luisa::span{indices}) << synchronize();
+
+        expect(values[0] == 1);
+        expect(indices[0] == 1u);
+        expect(values[1] == 2);
+        expect(indices[1] == 2u);
     };
 }

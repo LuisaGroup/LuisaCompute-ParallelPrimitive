@@ -13,6 +13,7 @@
 #include <lcpp/block/block_store.h>
 #include <lcpp/block/block_radix_rank.h>
 #include <lcpp/common/grid_even_shared.h>
+#include <lcpp/common/cuda_tile_state.h>
 #include <lcpp/common/thread_operators.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/util_type.h>
@@ -26,6 +27,7 @@
 #include <luisa/dsl/stmt.h>
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/var.h>
+#include <type_traits>
 
 namespace luisa::parallel_primitive
 {
@@ -51,6 +53,7 @@ namespace details
         static constexpr bool FULL_BINS             = BINS_PER_THREAD * BLOCK_SIZE == RADIX_DIGITS;
         static constexpr uint WARP_THREADS          = WARP_SIZE;
         static constexpr uint BLOCK_WARPS           = BLOCK_SIZE / WARP_THREADS;
+        static constexpr uint RANK_STORAGE_ITEMS    = BLOCK_WARPS * RADIX_DIGITS * RANK_NUM_PARTS;
         static constexpr uint WARP_MASK             = ~0;
         static constexpr uint LOOKBACK_PARTIAL_MASK = 1 << (uint(sizeof(uint)) * 8 - 2);
         static constexpr uint LOOKBACK_GLOBAL_MASK  = 1 << (uint(sizeof(uint)) * 8 - 1);
@@ -82,7 +85,8 @@ namespace details
 
         struct CountsCallback
         {
-            using RadixSortOneSweepPolicy = AgentRadixSortOneSweepPolicy<1u, 8u, KeyType, 1u, RADIX_BITS>;
+            using RadixSortOneSweepPolicy =
+                AgentRadixSortOneSweepPolicy<BLOCK_SIZE, ITEMS_PER_THREAD, KeyType, 1u, RADIX_BITS>;
             using AgentT =
                 AgentRadixSortOneSweep<KeyType, ValueType, KEYS_ONLY, RADIX_BITS, RadixSortOneSweepPolicy::RANK_NUM_PARTS, IS_DESCENDING, BLOCK_SIZE, WARP_SIZE, ITEMS_PER_THREAD>;
             AgentT&                                       agent;
@@ -117,7 +121,8 @@ namespace details
                                BufferVar<ValueType>&       values_out,
                                UInt                        num_items,
                                UInt                        current_bit,
-                               UInt                        num_bits)
+                               UInt                        num_bits,
+                               bool                        cuda_tile_state = false)
             : d_lookback(d_lookback)
             , d_ctrs(d_ctrs)
             , d_bins_in(d_bins_in)
@@ -132,7 +137,21 @@ namespace details
             , warp(thread_id().x / UInt(WARP_SIZE))
             , lane_id(warp_lane_id())
         {
-            m_shared_keys      = new SmemType<bit_ordered_type>(TILE_ITEMS);
+            m_cuda_tile_state = cuda_tile_state;
+            if constexpr(std::is_same_v<bit_ordered_type, uint>)
+            {
+                // Rank offsets are dead after RankKeys. Reuse the key tile
+                // allocation for 32-bit keys instead of reserving a second
+                // shared array for the rank workspace.
+                constexpr uint shared_items = TILE_ITEMS > RANK_STORAGE_ITEMS ? TILE_ITEMS : RANK_STORAGE_ITEMS;
+                m_shared_rank_storage = new SmemType<uint>(shared_items);
+                m_shared_keys         = m_shared_rank_storage;
+            }
+            else
+            {
+                m_shared_keys         = new SmemType<bit_ordered_type>(TILE_ITEMS);
+                m_shared_rank_storage = new SmemType<uint>(RANK_STORAGE_ITEMS);
+            }
             m_shared_block_idx = new SmemType<uint>(1);
             m_shared_values    = KEYS_ONLY ? nullptr : new SmemType<ValueType>(TILE_ITEMS);
             m_global_offsets   = new SmemType<uint>(RADIX_DIGITS);
@@ -210,7 +229,7 @@ namespace details
             ArrayVar<uint, ITEMS_PER_THREAD> ranks;
             ArrayVar<uint, BINS_PER_THREAD>  exclusive_digit_prefix;
             ArrayVar<uint, BINS_PER_THREAD>  bins;
-            BlockRadixRankT().template RankKeys<bit_ordered_type, ITEMS_PER_THREAD, digit_extractor_t, CountsCallback>(
+            BlockRadixRankT(m_shared_rank_storage).template RankKeys<bit_ordered_type, ITEMS_PER_THREAD, digit_extractor_t, CountsCallback>(
                 keys, ranks, digit_extractor(), exclusive_digit_prefix, CountsCallback(*this, bins, keys));
 
             sync_block();
@@ -238,7 +257,14 @@ namespace details
                 $if(FULL_BINS | bin < RADIX_DIGITS)
                 {
                     UInt value = bins[i] | LOOKBACK_PARTIAL_MASK;
-                    d_lookback.volatile_write(block_idx * RADIX_DIGITS + bin, value);
+                    if(m_cuda_tile_state)
+                    {
+                        cuda_tile_state_store<uint>(d_lookback, block_idx * RADIX_DIGITS + bin, value);
+                    }
+                    else
+                    {
+                        d_lookback.volatile_write(block_idx * RADIX_DIGITS + bin, value);
+                    }
                 };
             }
         }
@@ -297,7 +323,14 @@ namespace details
                         UInt value_j = 0;
                         $while(value_j == 0)
                         {
-                            value_j = d_lookback.volatile_read(loc_j);
+                            if(m_cuda_tile_state)
+                            {
+                                value_j = cuda_tile_state_load(d_lookback, loc_j);
+                            }
+                            else
+                            {
+                                value_j = d_lookback.volatile_read(loc_j);
+                            }
                         };
                         inc_sum += value_j & LOOKBACK_VALUE_MASK;
                         want_mask = warp_active_bit_mask((value_j & LOOKBACK_KIND_MASK) == 0).x;
@@ -310,7 +343,14 @@ namespace details
 
                     UInt loc_i   = block_idx * RADIX_DIGITS + bin;
                     UInt value_i = inc_sum | LOOKBACK_GLOBAL_MASK;
-                    d_lookback.volatile_write(loc_i, value_i);
+                    if(m_cuda_tile_state)
+                    {
+                        cuda_tile_state_store<uint>(d_lookback, loc_i, value_i);
+                    }
+                    else
+                    {
+                        d_lookback.volatile_write(loc_i, value_i);
+                    }
                     m_global_offsets->write(bin, m_global_offsets->read(bin) + inc_sum - bins[u]);
                 };
             }
@@ -428,7 +468,6 @@ namespace details
                 {
                     d_keys_out.write(global_idx * (uint)sizeof(bit_ordered_type), Twiddle::Out(key));
                 };
-                sync_block();
             }
         }
 
@@ -468,17 +507,18 @@ namespace details
                 {
                     d_values_out.write(global_idx, value);
                 };
-                sync_block();
             }
         }
 
 
       private:
         SmemTypePtr<bit_ordered_type> m_shared_keys;
+        SmemTypePtr<uint>              m_shared_rank_storage;
         SmemTypePtr<ValueType>        m_shared_values;
         SmemTypePtr<uint>             m_global_offsets;
         SmemTypePtr<uint>             m_shared_block_idx;
 
+        bool                   m_cuda_tile_state = false;
         BufferVar<uint>&       d_lookback;
         BufferVar<uint>&       d_ctrs;
         BufferVar<uint>&       d_bins_out;
