@@ -53,6 +53,30 @@ constexpr inline T ceil_div(T a, T b) noexcept
     return a / b + static_cast<T>(a % b != 0);
 }
 
+namespace details
+{
+    // Batching must not change a callable's thread identity or collective context.
+    inline bool can_batch_callable(luisa::compute::Function function) noexcept
+    {
+        using luisa::compute::CallOp;
+        if(!function.builtin_variables().empty() || !function.shared_variables().empty()
+           || !function.external_callables().empty() || function.requires_atomic()
+           || function.use_cooperative_operations())
+        {
+            return false;
+        }
+        for(auto operation : function.propagated_builtin_callables())
+        {
+            if(operation == CallOp::SYNCHRONIZE_BLOCK
+               || (operation >= CallOp::WARP_IS_FIRST_ACTIVE_LANE && operation <= CallOp::WARP_READ_FIRST_ACTIVE_LANE))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}  // namespace details
+
 template <int N, int CURRENT_VAL = N, int COUNT = 0>
 struct Log2
 {

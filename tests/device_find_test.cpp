@@ -3,6 +3,7 @@
 // empty ranges, and zero-work calls.
 
 #include <lcpp/parallel_primitive.h>
+#include <algorithm>
 
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
@@ -85,6 +86,35 @@ int main(int argc, char* argv[])
         expect(first_even_index == 1u);
         expect(no_match_index == input_values.size());
         expect(empty_index == 0u);
+    };
+
+    "device_find_tiled_tail_and_dense_matches"_test = [&]
+    {
+        constexpr uint     count = 100003u;
+        luisa::vector<int> values(count, 0);
+        auto               input   = device.create_buffer<int>(count);
+        auto               output  = device.create_buffer<uint>(1u);
+        auto               matches = [](const Int& value) noexcept { return value != 0; };
+        for(uint position : {count, count - 1u, 4096u, 31u, 0u})
+        {
+            std::fill(values.begin(), values.end(), 0);
+            if(position < count)
+            {
+                std::fill(values.begin() + position, values.end(), 1);
+            }
+            CommandList commands;
+            find.FindIf(commands, BufferView<uint>{}, input.view(), output.view(), matches, count);
+            uint result = ~0u;
+            stream << input.copy_from(luisa::span{values}) << commands.commit()
+                   << output.copy_to(luisa::span{&result, 1u}) << synchronize();
+            expect(result == position);
+        }
+        auto indexed = [](const Int&) noexcept { return dispatch_id().x + 1u == dispatch_size().x; };
+        CommandList commands;
+        find.FindIf(commands, BufferView<uint>{}, input.view(), output.view(), indexed, count);
+        uint result = ~0u;
+        stream << commands.commit() << output.copy_to(luisa::span{&result, 1u}) << synchronize();
+        expect(result == count - 1u);
     };
 
     "device_find_bounds_cover_duplicates_and_custom_order"_test = [&]

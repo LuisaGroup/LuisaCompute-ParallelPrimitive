@@ -38,6 +38,85 @@ int main(int argc, char* argv[])
     DeviceRunLengthEncode<> run_length_encode;
     run_length_encode.create(device);
 
+    "device_run_length_encode_preserves_wide_values"_test = [&]
+    {
+        const std::array<luisa::ulong, 7u> input{luisa::ulong{1} << 40u,
+                                                 luisa::ulong{1} << 40u,
+                                                 luisa::ulong{1} << 41u,
+                                                 luisa::ulong{1} << 42u,
+                                                 luisa::ulong{1} << 42u,
+                                                 luisa::ulong{1} << 42u,
+                                                 luisa::ulong{1} << 43u};
+        auto                               in = device.create_buffer<luisa::ulong>(input.size());
+        auto unique                           = device.create_buffer<luisa::ulong>(input.size());
+        auto lengths                          = device.create_buffer<uint>(input.size());
+        auto runs                             = device.create_buffer<uint>(1u);
+        auto temp                             = device.create_buffer<uint>(
+            bytes_to_uint_count(DeviceRunLengthEncode<>::GetTempStorageBytes(input.size())));
+        CommandList commands;
+        run_length_encode.Encode(
+            commands, temp.view(), in.view(), unique.view(), lengths.view(), runs.view(), input.size());
+        std::array<luisa::ulong, 7u> values{};
+        std::array<uint, 7u>         result_lengths{};
+        uint                         count = 0u;
+        stream << in.copy_from(luisa::span{input}) << commands.commit()
+               << unique.copy_to(luisa::span{values}) << lengths.copy_to(luisa::span{result_lengths})
+               << runs.copy_to(luisa::span{&count, 1u}) << synchronize();
+        expect(count == 4u);
+        const std::array<uint, 4u> expected_lengths{2u, 1u, 3u, 1u};
+        for(uint i = 0u; i < 4u; ++i)
+        {
+            expect(values[i] == luisa::ulong{1} << (40u + i));
+            expect(result_lengths[i] == expected_lengths[i]);
+        }
+    };
+
+    "device_run_length_encode_long_runs_across_fused_tiles"_test = [&]
+    {
+        for(uint count : {1u, 5759u, 5760u, 5761u, 230413u})
+        {
+            auto in      = device.create_buffer<int>(count);
+            auto unique  = device.create_buffer<int>(count);
+            auto lengths = device.create_buffer<uint>(count);
+            auto runs    = device.create_buffer<uint>(1u);
+            auto temp    = device.create_buffer<uint>(
+                bytes_to_uint_count(DeviceRunLengthEncode<>::GetTempStorageBytes(count)));
+            luisa::vector<uint> poison(temp.size(), 99u);
+            for(uint run_length : {1u, 17u, 18001u, count})
+            {
+                luisa::vector<int>  input(count);
+                luisa::vector<int>  expected;
+                luisa::vector<uint> expected_lengths;
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i] = static_cast<int>(i / run_length);
+                    if(i % run_length == 0u)
+                    {
+                        expected.emplace_back(input[i]);
+                        expected_lengths.emplace_back(0u);
+                    }
+                    ++expected_lengths.back();
+                }
+                CommandList commands;
+                run_length_encode.Encode(
+                    commands, temp.view(), in.view(), unique.view(), lengths.view(), runs.view(), count);
+                stream << temp.copy_from(luisa::span{poison}) << in.copy_from(luisa::span{input})
+                       << commands.commit();
+                luisa::vector<int>  values(count);
+                luisa::vector<uint> result_lengths(count);
+                uint                run_count = 0u;
+                stream << unique.copy_to(luisa::span{values})
+                       << lengths.copy_to(luisa::span{result_lengths})
+                       << runs.copy_to(luisa::span{&run_count, 1u}) << synchronize();
+                expect(run_count == expected.size());
+                values.resize(expected.size());
+                result_lengths.resize(expected_lengths.size());
+                expect(values == expected);
+                expect(result_lengths == expected_lengths);
+            }
+        }
+    };
+
     "device_run_length_encode_matches_cub_examples"_test = [&]
     {
         std::array<int, 8u> input{0, 2, 2, 9, 5, 5, 5, 8};

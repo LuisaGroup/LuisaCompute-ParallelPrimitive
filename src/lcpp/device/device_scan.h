@@ -334,6 +334,28 @@ class DeviceScan : public LuisaModule
             Type4Byte(0));
     }
 
+    template <NumericT InputT, typename TransformOp>
+    void ExclusiveSumTransform(CommandList&          cmdlist,
+                               BufferView<uint>      temp_storage,
+                               BufferView<InputT>    d_in,
+                               BufferView<uint>      d_out,
+                               size_t                num_items,
+                               TransformOp           transform)
+    {
+        dispatch_scan_transform(cmdlist, temp_storage, d_in, d_out, num_items, transform);
+    }
+
+    template <NumericT InputT, typename EqualityOp>
+    void ExclusiveSumAdjacent(CommandList&          cmdlist,
+                              BufferView<uint>      temp_storage,
+                              BufferView<InputT>    d_in,
+                              BufferView<uint>      d_out,
+                              size_t                num_items,
+                              EqualityOp            equality)
+    {
+        dispatch_scan_adjacent(cmdlist, temp_storage, d_in, d_out, num_items, equality);
+    }
+
     template <NumericT Type4Byte>
     void InclusiveSum(CommandList&          cmdlist,
                       BufferView<uint>      temp_storage,
@@ -525,6 +547,177 @@ class DeviceScan : public LuisaModule
 
 
   private:
+    template <NumericT InputT, typename TransformOp>
+    void dispatch_scan_transform(CommandList&       cmdlist,
+                                 BufferView<uint>   temp_storage,
+                                 BufferView<InputT> d_in,
+                                 BufferView<uint>   d_out,
+                                 size_t             num_items,
+                                 TransformOp        transform)
+    {
+        static_assert(sizeof(InputT) == sizeof(uint), "ExclusiveSumTransform requires 4-byte input values.");
+        LUISA_ASSERT(m_created, "DeviceScan::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(), "Too many items for DeviceScan.");
+        if(num_items == 0u)
+        {
+            return;
+        }
+        LUISA_ASSERT(d_in.size() >= num_items, "DeviceScan transform input view is too small.");
+        LUISA_ASSERT(d_out.size() >= num_items, "DeviceScan transform output view is too small.");
+        LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(scan_temp_storage_bytes<uint>(num_items, m_block_size)),
+                     "DeviceScan transform temporary storage is too small.");
+        if(use_packed_tile_state<uint>())
+        {
+            auto views = packed_scan_temp_views(temp_storage, num_items, m_block_size);
+            lcpp_check(scan_array_transform_packed(cmdlist, views.tile_state, d_in, d_out, num_items, transform),
+                       cmdlist,
+                       debug_stream());
+        }
+        else
+        {
+            auto views = scan_temp_views<uint>(temp_storage, num_items, m_block_size);
+            lcpp_check(scan_array_transform(cmdlist,
+                                            views.tile_status,
+                                            views.tile_partial,
+                                            views.tile_inclusive,
+                                            d_in,
+                                            d_out,
+                                            num_items,
+                                            transform),
+                       cmdlist,
+                       debug_stream());
+        }
+    }
+
+    template <NumericT InputT, typename EqualityOp>
+    [[nodiscard]] int scan_array_adjacent(CommandList&       cmdlist,
+                                          BufferView<uint>   tile_states,
+                                          BufferView<uint>   tile_partial,
+                                          BufferView<uint>   tile_inclusive,
+                                          BufferView<InputT> d_in,
+                                          BufferView<uint>   d_out,
+                                          size_t             num_items,
+                                          EqualityOp          equality)
+    {
+        uint num_tiles = static_cast<uint>(num_tiles_for(num_items, m_block_size));
+        using ScanShader = details::ScanModule<uint,
+                                               BLOCK_SIZE,
+                                               ITEMS_PER_THREAD,
+                                               LOAD_ALGORITHM,
+                                               STORE_ALGORITHM,
+                                               WARP_SYNC>;
+        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_it  = ms_scan_key.find(init_key);
+        if(init_it == ms_scan_key.end())
+        {
+            auto shader = ScanShader().compile_scan_tile_state_init(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_scan_key.try_emplace(init_key, std::move(shader));
+            init_it = ms_scan_key.find(init_key);
+        }
+        auto init_shader = reinterpret_cast<typename ScanShader::ScanTileStateInitKernel*>(&(*init_it->second));
+        if(!init_shader)
+        {
+            return -1;
+        }
+        size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
+        cmdlist << (*init_shader)(tile_states, tile_partial, tile_inclusive, num_tiles)
+                       .dispatch(m_block_size * init_num_blocks);
+
+        auto key = luisa::format("adjacent+{}+{}",
+                                 luisa::compute::Type::of<InputT>()->description(),
+                                 equality.function().hash());
+        auto it = ms_exclusive_scan_transform_map.find(key);
+        if(it == ms_exclusive_scan_transform_map.end())
+        {
+            auto shader = ScanShader().template compile_adjacent_transform<InputT>(m_device, m_shared_mem_size, equality);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_exclusive_scan_transform_map.try_emplace(key, std::move(shader));
+            it = ms_exclusive_scan_transform_map.find(key);
+        }
+        auto scan_shader = reinterpret_cast<typename ScanShader::template TransformScanKernel<InputT>*>(&(*it->second));
+        if(!scan_shader)
+        {
+            return -1;
+        }
+        cmdlist << (*scan_shader)(tile_states,
+                                  tile_partial,
+                                  tile_inclusive,
+                                  d_in,
+                                  d_out,
+                                  uint{0},
+                                  static_cast<uint>(num_items))
+                       .dispatch(m_block_size * num_tiles);
+        return 0;
+    }
+
+    template <NumericT InputT, typename EqualityOp>
+    [[nodiscard]] int scan_array_adjacent_packed(CommandList&       cmdlist,
+                                                 BufferView<ulong>  tile_state,
+                                                 BufferView<InputT> d_in,
+                                                 BufferView<uint>   d_out,
+                                                 size_t             num_items,
+                                                 EqualityOp          equality)
+    {
+        uint num_tiles = static_cast<uint>(num_tiles_for(num_items, m_block_size));
+        using ScanShader = details::ScanModule<uint,
+                                               BLOCK_SIZE,
+                                               ITEMS_PER_THREAD,
+                                               LOAD_ALGORITHM,
+                                               STORE_ALGORITHM,
+                                               WARP_SYNC>;
+        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_it  = ms_packed_scan_key.find(init_key);
+        if(init_it == ms_packed_scan_key.end())
+        {
+            auto shader = ScanShader().compile_packed_scan_tile_state_init(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_packed_scan_key.try_emplace(init_key, std::move(shader));
+            init_it = ms_packed_scan_key.find(init_key);
+        }
+        auto init_shader = reinterpret_cast<typename ScanShader::PackedScanTileStateInitKernel*>(&(*init_it->second));
+        if(!init_shader)
+        {
+            return -1;
+        }
+        size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
+        cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
+
+        auto key = luisa::format("adjacent+{}+{}",
+                                 luisa::compute::Type::of<InputT>()->description(),
+                                 equality.function().hash());
+        auto it = ms_packed_exclusive_scan_transform_map.find(key);
+        if(it == ms_packed_exclusive_scan_transform_map.end())
+        {
+            auto shader = ScanShader().template compile_packed_adjacent_transform<InputT>(m_device,
+                                                                                           m_shared_mem_size,
+                                                                                           equality);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_packed_exclusive_scan_transform_map.try_emplace(key, std::move(shader));
+            it = ms_packed_exclusive_scan_transform_map.find(key);
+        }
+        auto scan_shader = reinterpret_cast<typename ScanShader::template PackedTransformScanKernel<InputT>*>(&(*it->second));
+        if(!scan_shader)
+        {
+            return -1;
+        }
+        cmdlist << (*scan_shader)(tile_state, d_in, d_out, uint{0}, static_cast<uint>(num_items))
+                       .dispatch(m_block_size * num_tiles);
+        return 0;
+    }
+
     template <bool is_inclusive, bool use_initial_value, NumericT Type4Byte, typename ScanOp>
     void dispatch_scan(CommandList&          cmdlist,
                        BufferView<uint>      temp_storage,
@@ -582,6 +775,48 @@ class DeviceScan : public LuisaModule
         }
     }
 
+    template <NumericT InputT, typename EqualityOp>
+    void dispatch_scan_adjacent(CommandList&       cmdlist,
+                                BufferView<uint>   temp_storage,
+                                BufferView<InputT> d_in,
+                                BufferView<uint>   d_out,
+                                size_t             num_items,
+                                EqualityOp          equality)
+    {
+        static_assert(sizeof(InputT) == sizeof(uint), "ExclusiveSumAdjacent requires 4-byte input values.");
+        LUISA_ASSERT(m_created, "DeviceScan::create must be called before dispatch.");
+        LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(), "Too many items for DeviceScan.");
+        if(num_items == 0u)
+        {
+            return;
+        }
+        LUISA_ASSERT(d_in.size() >= num_items, "DeviceScan adjacent input view is too small.");
+        LUISA_ASSERT(d_out.size() >= num_items, "DeviceScan adjacent output view is too small.");
+        LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(scan_temp_storage_bytes<uint>(num_items, m_block_size)),
+                     "DeviceScan adjacent temporary storage is too small.");
+        if(use_packed_tile_state<uint>())
+        {
+            auto views = packed_scan_temp_views(temp_storage, num_items, m_block_size);
+            lcpp_check(scan_array_adjacent_packed(cmdlist, views.tile_state, d_in, d_out, num_items, equality),
+                       cmdlist,
+                       debug_stream());
+        }
+        else
+        {
+            auto views = scan_temp_views<uint>(temp_storage, num_items, m_block_size);
+            lcpp_check(scan_array_adjacent(cmdlist,
+                                           views.tile_status,
+                                           views.tile_partial,
+                                           views.tile_inclusive,
+                                           d_in,
+                                           d_out,
+                                           num_items,
+                                           equality),
+                       cmdlist,
+                       debug_stream());
+        }
+    }
+
     template <bool is_inclusive, bool use_initial_value, NumericT KeyType, NumericT ValueType, typename ScanOp, typename EqualityOp>
     void dispatch_scan_by_key(CommandList&          cmdlist,
                               BufferView<uint>      temp_storage,
@@ -613,6 +848,133 @@ class DeviceScan : public LuisaModule
                                                                                            equality_op)),
                    cmdlist,
                    debug_stream());
+    }
+
+    template <NumericT InputT, typename TransformOp>
+    [[nodiscard]] int scan_array_transform(CommandList&       cmdlist,
+                                           BufferView<uint>   tile_states,
+                                           BufferView<uint>   tile_partial,
+                                           BufferView<uint>   tile_inclusive,
+                                           BufferView<InputT> d_in,
+                                           BufferView<uint>   d_out,
+                                           size_t             num_items,
+                                           TransformOp        transform)
+    {
+        uint num_tiles = static_cast<uint>(num_tiles_for(num_items, m_block_size));
+        using ScanShader = details::ScanModule<uint,
+                                               BLOCK_SIZE,
+                                               ITEMS_PER_THREAD,
+                                               LOAD_ALGORITHM,
+                                               STORE_ALGORITHM,
+                                               WARP_SYNC>;
+        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_it  = ms_scan_key.find(init_key);
+        if(init_it == ms_scan_key.end())
+        {
+            auto shader = ScanShader().compile_scan_tile_state_init(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_scan_key.try_emplace(init_key, std::move(shader));
+            init_it = ms_scan_key.find(init_key);
+        }
+        auto init_shader = reinterpret_cast<typename ScanShader::ScanTileStateInitKernel*>(&(*init_it->second));
+        if(!init_shader)
+        {
+            return -1;
+        }
+        size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
+        cmdlist << (*init_shader)(tile_states, tile_partial, tile_inclusive, num_tiles)
+                       .dispatch(m_block_size * init_num_blocks);
+
+        auto key = luisa::format("transform+{}+{}",
+                                 luisa::compute::Type::of<InputT>()->description(),
+                                 transform.function().hash());
+        auto it = ms_exclusive_scan_transform_map.find(key);
+        if(it == ms_exclusive_scan_transform_map.end())
+        {
+            auto shader = ScanShader().template compile_transform<InputT>(m_device, m_shared_mem_size, transform);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_exclusive_scan_transform_map.try_emplace(key, std::move(shader));
+            it = ms_exclusive_scan_transform_map.find(key);
+        }
+        auto scan_shader = reinterpret_cast<typename ScanShader::template TransformScanKernel<InputT>*>(&(*it->second));
+        if(!scan_shader)
+        {
+            return -1;
+        }
+        cmdlist << (*scan_shader)(tile_states,
+                                  tile_partial,
+                                  tile_inclusive,
+                                  d_in,
+                                  d_out,
+                                  uint{0},
+                                  static_cast<uint>(num_items))
+                       .dispatch(m_block_size * num_tiles);
+        return 0;
+    }
+
+    template <NumericT InputT, typename TransformOp>
+    [[nodiscard]] int scan_array_transform_packed(CommandList&       cmdlist,
+                                                  BufferView<ulong>  tile_state,
+                                                  BufferView<InputT> d_in,
+                                                  BufferView<uint>   d_out,
+                                                  size_t             num_items,
+                                                  TransformOp        transform)
+    {
+        uint num_tiles = static_cast<uint>(num_tiles_for(num_items, m_block_size));
+        using ScanShader = details::ScanModule<uint,
+                                               BLOCK_SIZE,
+                                               ITEMS_PER_THREAD,
+                                               LOAD_ALGORITHM,
+                                               STORE_ALGORITHM,
+                                               WARP_SYNC>;
+        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_it  = ms_packed_scan_key.find(init_key);
+        if(init_it == ms_packed_scan_key.end())
+        {
+            auto shader = ScanShader().compile_packed_scan_tile_state_init(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_packed_scan_key.try_emplace(init_key, std::move(shader));
+            init_it = ms_packed_scan_key.find(init_key);
+        }
+        auto init_shader = reinterpret_cast<typename ScanShader::PackedScanTileStateInitKernel*>(&(*init_it->second));
+        if(!init_shader)
+        {
+            return -1;
+        }
+        size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
+        cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
+
+        auto key = luisa::format("transform+{}+{}",
+                                 luisa::compute::Type::of<InputT>()->description(),
+                                 transform.function().hash());
+        auto it = ms_packed_exclusive_scan_transform_map.find(key);
+        if(it == ms_packed_exclusive_scan_transform_map.end())
+        {
+            auto shader = ScanShader().template compile_packed_transform<InputT>(m_device, m_shared_mem_size, transform);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_packed_exclusive_scan_transform_map.try_emplace(key, std::move(shader));
+            it = ms_packed_exclusive_scan_transform_map.find(key);
+        }
+        auto scan_shader = reinterpret_cast<typename ScanShader::template PackedTransformScanKernel<InputT>*>(&(*it->second));
+        if(!scan_shader)
+        {
+            return -1;
+        }
+        cmdlist << (*scan_shader)(tile_state, d_in, d_out, uint{0}, static_cast<uint>(num_items))
+                       .dispatch(m_block_size * num_tiles);
+        return 0;
     }
 
     template <bool is_inclusive, bool use_initial_value, NumericT Type4Byte, typename ScanOp>
@@ -861,10 +1223,12 @@ class DeviceScan : public LuisaModule
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_key;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_map;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_inclusive_scan_map;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_transform_map;
 
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_scan_key;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_exclusive_scan_map;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_inclusive_scan_map;
+    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_exclusive_scan_transform_map;
 
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_by_key_tile_state_init_map;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_by_key_map;

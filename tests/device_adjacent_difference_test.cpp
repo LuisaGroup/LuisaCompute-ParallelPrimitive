@@ -38,6 +38,41 @@ int main(int argc, char* argv[])
     DeviceAdjacentDifference<> adjacent_difference;
     adjacent_difference.create(device);
 
+    "device_adjacent_difference_tiled_tail_preserves_endpoints"_test = [&]
+    {
+        for(uint count : {8196u, 100003u})
+        {
+            luisa::vector<int> input(count);
+            for(uint i = 0u; i < count; ++i)
+            {
+                input[i] = static_cast<int>(i * 3u);
+            }
+            auto        in    = device.create_buffer<int>(count);
+            auto        left  = device.create_buffer<int>(count);
+            auto        right = device.create_buffer<int>(count);
+            CommandList commands;
+            adjacent_difference.SubtractLeftCopy(commands, BufferView<uint>{}, in.view(), left.view(), count);
+            adjacent_difference.SubtractRightCopy(commands, BufferView<uint>{}, in.view(), right.view(), count);
+            luisa::vector<int> left_result(count);
+            luisa::vector<int> right_result(count);
+            stream << in.copy_from(luisa::span{input}) << commands.commit()
+                   << left.copy_to(luisa::span{left_result})
+                   << right.copy_to(luisa::span{right_result}) << synchronize();
+            bool left_matches  = left_result[0u] == input[0u];
+            bool right_matches = right_result[count - 1u] == input[count - 1u];
+            for(uint i = 1u; i < count; ++i)
+            {
+                left_matches = left_matches && left_result[i] == 3;
+            }
+            for(uint i = 0u; i + 1u < count; ++i)
+            {
+                right_matches = right_matches && right_result[i] == -3;
+            }
+            expect(left_matches);
+            expect(right_matches);
+        }
+    };
+
     "device_adjacent_difference_supports_all_four_entry_points"_test = [&]
     {
         constexpr uint      item_count = 5u;

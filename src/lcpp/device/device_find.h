@@ -66,23 +66,57 @@ class DeviceFind : public LuisaModule
         }
         LUISA_ASSERT(input.size() >= num_items, "DeviceFind input view is too small.");
 
-        using FindIfShader = Shader<1, Buffer<T>, Buffer<uint>>;
-        auto key =
-            luisa::format("device_find_if+{}+{}", Type::of<T>()->description(), get_unary_op_hash<T>(predicate));
+        using FindIfShader = Shader<1, Buffer<T>, Buffer<uint>, uint>;
+        Callable callable  = [predicate](Var<T> value) noexcept { return predicate(value); };
+        bool     reduce_warp =
+            m_device.backend_name() == "cuda" && details::can_batch_callable(callable.function());
+        size_t items_per_thread = reduce_warp ? 16u : 1u;
+        auto   key              = luisa::format("device_find_if_tiled+{}+{}+{}",
+                                 Type::of<T>()->description(),
+                                 callable.function().hash(),
+                                 items_per_thread);
         auto shader_it = m_find_if_shaders.find(key);
         if(shader_it == m_find_if_shaders.end())
         {
             U<FindIfShader> shader = nullptr;
             lazy_compile(m_device,
                          shader,
-                         [predicate](BufferVar<T> input_buffer, BufferVar<uint> output_buffer) noexcept
+                         [predicate, items_per_thread, reduce_warp](BufferVar<T>    input_buffer,
+                                                                    BufferVar<uint> output_buffer,
+                                                                    UInt num_elements) noexcept
                          {
                              set_block_size(BLOCK_SIZE);
-                             UInt index = dispatch_id().x;
-                             $if(predicate(input_buffer.read(index)))
+                             UInt tile_start = block_id().x * UInt(BLOCK_SIZE * items_per_thread);
+                             UInt valid_items =
+                                 min(UInt(BLOCK_SIZE * items_per_thread), num_elements - tile_start);
+                             UInt candidate = num_elements;
+                             for(size_t item = 0u; item < items_per_thread; ++item)
                              {
-                                 output_buffer.atomic(0u).fetch_min(index);
-                             };
+                                 UInt local = thread_id().x + UInt(item * BLOCK_SIZE);
+                                 $if(local < valid_items)
+                                 {
+                                     UInt index = tile_start + local;
+                                     $if(predicate(input_buffer.read(index)))
+                                     {
+                                         candidate = min(candidate, index);
+                                     };
+                                 };
+                             }
+                             if(reduce_warp)
+                             {
+                                 candidate = warp_active_min(candidate);
+                                 $if(warp_lane_id() == 0u & candidate < num_elements)
+                                 {
+                                     output_buffer.atomic(0u).fetch_min(candidate);
+                                 };
+                             }
+                             else
+                             {
+                                 $if(candidate < num_elements)
+                                 {
+                                     output_buffer.atomic(0u).fetch_min(candidate);
+                                 };
+                             }
                          });
             m_find_if_shaders.try_emplace(key, std::move(shader));
             shader_it = m_find_if_shaders.find(key);
@@ -90,7 +124,10 @@ class DeviceFind : public LuisaModule
 
         auto shader = reinterpret_cast<FindIfShader*>(&(*shader_it->second));
         LUISA_ASSERT(shader != nullptr, "Failed to compile DeviceFind::FindIf shader.");
-        cmdlist << (*shader)(input, output).dispatch(num_items);
+        size_t threads = items_per_thread == 1u ?
+                             num_items :
+                             ceil_div(num_items, BLOCK_SIZE * items_per_thread) * BLOCK_SIZE;
+        cmdlist << (*shader)(input, output, static_cast<uint>(num_items)).dispatch(threads);
     }
 
     template <typename RangeT, typename ValueT, typename Compare>

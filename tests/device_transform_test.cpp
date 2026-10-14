@@ -40,6 +40,51 @@ int main(int argc, char* argv[])
     DeviceTransform<> transform;
     transform.create(device);
 
+    "device_transform_tiled_tail_and_builtin_index_semantics"_test = [&]
+    {
+        for(uint count : {8196u, 100003u})
+        {
+            luisa::vector<int> input(count);
+            for(uint i = 0u; i < count; ++i)
+            {
+                input[i] = static_cast<int>(i);
+            }
+            auto in          = device.create_buffer<int>(count);
+            auto out         = device.create_buffer<int>(count);
+            auto indexed_out = device.create_buffer<int>(count);
+            auto prefix_out  = device.create_buffer<int>(count);
+            auto twice       = [](const Int& value) noexcept { return value * 2; };
+            auto indexed     = [](const Int& value) noexcept
+            { return value + cast<int>(dispatch_id().x) + cast<int>(dispatch_size().x); };
+            auto warp_prefix = [](const Int& value) noexcept { return warp_prefix_sum(value); };
+            CommandList commands;
+            transform.Transform(commands, BufferView<uint>{}, in.view(), out.view(), count, twice);
+            transform.Transform(commands, BufferView<uint>{}, in.view(), indexed_out.view(), count, indexed);
+            transform.Transform(commands, BufferView<uint>{}, in.view(), prefix_out.view(), count, warp_prefix);
+            luisa::vector<int> result(count);
+            luisa::vector<int> indexed_result(count);
+            luisa::vector<int> prefix_result(count);
+            stream << in.copy_from(luisa::span{input}) << commands.commit()
+                   << out.copy_to(luisa::span{result}) << indexed_out.copy_to(luisa::span{indexed_result})
+                   << prefix_out.copy_to(luisa::span{prefix_result}) << synchronize();
+            bool matches         = true;
+            bool indexed_matches = true;
+            bool prefix_matches  = true;
+            for(uint i = 0u; i < count; ++i)
+            {
+                matches = matches && result[i] == input[i] * 2;
+                indexed_matches =
+                    indexed_matches && indexed_result[i] == input[i] * 2 + static_cast<int>(count);
+                uint lane = i % 32u;
+                uint expected_prefix = lane * (i - lane) + (lane == 0u ? 0u : lane * (lane - 1u) / 2u);
+                prefix_matches = prefix_matches && prefix_result[i] == static_cast<int>(expected_prefix);
+            }
+            expect(matches);
+            expect(indexed_matches);
+            expect(prefix_matches);
+        }
+    };
+
     "device_transform_fill_and_generate"_test = [&]
     {
         constexpr size_t item_count = 8u;

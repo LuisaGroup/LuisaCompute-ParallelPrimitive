@@ -93,6 +93,37 @@ int main(int argc, char* argv[])
         expect(DeviceHistogram<>::GetTempStorageBytes(even_samples.size(), 5u) == 0u);
     };
 
+    "device_histogram_contiguous_256_bin_fast_path_handles_tail"_test = [&]
+    {
+        luisa::vector<int> samples(513u);
+        for(size_t i = 0u; i < samples.size(); ++i)
+        {
+            samples[i] = static_cast<int>(i & 255u);
+        }
+        auto input  = device.create_buffer<int>(samples.size());
+        auto output = device.create_buffer<uint>(256u);
+        std::array<uint, 256u> initial_counts{};
+
+        CommandList commands;
+        histogram.HistogramEven(commands,
+                                temp_storage.view(),
+                                input.view(),
+                                output.view(),
+                                257u,
+                                0,
+                                256,
+                                samples.size());
+        stream << input.copy_from(luisa::span{samples}) << output.copy_from(luisa::span{initial_counts})
+               << commands.commit();
+
+        std::array<uint, 256u> counts{};
+        stream << output.copy_to(luisa::span{counts}) << synchronize();
+        for(size_t bin = 0u; bin < counts.size(); ++bin)
+        {
+            expect(counts[bin] == (bin == 0u ? 3u : 2u));
+        }
+    };
+
     "device_histogram_computes_independent_active_channels"_test = [&]
     {
         constexpr uint num_channels        = 3u;

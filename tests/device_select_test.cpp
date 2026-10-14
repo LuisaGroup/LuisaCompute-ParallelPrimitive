@@ -4,6 +4,7 @@
 #include <lcpp/parallel_primitive.h>
 
 #include <array>
+#include <algorithm>
 #include <boost/ut.hpp>
 #include <luisa/runtime/context.h>
 #include <luisa/runtime/stream.h>
@@ -37,6 +38,218 @@ int main(int argc, char* argv[])
 
     DeviceSelect<> selector;
     selector.create(device);
+
+    "deviceselect_if_preserves_pointwise_predicates"_test = [&]
+    {
+        auto check_predicates = [&]<typename T>(T)
+        {
+            for(uint count : {1u, 33u, 4099u})
+            {
+                luisa::vector<T> input(count);
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i] = static_cast<T>(i);
+                }
+                auto in       = device.create_buffer<T>(count);
+                auto out      = device.create_buffer<T>(count);
+                auto selected = device.create_buffer<uint>(1u);
+                auto calls    = device.create_buffer<uint>(count);
+                auto temp = device.create_buffer<uint>(
+                    bytes_to_uint_count(DeviceSelect<>::GetTempStorageBytes(count)));
+                Callable<bool(T)> indexed = [count](Var<T> value) noexcept
+                {
+                    return (cast<uint>(value) == dispatch_id().x)
+                           & (dispatch_size().x == count) & (dispatch_id().x % 3u == 0u);
+                };
+                Callable<bool(T)> collective = [](Var<T> value) noexcept
+                { return warp_prefix_sum(cast<uint>(value)) % 7u == 0u; };
+                Callable<bool(T)> atomic = [&calls](Var<T> value) noexcept
+                {
+                    UInt index    = cast<uint>(value);
+                    UInt previous = calls->atomic(index).fetch_add(1u);
+                    return (previous == 0u) & (index % 3u == 1u);
+                };
+                stream << in.copy_from(luisa::span{input});
+                for(uint mode = 0u; mode < 3u; ++mode)
+                {
+                    luisa::vector<T> expected;
+                    for(uint i = 0u; i < count; ++i)
+                    {
+                        uint lane = i % 32u;
+                        uint prefix = lane * (i - lane)
+                                      + (lane == 0u ? 0u : lane * (lane - 1u) / 2u);
+                        bool keep = mode == 1u ? prefix % 7u == 0u :
+                                                i % 3u == (mode == 0u ? 0u : 1u);
+                        if(keep)
+                        {
+                            expected.emplace_back(input[i]);
+                        }
+                    }
+                    const auto& predicate = mode == 0u ? indexed : mode == 1u ? collective : atomic;
+                    CommandList commands;
+                    selector.If(commands, temp.view(), in.view(), out.view(), selected.view(), count, predicate);
+                    luisa::vector<T> result(count, static_cast<T>(-1));
+                    luisa::vector<uint> call_counts(count, 0u);
+                    uint size = 99u;
+                    stream << out.copy_from(luisa::span{result})
+                           << calls.copy_from(luisa::span{call_counts}) << commands.commit()
+                           << out.copy_to(luisa::span{result})
+                           << selected.copy_to(luisa::span{&size, 1u})
+                           << calls.copy_to(luisa::span{call_counts}) << synchronize();
+                    expect(size == expected.size());
+                    result.resize(expected.size());
+                    expect(result == expected);
+                    if(mode == 2u)
+                    {
+                        expect(std::all_of(call_counts.begin(), call_counts.end(),
+                                           [](uint calls) { return calls == 1u; }));
+                    }
+                }
+            }
+        };
+        check_predicates(int{});
+        check_predicates(luisa::ulong{});
+    };
+
+    "deviceselect_preserves_wide_values_and_boolean_flags"_test = [&]
+    {
+        constexpr uint                  count = 17u;
+        std::array<luisa::ulong, count> values{};
+        std::array<bool, count>         flags{};
+        luisa::vector<luisa::ulong>     expected_flagged, expected_if, expected_unique;
+        for(uint i = 0u; i < count; ++i)
+        {
+            values[i] = luisa::ulong{1} << 40u | luisa::ulong(i / 3u);
+            flags[i]  = i % 3u == 1u;
+            if(flags[i])
+            {
+                expected_flagged.emplace_back(values[i]);
+            }
+            if(values[i] % 2u == 0u)
+            {
+                expected_if.emplace_back(values[i]);
+            }
+            if(i % 3u == 0u)
+            {
+                expected_unique.emplace_back(values[i]);
+            }
+        }
+        auto in       = device.create_buffer<luisa::ulong>(count);
+        auto flag     = device.create_buffer<bool>(count);
+        auto out      = device.create_buffer<luisa::ulong>(count);
+        auto selected = device.create_buffer<uint>(1u);
+        auto temp =
+            device.create_buffer<uint>(bytes_to_uint_count(DeviceSelect<>::GetTempStorageBytes(count)));
+        Callable<bool(luisa::ulong)> even = [](Var<luisa::ulong> value) noexcept
+        { return value % luisa::ulong{2} == luisa::ulong{0}; };
+        stream << in.copy_from(luisa::span{values}) << flag.copy_from(luisa::span{flags});
+        for(uint mode = 0u; mode < 3u; ++mode)
+        {
+            CommandList commands;
+            if(mode == 0u)
+            {
+                selector.Flagged(commands, temp.view(), in.view(), flag.view(), out.view(), selected.view(), count);
+            }
+            else if(mode == 1u)
+            {
+                selector.If(commands, temp.view(), in.view(), out.view(), selected.view(), count, even);
+            }
+            else
+            {
+                selector.Unique(commands, temp.view(), in.view(), out.view(), selected.view(), count);
+            }
+            luisa::vector<luisa::ulong> result(count);
+            uint                        size = 0u;
+            stream << commands.commit() << out.copy_to(luisa::span{result})
+                   << selected.copy_to(luisa::span{&size, 1u}) << synchronize();
+            const auto& expected = mode == 0u ? expected_flagged :
+                                   mode == 1u ? expected_if :
+                                                expected_unique;
+            expect(size == expected.size());
+            result.resize(expected.size());
+            expect(result == expected);
+        }
+    };
+
+    "deviceselect_fused_multitile_tails_and_empty_tiles"_test = [&]
+    {
+        for(uint count : {1u, 5759u, 5760u, 5761u, 230413u})
+        {
+            luisa::vector<int>  input(count + 3u);
+            luisa::vector<uint> flags(count);
+            auto                input_buffer  = device.create_buffer<int>(input.size());
+            auto                flag_buffer   = device.create_buffer<uint>(count);
+            auto                output_buffer = device.create_buffer<int>(count + 2u);
+            auto                count_buffer  = device.create_buffer<uint>(2u);
+            auto                bytes         = DeviceSelect<>::GetTempStorageBytes(count);
+            auto scratch = device.create_buffer<uint>(bytes_to_uint_count(bytes) + 64u);
+            auto temp    = scratch.view().subview(64u, bytes_to_uint_count(bytes));
+            luisa::vector<uint> poison(scratch.size(), 99u);
+            for(uint pattern = 0u; pattern < 4u; ++pattern)
+            {
+                luisa::vector<int> expected;
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i + 3u] = static_cast<int>(i);
+                    flags[i]      = pattern == 0u ? 0u :
+                                    pattern == 1u ? 1u :
+                                    pattern == 2u ? i % 3u :
+                                                    uint(i < 11u || i > 200000u);
+                    if(flags[i] != 0u)
+                    {
+                        expected.emplace_back(input[i + 3u]);
+                    }
+                }
+                CommandList commands;
+                selector.Flagged(commands,
+                                 temp,
+                                 input_buffer.view().subview(3u, count),
+                                 flag_buffer.view(),
+                                 output_buffer.view().subview(2u, count),
+                                 count_buffer.view().subview(1u, 1u),
+                                 count);
+                stream << scratch.copy_from(luisa::span{poison})
+                       << input_buffer.copy_from(luisa::span{input})
+                       << flag_buffer.copy_from(luisa::span{flags}) << commands.commit();
+                luisa::vector<int> result(count + 2u);
+                uint               selected = 0u;
+                stream << output_buffer.copy_to(luisa::span{result})
+                       << count_buffer.view().subview(1u, 1u).copy_to(luisa::span{&selected, 1u})
+                       << synchronize();
+                expect(selected == expected.size());
+                expect(std::equal(expected.begin(), expected.end(), result.begin() + 2u));
+            }
+
+            for(uint run_length : {1u, 17u, 18001u, count})
+            {
+                luisa::vector<int> expected;
+                for(uint i = 0u; i < count; ++i)
+                {
+                    input[i + 3u] = static_cast<int>(i / run_length);
+                    if(i % run_length == 0u)
+                    {
+                        expected.emplace_back(input[i + 3u]);
+                    }
+                }
+                CommandList commands;
+                selector.Unique(commands,
+                                temp,
+                                input_buffer.view().subview(3u, count),
+                                output_buffer.view().subview(2u, count),
+                                count_buffer.view().subview(1u, 1u),
+                                count);
+                stream << scratch.copy_from(luisa::span{poison})
+                       << input_buffer.copy_from(luisa::span{input}) << commands.commit();
+                luisa::vector<int> result(count + 2u);
+                uint               selected = 0u;
+                stream << output_buffer.copy_to(luisa::span{result})
+                       << count_buffer.view().subview(1u, 1u).copy_to(luisa::span{&selected, 1u})
+                       << synchronize();
+                expect(selected == expected.size());
+                expect(std::equal(expected.begin(), expected.end(), result.begin() + 2u));
+            }
+        }
+    };
 
     "deviceselect_flagged_and_if_are_stable"_test = [&]
     {

@@ -9,6 +9,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <lcpp/common/utils.h>
 #include <lcpp/runtime/core.h>
 #include <luisa/dsl/sugar.h>
 
@@ -280,24 +281,57 @@ class DeviceTransform : public LuisaModule
     {
         Callable callable = [transform_op](Var<InputT>... values) noexcept
         { return transform_op(values...); };
-        using TransformShader = Shader<1, Buffer<OutputT>, Buffer<InputT>...>;
-        auto key              = luisa::format("{}+{}",
+        // Builtin indices keep their one-element-per-thread semantics.
+        size_t items_per_thread =
+            m_device.backend_name() == "cuda" && details::can_batch_callable(callable.function()) ? 16u : 1u;
+        if constexpr(sizeof(OutputT) == 4u && luisa::is_scalar_v<OutputT>
+                     && ((sizeof(InputT) == 4u && luisa::is_scalar_v<InputT>) && ...))
+        {
+            bool aligned =
+                output.offset_bytes() % 16u == 0u && output.stride() == sizeof(OutputT)
+                && std::apply(
+                    [](auto... views) {
+                        return ((views.offset_bytes() % 16u == 0u && views.stride() == sizeof(InputT)) && ...);
+                    },
+                    inputs);
+            if(items_per_thread > 1u && num_items % 4u == 0u && aligned)
+            {
+                dispatch_vector_transform(
+                    cmdlist, inputs, output, num_items, transform_op, callable.function().hash());
+                return;
+            }
+        }
+        using TransformShader = Shader<1, uint, Buffer<OutputT>, Buffer<InputT>...>;
+        auto key              = luisa::format("{}+{}+{}",
                                  type_sequence_key<OutputT, InputT...>("device_transform"),
-                                 callable.function().hash());
+                                 callable.function().hash(),
+                                 items_per_thread);
         auto shader_it        = m_transform_shaders.find(key);
         if(shader_it == m_transform_shaders.end())
         {
             U<TransformShader> shader = nullptr;
             lazy_compile(m_device,
                          shader,
-                         [transform_op](BufferVar<OutputT> output_buffer, BufferVar<InputT>... input_buffers) noexcept
+                         [transform_op, items_per_thread](UInt               num_elements,
+                                                          BufferVar<OutputT> output_buffer,
+                                                          BufferVar<InputT>... input_buffers) noexcept
                          {
                              set_block_size(BLOCK_SIZE);
-                             UInt index = dispatch_id().x;
-                             auto input_values =
-                                 std::tuple<Var<InputT>...>{Var<InputT>{input_buffers.read(index)}...};
-                             auto result = std::apply(transform_op, input_values);
-                             output_buffer.write(index, assignable_value<OutputT>(result));
+                             UInt tile_start = block_id().x * UInt(BLOCK_SIZE * items_per_thread);
+                             UInt valid_items =
+                                 min(UInt(BLOCK_SIZE * items_per_thread), num_elements - tile_start);
+                             for(size_t item = 0u; item < items_per_thread; ++item)
+                             {
+                                 UInt local = thread_id().x + UInt(item * BLOCK_SIZE);
+                                 $if(local < valid_items)
+                                 {
+                                     UInt index        = tile_start + local;
+                                     auto input_values = std::tuple<Var<InputT>...>{
+                                         Var<InputT>{input_buffers.read(index)}...};
+                                     auto result = std::apply(transform_op, input_values);
+                                     output_buffer.write(index, assignable_value<OutputT>(result));
+                                 };
+                             }
                          });
             m_transform_shaders.try_emplace(key, std::move(shader));
             shader_it = m_transform_shaders.find(key);
@@ -305,9 +339,79 @@ class DeviceTransform : public LuisaModule
 
         auto shader = reinterpret_cast<TransformShader*>(&(*shader_it->second));
         LUISA_ASSERT(shader != nullptr, "Failed to compile DeviceTransform::Transform shader.");
-        std::apply([&](auto... input_views)
-                   { cmdlist << (*shader)(output, input_views...).dispatch(num_items); },
-                   inputs);
+        size_t threads = items_per_thread == 1u ?
+                             num_items :
+                             ceil_div(num_items, BLOCK_SIZE * items_per_thread) * BLOCK_SIZE;
+        std::apply(
+            [&](auto... input_views) {
+                cmdlist << (*shader)(static_cast<uint>(num_items), output, input_views...).dispatch(threads);
+            },
+            inputs);
+    }
+
+    template <typename... InputT, typename OutputT, typename TransformOp>
+    void dispatch_vector_transform(CommandList&                             cmdlist,
+                                   const std::tuple<BufferView<InputT>...>& inputs,
+                                   BufferView<OutputT>                      output,
+                                   size_t                                   num_items,
+                                   TransformOp                              transform_op,
+                                   uint64_t                                 operation_hash)
+    {
+        using OutputPacket = luisa::Vector<OutputT, 4u>;
+        using Kernel = Shader<1, uint, Buffer<OutputPacket>, Buffer<luisa::Vector<InputT, 4u>>...>;
+        auto key =
+            luisa::format("{}+{}", type_sequence_key<OutputT, InputT...>("device_transform_vector4"), operation_hash);
+        auto shader_it = m_transform_shaders.find(key);
+        if(shader_it == m_transform_shaders.end())
+        {
+            U<Kernel> shader = nullptr;
+            lazy_compile(m_device,
+                         shader,
+                         [transform_op](UInt                    packets,
+                                        BufferVar<OutputPacket> output_buffer,
+                                        BufferVar<luisa::Vector<InputT, 4u>>... input_buffers) noexcept
+                         {
+                             set_block_size(BLOCK_SIZE);
+                             UInt tile_start = block_id().x * UInt(BLOCK_SIZE * 4u);
+                             UInt valid      = min(UInt(BLOCK_SIZE * 4u), packets - tile_start);
+                             for(size_t item = 0u; item < 4u; ++item)
+                             {
+                                 UInt local = thread_id().x + UInt(item * BLOCK_SIZE);
+                                 $if(local < valid)
+                                 {
+                                     UInt index = tile_start + local;
+                                     // Materialize each packet once before evaluating its scalar components.
+                                     auto input_packets = std::tuple{
+                                         Var<luisa::Vector<InputT, 4u>>{input_buffers.read(index)}...};
+                                     Var<OutputPacket> result;
+                                     for(size_t component = 0u; component < 4u; ++component)
+                                     {
+                                         auto values = std::apply(
+                                             [component](auto&... packet) {
+                                                 return std::tuple{Var<InputT>{packet[component]}...};
+                                             },
+                                             input_packets);
+                                         auto value        = std::apply(transform_op, values);
+                                         result[component] = assignable_value<OutputT>(value);
+                                     }
+                                     output_buffer.write(index, result);
+                                 };
+                             }
+                         });
+            m_transform_shaders.try_emplace(key, std::move(shader));
+            shader_it = m_transform_shaders.find(key);
+        }
+        auto   shader  = reinterpret_cast<Kernel*>(&(*shader_it->second));
+        size_t packets = num_items / 4u;
+        std::apply(
+            [&](auto... views)
+            {
+                cmdlist << (*shader)(static_cast<uint>(packets),
+                                     output.template as<OutputPacket>(),
+                                     views.template as<luisa::Vector<InputT, 4u>>()...)
+                               .dispatch(ceil_div(packets, BLOCK_SIZE * 4u) * BLOCK_SIZE);
+            },
+            inputs);
     }
 
     template <typename... InputT, typename OutputT, typename Predicate, typename TransformOp>
