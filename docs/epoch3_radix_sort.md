@@ -156,5 +156,18 @@ Correctness / regression
   block_level_test 1025, warp_level_test 592, decoupled_look_back 2, device_reduce_test 71,
   device_scan_test 16,777,208, device_segment_reduce 86, device_radix_sort_one_sweep 66.
 
-Summary vs baseline: cuda reached CUB parity (1.80× → 1.01×); dx 1.92× → 1.58×; the vk
-outlier 8.63× → 5.83×. All backends remain bit-exact and the full 21-combo regression is green.
+  Summary vs baseline: cuda reached CUB parity (1.80× → 1.01×); dx 1.92× → 1.58×; the vk
+  outlier 8.63× → 5.83×. All backends remain bit-exact and the full 21-combo regression is green.
+
+  ## Addendum (epoch 3.5): sizeof-aware tile clamp (review fix)
+
+  Review of epoch 3 found that the new default `ITEMS_PER_THREAD = 16` breaks the
+  32 KiB DX shared floor for **8-byte keys** (a default `DeviceRadixSort<>` with
+  uint64 keys on dx would fail at shader compile time — a regression vs epoch 0's
+  default of 4). Fixed by `radix_effective_items_v<NominalItems, KeyType>`
+  (`src/lcpp/agent/policy.h`): the nominal tile is kept for `sizeof(KeyType) <= 4`
+  and scaled by `4/sizeof(KeyType)` (floor 4) for wider keys, applied consistently
+  in `GetSortPairsTempStorageBytes` and in `onesweep_radix_sort` (tile sizing +
+  histogram module). Verified by a new `ulong` default-policy test case in
+  `device_radix_sort_one_sweep` (67 asserts, green on cuda/dx/vk); uint32 timings
+  are unchanged (0.428 ms cuda).
