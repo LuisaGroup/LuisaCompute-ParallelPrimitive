@@ -43,7 +43,7 @@
 #define LCPP_RADIX_BLOCK 256u
 #endif
 #ifndef LCPP_RADIX_ITEMS
-#define LCPP_RADIX_ITEMS 4u
+#define LCPP_RADIX_ITEMS 16u
 #endif
 #ifndef LCPP_RADIX_CUB_POLICY
 #define LCPP_RADIX_CUB_POLICY true

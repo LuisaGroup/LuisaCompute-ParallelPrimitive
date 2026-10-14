@@ -34,7 +34,16 @@ namespace luisa::parallel_primitive
 {
 
 using namespace luisa::compute;
-template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+// Radix one-sweep policy default (epoch-3): BLOCK_SIZE x ITEMS_PER_THREAD tile.
+// Tuned on RTX 5060 (4M uint32 SortKeys): 256x16 is the best portable policy
+// (cuda 0.43 ms ~ CUB parity, dx 0.67 ms, vk 2.48 ms) -- larger tiles cut the
+// block count (hence the per-pass lookback chain length and the 1M-uint lookback
+// reset volume) and improve per-thread ILP. Shared bytes ~= BLOCK*ITEMS*sizeof(k)
+// + (BLOCK/32)*RADIX_DIGITS*4 + RADIX_DIGITS*4; 256x16 uint32 ~= 26 KiB, under the
+// 32 KiB DX/HLSL floor. See docs/epoch3_radix_sort.md.
+static constexpr size_t RADIX_ITEMS_PER_THREAD = 16;
+
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = RADIX_ITEMS_PER_THREAD>
 class DeviceRadixSort : public LuisaModule
 {
     enum class RadixSortAlgorithm
