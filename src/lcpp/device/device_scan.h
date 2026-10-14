@@ -30,7 +30,12 @@ namespace luisa::parallel_primitive
 {
 
 using namespace luisa::compute;
-template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+// Tuned policy for 4-byte element types (epoch 2). The scan kernel uses a
+// coalesced block-striped load/store transposed through shared memory (see
+// device/details/scan.h). 256 threads x 15 items/tile balances DRAM
+// coalescing against decoupled-look-back depth and stays within the DX 32 KiB
+// shared-memory floor: (256*15 + 256*15/32)*4 = 15840 B per block.
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = 15>
 class DeviceScan : public LuisaModule
 {
   private:

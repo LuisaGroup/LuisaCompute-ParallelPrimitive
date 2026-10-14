@@ -25,7 +25,7 @@
 #define LCPP_SCAN_BLOCK 256u
 #endif
 #ifndef LCPP_SCAN_ITEMS
-#define LCPP_SCAN_ITEMS 8u
+#define LCPP_SCAN_ITEMS 15u
 #endif
 #ifndef LCPP_SCAN_PACKED_TILE_STATE
 #define LCPP_SCAN_PACKED_TILE_STATE 1
