@@ -21,6 +21,13 @@ Measurement: cuda = CUDA events on the LC stream; dx/vk = amortized wall clock
 | DeviceReduce.Sum | vk | 0.1481¹ | 0.0362 | 4.1x¹ | 3.17x¹ → **0.78x** |
 | DeviceScan.InclusiveSum | vk | 0.3246¹ | 0.0921 | 3.5x¹ | 4.12x¹ → **1.15x** |
 | DeviceRadixSort.SortKeys | vk | 3.8178¹ | 2.4836 | 1.54x¹ | 9.02x¹ → **5.86x** |
+| DeviceReduce.Sum | vk + cuda-interop² | — | 0.0230 | — | **0.49x** |
+| DeviceScan.InclusiveSum | vk + cuda-interop² | — | (DSL path by policy) | — | **1.06x** |
+| DeviceRadixSort.SortKeys | vk + cuda-interop² | — | 0.4341 | — | **1.015x** |
+
+² epoch 6: cuda-backend-compiled kernels launched in the vk command buffer via
+`VK_NV_cuda_kernel_launch` (`LCPP_INTEROP=auto`, plan `vk_cuda_opt.md`). Throughput
+rows at `LCPP_BENCH_BATCH=100`; radix floor at batch=1: 0.8168 → 0.5509 ms (−32.6 %).
 
 ¹ epoch-0 dx/vk numbers used per-op `synchronize()` timing (~100+ µs backend
 round-trip per op); final numbers use amortized timing — see
@@ -40,22 +47,27 @@ with scan and radix ~2.4x / ~1.8x faster than at epoch 0.**
 | 3 | radix sort | policy 256×4→256×16 (tile 4096, 4x fewer blocks → shorter lookback, 4x smaller lookback resets) | 0.767→0.428 ms (1.8x), 1.00x CUB | `epoch3_radix_sort.md` |
 | 3.5 | review fix | sizeof-aware tile clamp `radix_effective_items_v` keeps default policy DX-safe for >4-byte keys (+ ulong test) | no perf change | `epoch3_radix_sort.md` addendum |
 | 4 | reduce kernel | coalesced striped `ConsumeFullTile` loads; policy 256×4→256×8; ReduceByKey decoupled to its own DX-floor tile | 0.032→0.022 ms (1.46x), 1.11x CUB | `epoch4_reduce_kernel.md` |
+| 5 | vk legacy HLSL route | `lc_vk_backend_use_xir_spirv=false`: radix one-sweep 3.5x faster on the legacy HLSL/DXC vk route (0.71 ms, 1.68x CUB); gap is specific to XIR→SPIR-V codegen | — | `epoch5_vk_legacy_hlsl.md` |
+| 6 | vk-cuda interop | `VK_NV_cuda_kernel_launch`: all ops dispatch cuda-compiled kernels in the vk command buffer; radix 0.690→0.434 ms (−37 %, 1.015x CUB); per-op policy `LCPP_INTEROP=auto`; LC `KernelLauncher` single-alloc patch; K-ops-per-CommandList floor lever | radix at CUB parity on vk | `epoch6_vk_cuda_interop.md` |
 
 ## Verification (final state)
-- Full regression `scripts/run_regression.sh`: **21/21 green** (7 tests ×
-  cuda/dx/vk), incl. 16.7M-assert scan test and 67-assert radix test with the new
-  ulong default-policy case — `docs/final_regression.log`.
-- Ragged sizes (1,000,003 / 65,537 items) verified exactly on cuda/dx/vk.
+- Full regression `scripts/run_regression.sh`: **40/40 green** — 21 legacy rows
+  (7 tests × cuda/dx/vk, incl. 16.7M-assert scan and 67-assert radix with the ulong
+  default-policy case) + vk-interop rows for all 7 tests + policy rows
+  (`LCPP_INTEROP=auto`, explicit lists) with non-vacuous fast-path assertions —
+  `docs/final_regression_vk_cuda_interop.log` (epoch 0–4 log preserved as
+  `docs/final_regression.log`).
+- Ragged sizes (1,000,003 / 65,537 items) verified exactly on cuda/dx/vk and on the
+  vk-interop path (bit-exact vs host *and* vs the DSL path).
 - Full `xmake build` (all targets) OK.
 
 ## What remains (documented, out of scope)
-- **vk radix sort on the XIR→SPIR-V path (5.9x CUB)**: per-phase breakdown shows
-  the one-sweep kernel itself is ~90% of the time; its volatile lookback
-  spin-polling and MatchAny rank are expensive on that codegen route — a backend
-  characteristic, not a policy knob (epoch-3 doc). **Update (epoch 5):** with
-  `lc_vk_backend_use_xir_spirv=false` (legacy HLSL/DXC path) the same kernel runs
-  3.5x faster (0.71 ms, 1.68x CUB), so the gap is specific to the XIR→SPIR-V
-  codegen, not the algorithm. Both vk routes now pass the full suite.
+- ~~vk radix sort on the XIR→SPIR-V path (5.9x CUB)~~ **Resolved (epochs 5–6):**
+  epoch 5 showed the gap is specific to the XIR→SPIR-V codegen (legacy HLSL route:
+  1.68x CUB); epoch 6 closed it outright — cuda-compiled kernels in the vk command
+  buffer run at **1.015x CUB** (`epoch6_vk_cuda_interop.md`). The residual vk host
+  floor (~120–160 µs per commit) is only amortizable (K ops per CommandList),
+  not removable without vk submit-architecture work (documented non-goal).
 - dx/vk residual ratios for scan/radix partly reflect cross-backend comparison
   (CUB runs natively on CUDA on the same GPU) plus dx/vk dispatch overhead.
 - `LCPP_BENCH_GRAPH=1` (CUDA graph capture) exists for submit-overhead-free

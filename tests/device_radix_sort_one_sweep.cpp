@@ -10,6 +10,8 @@
 #include <luisa/vstl/config.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <lcpp/parallel_primitive.h>
 #include <random>
 #include <boost/ut.hpp>
@@ -48,6 +50,17 @@ int main(int argc, char* argv[])
     Context context{ctx_dir.empty() ? argv[0] : ctx_dir};
     Device device = context.create_device(backend_name);
     Stream      stream = device.create_stream();
+    // Epoch B: opt-in vk-cuda interop fast path (env LCPP_INTEROP=1, vk only).
+    // The context must outlive every lcpp module that dispatches through it and
+    // is destroyed before the vk device it borrows (see interop_dispatch.h).
+    auto interop_requested = [] {
+        const char* env = std::getenv("LCPP_INTEROP");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    luisa::unique_ptr<InteropContext> interop;
+    if (interop_requested && backend_name == "vk") {
+        interop = InteropContext::create(context, device);
+    }
     CommandList cmdlist;
 
     constexpr int32_t BLOCK_SIZE       = 128;
@@ -56,7 +69,11 @@ int main(int argc, char* argv[])
 
     using RadixSorterT = DeviceRadixSort<BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
     RadixSorterT radixsorter;
-    radixsorter.create(device, &stream);
+    radixsorter.create(device, &stream, interop.get());
+        if (interop_requested && backend_name == "vk" && interop_policy_selects("radix") && !radixsorter.interop_active()) {
+            std::fprintf(stderr, "[FAIL] LCPP_INTEROP selects radix but radixsorter stayed on the DSL path\n");
+            return 3;
+        }
 
     "radix sort key float"_test = [&]
     {
@@ -121,7 +138,11 @@ int main(int argc, char* argv[])
     {
         using DefaultRadixSorterT = DeviceRadixSort<>;
         DefaultRadixSorterT device_radix_sort;
-        device_radix_sort.create(device, &stream);
+        device_radix_sort.create(device, &stream, interop.get());
+        if (interop_requested && backend_name == "vk" && interop_policy_selects("radix") && !device_radix_sort.interop_active()) {
+            std::fprintf(stderr, "[FAIL] LCPP_INTEROP selects radix but device_radix_sort stayed on the DSL path\n");
+            return 3;
+        }
         for(uint loop = 0; loop < 24; ++loop)
         {
             uint                num_items  = 1 << loop;
@@ -157,7 +178,7 @@ int main(int argc, char* argv[])
         // block shared usage stays under the 32 KiB HLSL/DX codegen floor.
         using DefaultRadixSorterT = DeviceRadixSort<>;
         DefaultRadixSorterT device_radix_sort;
-        device_radix_sort.create(device, &stream);
+        device_radix_sort.create(device, &stream, interop.get());
         const uint          num_items  = 65536;
         Buffer<ulong>       d_keys_in  = device.create_buffer<ulong>(num_items);
         Buffer<ulong>       d_keys_out = device.create_buffer<ulong>(num_items);

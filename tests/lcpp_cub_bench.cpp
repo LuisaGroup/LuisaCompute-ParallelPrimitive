@@ -8,15 +8,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <unordered_map>
 
 #include <luisa/runtime/context.h>
+#include <luisa/runtime/event.h>
 #include <luisa/runtime/stream.h>
+#include <lcpp/runtime/interop_dispatch.h>
 
 // Portable defaults: keep per-block shared memory under the 32 KiB floor of
 // the HLSL/DX codegen path ((BLOCK*ITEMS + BLOCK*ITEMS/32) * 4B <= 32 KiB).
@@ -105,6 +109,79 @@ T *raw(BufferView<T> view) {
     return reinterpret_cast<T *>(view.native_handle()) + view.offset();
 }
 
+// Env helpers: every knob is documented in --help (see print_usage).
+bool env_flag(const char *name, bool fallback = false) {
+    const char *env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') { return fallback; }
+    return env[0] != '0';
+}
+
+int env_int(const char *name, int fallback) {
+    const char *env = std::getenv(name);
+    return env != nullptr ? std::max(0, std::atoi(env)) : fallback;
+}
+
+void print_usage(const char *exe) {
+    std::printf(
+        "usage: %s [backend] [num_items<=UINT_MAX] [repetitions>=5]\n"
+        "       %s [num_items] [repetitions]        (implicit cuda backend)\n"
+        "\n"
+        "Benchmarks lcpp DeviceReduce / DeviceScan / DeviceRadixSort against a\n"
+        "same-run CUB baseline on the same physical GPU and prints CSV rows:\n"
+        "  operation,items,lcpp_median_ms,lcpp_min_ms,lcpp_max_ms,\n"
+        "  cub_median_ms,cub_min_ms,cub_max_ms,lcpp_over_cub\n"
+        "\n"
+        "Environment:\n",
+        exe, exe);
+    struct Knob {
+        const char *name;
+        std::initializer_list<const char *> lines;
+    };
+    const Knob knobs[] = {
+        {"LCPP_INTEROP=1",
+         {"vk only: compile the kernels with the cuda backend and launch them",
+          "inside the vk command buffer (VK_NV_cuda_kernel_launch)."}},
+        {"LCPP_BENCH_BATCH=N",
+         {"Non-cuda (dx/vk) host timer only: number of op invocations, each",
+          "recorded into its own CommandList and committed separately, bracketed",
+          "by ONE synchronize() pair. The reported time is the elapsed wall time",
+          "divided by N, i.e. the per-op average including 1/N of the",
+          "submit+sync cost. N=1 exposes the raw per-op host floor (~120-130 us",
+          "of vk submit+sync); N>=100 amortizes it away and exposes GPU",
+          "throughput -- use N>=100 for throughput tables and N=1 for host-floor",
+          "tables. Default 10 (the epoch-0/1 protocol). The cuda backend ignores",
+          "it and times with GPU events (or CUDA graphs with",
+          "LCPP_BENCH_GRAPH=1)."}},
+        {"LCPP_BENCH_POLL=1",
+         {"End the timed window by signaling a stream event and polling",
+          "Event::is_completed() instead of synchronize(), i.e. without the",
+          "backend's worker-thread completion hand-off."}},
+        {"LCPP_BENCH_INQUEUE_LIMIT=0",
+         {"vk only: turn the backend's depth-2 in-flight throttle",
+          "(DeviceConfig::inqueue_buffer_limit: every dispatch waits for fence-2",
+          "before submitting) OFF. WARNING: measured to be a large bimodal",
+          "regression on WDDM (batch=100 at 4M items: reduce 0.023 -> 0.61 ms,",
+          "scan 0.085 -> 1.14 ms, radix 0.687 -> 0.97 ms; up to 7 ms/op samples",
+          "at batch=8..32); it changes nothing at batch=1. Default: throttle on",
+          "(the stock backend setting)."}},
+        {"LCPP_BENCH_CL_OPS=K",
+         {"K>=2: additionally measure K op invocations recorded into ONE caller",
+          "CommandList over K distinct non-aliasing buffer sets, at one commit",
+          "per sample. The vk command-reorder pass merges such iterations into",
+          "barrier-free layers, so this is the pattern that hides the per-op",
+          "submit floor; rows are named \"<op>[xK/CL]\"."}},
+        {"LCPP_BENCH_GRAPH=1",
+         {"cuda only: capture the batch into a CUDA graph and replay it."}},
+    };
+    for (auto &&knob : knobs) {
+        auto first = true;
+        for (auto *line : knob.lines) {
+            std::printf("  %-26s %s\n", first ? knob.name : "", line);
+            first = false;
+        }
+    }
+}
+
 struct Stats {
     std::vector<float> values;
     [[nodiscard]] float median() const {
@@ -116,11 +193,13 @@ struct Stats {
     [[nodiscard]] float maximum() const { return *std::max_element(values.begin(), values.end()); }
 };
 
-void print_stats(std::string_view name, const Stats &lcpp, const Stats &cub, size_t num_items) {
+void print_stats(std::string_view name, const Stats &lcpp, const Stats &cub, size_t num_items,
+                 std::string_view suffix = {}) {
     const auto lcpp_median = lcpp.median();
     const auto cub_median  = cub.median();
+    auto label = suffix.empty() ? std::string{name} : std::string{name} + std::string{suffix};
     std::printf("%s,%zu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4fx\n",
-                name.data(),
+                label.c_str(),
                 num_items,
                 lcpp_median,
                 lcpp.minimum(),
@@ -209,16 +288,32 @@ struct CudaStreamTimer final : LcppTimer {
 // Epoch-0/1 numbers used batch=1 (LCPP_BENCH_BATCH=1 reproduces them).
 struct HostSyncTimer final : LcppTimer {
     Stream *stream;
-    int batch = [] {
-        const char *env = std::getenv("LCPP_BENCH_BATCH");
-        return env ? std::max(1, std::atoi(env)) : 10;
-    }();
-    explicit HostSyncTimer(Stream &s) : stream(&s) {}
+    // Epoch C (plan §4.2): LCPP_BENCH_POLL=1 replaces the closing
+    // synchronize() with a stream event + host-side completion poll.  On vk a
+    // plain synchronize() spins on the stream's internal event, which is only
+    // published after the backend worker thread has observed GPU completion
+    // (vkWaitSemaphores) and run its notification item; polling a user event
+    // keeps the same device-side fence but removes the app-thread hand-off
+    // from the measured window.  Both paths wait for the same GPU work.
+    Event event;
+    bool poll_mode = env_flag("LCPP_BENCH_POLL");
+    int batch = std::max(1, env_int("LCPP_BENCH_BATCH", 10));
+    HostSyncTimer(Stream &s, Device &d) : stream(&s) {
+        if (poll_mode) { event = d.create_event(); }
+    }
+    void wait_idle() {
+        if (poll_mode) {
+            *stream << event.signal();
+            while (!event.is_completed()) { std::this_thread::yield(); }
+        } else {
+            stream->synchronize();
+        }
+    }
     float measure(const char *, const std::function<void()> &enqueue) override {
-        stream->synchronize();
+        wait_idle();
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < batch; ++i) { enqueue(); }
-        stream->synchronize();
+        wait_idle();
         const auto t1 = std::chrono::steady_clock::now();
         return std::chrono::duration<float, std::milli>(t1 - t0).count() / static_cast<float>(batch);
     }
@@ -306,7 +401,11 @@ bool is_backend_name(std::string_view s) {
 int main(int argc, char **argv) {
     // usage: lcpp_cub_bench [backend] [num_items<=UINT_MAX] [repetitions>=5]
     // The legacy numeric-only form "lcpp_cub_bench [num_items] [repetitions]"
-    // (implicit cuda backend) is still accepted.
+    // (implicit cuda backend) is still accepted.  Env knobs: see print_usage.
+    if (argc > 1 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
     const char *backend_name = "cuda";
     int argi = 1;
     if (argc > argi && is_backend_name(argv[argi])) {
@@ -318,26 +417,63 @@ int main(int argc, char **argv) {
     if (argc > argi) { num_items = static_cast<size_t>(std::strtoull(argv[argi], nullptr, 10)); }
     if (argc > argi + 1) { repetitions = std::atoi(argv[argi + 1]); }
     if (num_items == 0u || num_items > static_cast<size_t>(std::numeric_limits<uint>::max()) || repetitions < 5) {
-        std::fprintf(stderr, "usage: %s [backend] [num_items<=UINT_MAX] [repetitions>=5]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [backend] [num_items<=UINT_MAX] [repetitions>=5]  (see --help)\n", argv[0]);
         return 1;
     }
 
+    const bool is_vk = std::string_view{backend_name} == "vk";
     Context context{argv[0]};
     // GPU name for the report. On the vk backend, backend_device_names() must
     // NOT be called before device creation (volk global dispatch tables) nor
     // while a device is live, so vk simply reports "unknown".
     std::string gpu_name = "unknown";
-    if (std::string_view{backend_name} != "vk") {
+    if (!is_vk) {
         const auto gpu_names = context.backend_device_names(backend_name);
         if (!gpu_names.empty()) { gpu_name = gpu_names.front(); }
     }
-    Device device = context.create_device(backend_name);
+    // Epoch C (plan §4.1): expose the raw vk submit floor.  The vk backend's
+    // depth-2 in-flight throttle (DeviceConfig::inqueue_buffer_limit,
+    // D:/LuisaCompute/src/backends/vk/stream.cpp:1962-1966) makes every
+    // dispatch wait for fence-2 before submitting, so the plan asked for it to
+    // be turned off by default in the bench.  MEASURED (Epoch C, §C1 of
+    // .kimix_cache/epoch_C_report.md): turning it off is a large, bimodal
+    // REGRESSION on this platform (WDDM): at 4M items / batch=100 the per-op
+    // wall time goes 0.023 -> 0.61 ms (reduce), 0.085 -> 1.14 ms (scan),
+    // 0.687 -> 0.97 ms (radix), with individual samples up to 7 ms/op at
+    // batch=8..32, while at batch=1 (a single op in flight) it changes nothing
+    // (the throttle only engages from fence 3 on).  The bench therefore keeps
+    // the stock setting by default and exposes the plan's knob as an opt-in
+    // A/B: LCPP_BENCH_INQUEUE_LIMIT=0 turns the throttle off.
+    const bool inqueue_limit = !is_vk || env_flag("LCPP_BENCH_INQUEUE_LIMIT", true);
+    DeviceConfig device_config{};
+    device_config.inqueue_buffer_limit = inqueue_limit;
+    Device device = is_vk ? context.create_device(backend_name, &device_config)
+                          : context.create_device(backend_name);
     if (!device) {
         std::fprintf(stderr, "failed to create device for backend '%s'\n", backend_name);
         return 2;
     }
     Stream stream = device.create_stream();
     const bool is_cuda = std::string_view{backend_name} == "cuda";
+    const bool poll_mode = env_flag("LCPP_BENCH_POLL");
+    const int cl_ops = env_int("LCPP_BENCH_CL_OPS", 0);
+
+    // Epoch A: opt-in vk-cuda interop fast path (env LCPP_INTEROP=1, vk only).
+    // The context must outlive every lcpp module that dispatches through it and
+    // be destroyed before the vk device it borrows (see interop_dispatch.h).
+    auto interop_requested = [] {
+        const char *env = std::getenv("LCPP_INTEROP");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    luisa::unique_ptr<InteropContext> interop;
+    if (interop_requested) {
+        if (std::string_view{backend_name} == "vk") {
+            interop = InteropContext::create(context, device);
+        } else {
+            std::fprintf(stderr, "LCPP_INTEROP=1 requires the vk backend; ignored.\n");
+        }
+    }
+    const bool interop_active = interop != nullptr;
 
     CUstream raw_stream = nullptr;
     CUcontext context_handle = nullptr;
@@ -349,9 +485,14 @@ int main(int argc, char **argv) {
         (void)previous_context;
     }
 
-    std::printf("gpu=%s backend=%s cub=%d items=%zu reps=%d\n",
+    std::printf("gpu=%s backend=%s cub=%d items=%zu reps=%d interop=%d batch=%d poll=%d inqueue_limit=%d cl_ops=%d\n",
                 gpu_name.c_str(),
-                device.backend_name().data(), cub_bench_version(), num_items, repetitions);
+                device.backend_name().data(), cub_bench_version(), num_items, repetitions,
+                interop_active ? 1 : 0,
+                is_cuda ? 0 : std::max(1, env_int("LCPP_BENCH_BATCH", 10)),
+                poll_mode ? 1 : 0,
+                inqueue_limit ? 1 : 0,
+                cl_ops);
     std::printf("operation,items,lcpp_median_ms,lcpp_min_ms,lcpp_max_ms,cub_median_ms,cub_min_ms,cub_max_ms,lcpp_over_cub\n");
 
     // lcpp-side timer
@@ -359,7 +500,7 @@ int main(int argc, char **argv) {
     if (is_cuda) {
         lcpp_timer = std::make_unique<CudaStreamTimer>(raw_stream, context_handle);
     } else {
-        lcpp_timer = std::make_unique<HostSyncTimer>(stream);
+        lcpp_timer = std::make_unique<HostSyncTimer>(stream, device);
     }
     // CUB baseline: standalone CUDA stream when lcpp runs on another backend.
     CubStandalone cub;
@@ -396,7 +537,10 @@ int main(int argc, char **argv) {
         }
 
         ReduceBench lcpp_reduce;
-        lcpp_reduce.create(device);
+        lcpp_reduce.create(device, nullptr, interop.get());
+        if (interop_requested) {
+            std::fprintf(stderr, "DeviceReduce interop_active=%d\n", lcpp_reduce.interop_active() ? 1 : 0);
+        }
         CommandList warmup;
         lcpp_reduce.Sum(warmup, lcpp_temp.view(), input.view(), lcpp_output.view(), num_items);
         stream << warmup.commit() << synchronize();
@@ -459,6 +603,54 @@ int main(int argc, char **argv) {
             return 3;
         }
         print_stats("DeviceReduce.Sum", lcpp_stats, cub_stats, num_items);
+        // Epoch C (plan §4.3): K invocations of the op recorded into ONE caller
+        // CommandList over K distinct (non-aliasing) buffer sets.  The vk
+        // command-reorder pass merges such iterations into barrier-free layers,
+        // so this measures the per-op floor of the pattern that hides the
+        // per-op submit cost (batch=1, one commit per sample).
+        if (cl_ops >= 2 && !is_cuda) {
+            std::vector<Buffer<int>> in_k, out_k;
+            std::vector<Buffer<uint>> temp_k;
+            for (int k = 0; k < cl_ops; ++k) {
+                in_k.emplace_back(device.create_buffer<int>(num_items));
+                out_k.emplace_back(device.create_buffer<int>(1u));
+                temp_k.emplace_back(device.create_buffer<uint>(bytes_to_uint_count(ReduceBench::GetTempStorageBytes<int>(num_items))));
+                stream << in_k.back().copy_from(span{host_input});
+            }
+            CommandList cl_warm;
+            for (int k = 0; k < cl_ops; ++k) {
+                lcpp_reduce.Sum(cl_warm, temp_k[k].view(), in_k[k].view(), out_k[k].view(), num_items);
+            }
+            stream << cl_warm.commit() << synchronize();
+            HostSyncTimer cl_timer{stream, device};
+            cl_timer.batch = 1;
+            Stats cl_stats;
+            cl_stats.values.reserve(repetitions);
+            for (int i = 0; i < repetitions; ++i) {
+                auto total = cl_timer.measure("reduce_cl_ops", [&] {
+                    CommandList commands;
+                    for (int k = 0; k < cl_ops; ++k) {
+                        lcpp_reduce.Sum(commands, temp_k[k].view(), in_k[k].view(), out_k[k].view(), num_items);
+                    }
+                    stream << commands.commit();
+                });
+                cl_stats.values.emplace_back(total / static_cast<float>(cl_ops));
+            }
+            // Exactness of every merged-layer iteration (this is also the R2
+            // hazard check for K non-aliasing launches in one layer).
+            auto bad = 0;
+            for (int k = 0; k < cl_ops; ++k) {
+                int value = 0;
+                stream << out_k[k].copy_to(span{&value, 1u}) << synchronize();
+                if (value != expected_reduce) { ++bad; }
+            }
+            print_stats("DeviceReduce.Sum", cl_stats, cub_stats, num_items,
+                        "[x" + std::to_string(cl_ops) + "/CL]");
+            if (bad != 0) {
+                std::fprintf(stderr, "cl_ops reduce verification failed in %d/%d sets\n", bad, cl_ops);
+                return 3;
+            }
+        }
         if (is_cuda) {
             with_context(context_handle, [&] { check_cu(cuMemFree(cub_temp_ptr), "cuMemFree(reduce temp)"); });
         }
@@ -496,8 +688,11 @@ int main(int argc, char **argv) {
             cub_temp.allocate(cub_temp_bytes);
         }
 
-        ScanBench lcpp_scan;
-        lcpp_scan.create(device);
+          ScanBench lcpp_scan;
+          lcpp_scan.create(device, nullptr, interop.get());
+          if (interop_requested) {
+              std::fprintf(stderr, "DeviceScan interop_active=%d\n", lcpp_scan.interop_active() ? 1 : 0);
+          }
         CommandList warmup;
         lcpp_scan.InclusiveSum(warmup, lcpp_temp.view(), input.view(), lcpp_output.view(), num_items);
         stream << warmup.commit() << synchronize();
@@ -560,6 +755,49 @@ int main(int argc, char **argv) {
             return 3;
         }
         print_stats("DeviceScan.InclusiveSum", lcpp_stats, cub_stats, num_items);
+        // Epoch C §4.3: K scan invocations in one CommandList over K distinct
+        // buffer sets (see the reduce block above for the rationale).
+        if (cl_ops >= 2 && !is_cuda) {
+            std::vector<Buffer<int>> in_k, out_k;
+            std::vector<Buffer<uint>> temp_k;
+            for (int k = 0; k < cl_ops; ++k) {
+                in_k.emplace_back(device.create_buffer<int>(num_items));
+                out_k.emplace_back(device.create_buffer<int>(num_items));
+                temp_k.emplace_back(device.create_buffer<uint>(bytes_to_uint_count(ScanBench::GetTempStorageBytes<int>(num_items))));
+                stream << in_k.back().copy_from(span{host_input});
+            }
+            CommandList cl_warm;
+            for (int k = 0; k < cl_ops; ++k) {
+                lcpp_scan.InclusiveSum(cl_warm, temp_k[k].view(), in_k[k].view(), out_k[k].view(), num_items);
+            }
+            stream << cl_warm.commit() << synchronize();
+            HostSyncTimer cl_timer{stream, device};
+            cl_timer.batch = 1;
+            Stats cl_stats;
+            cl_stats.values.reserve(repetitions);
+            for (int i = 0; i < repetitions; ++i) {
+                auto total = cl_timer.measure("scan_cl_ops", [&] {
+                    CommandList commands;
+                    for (int k = 0; k < cl_ops; ++k) {
+                        lcpp_scan.InclusiveSum(commands, temp_k[k].view(), in_k[k].view(), out_k[k].view(), num_items);
+                    }
+                    stream << commands.commit();
+                });
+                cl_stats.values.emplace_back(total / static_cast<float>(cl_ops));
+            }
+            auto bad = 0;
+            for (int k = 0; k < cl_ops; ++k) {
+                std::vector<int> result(num_items);
+                stream << out_k[k].copy_to(span{result}) << synchronize();
+                if (!std::equal(result.begin(), result.end(), expected.begin())) { ++bad; }
+            }
+            print_stats("DeviceScan.InclusiveSum", cl_stats, cub_stats, num_items,
+                        "[x" + std::to_string(cl_ops) + "/CL]");
+            if (bad != 0) {
+                std::fprintf(stderr, "cl_ops scan verification failed in %d/%d sets\n", bad, cl_ops);
+                return 3;
+            }
+        }
         if (is_cuda) {
             with_context(context_handle, [&] { check_cu(cuMemFree(cub_temp_ptr), "cuMemFree(scan temp)"); });
         }
@@ -591,8 +829,11 @@ int main(int argc, char **argv) {
             cub_temp.allocate(cub_temp_bytes);
         }
 
-        RadixBench lcpp_sort;
-        lcpp_sort.create(device);
+          RadixBench lcpp_sort;
+          lcpp_sort.create(device, nullptr, interop.get());
+          if (interop_requested) {
+              std::fprintf(stderr, "DeviceRadixSort interop_active=%d\n", lcpp_sort.interop_active() ? 1 : 0);
+          }
         CommandList warmup;
         lcpp_sort.SortKeys(warmup, lcpp_temp.view(), keys_in.view(), lcpp_keys_out.view(), static_cast<uint>(num_items));
         stream << warmup.commit() << synchronize();
@@ -656,6 +897,50 @@ int main(int argc, char **argv) {
             return 3;
         }
         print_stats("DeviceRadixSort.SortKeys", lcpp_stats, cub_stats, num_items);
+        // Epoch C §4.3: K radix sorts in one CommandList over K distinct buffer
+        // sets -- the 12-launch op where the reorder pass has the most to merge
+        // (4 init launches become one barrier-free layer, the one-sweep launches
+        // of different iterations no longer serialize)...
+        if (cl_ops >= 2 && !is_cuda) {
+            std::vector<Buffer<uint>> keys_in_k, keys_out_k, temp_k;
+            for (int k = 0; k < cl_ops; ++k) {
+                keys_in_k.emplace_back(device.create_buffer<uint>(num_items));
+                keys_out_k.emplace_back(device.create_buffer<uint>(num_items));
+                temp_k.emplace_back(device.create_buffer<uint>(bytes_to_uint_count(RadixBench::GetSortKeysTempStorageBytes<uint>(static_cast<uint>(num_items)))));
+                stream << keys_in_k.back().copy_from(span{host_keys});
+            }
+            CommandList cl_warm;
+            for (int k = 0; k < cl_ops; ++k) {
+                lcpp_sort.SortKeys(cl_warm, temp_k[k].view(), keys_in_k[k].view(), keys_out_k[k].view(), static_cast<uint>(num_items));
+            }
+            stream << cl_warm.commit() << synchronize();
+            HostSyncTimer cl_timer{stream, device};
+            cl_timer.batch = 1;
+            Stats cl_stats;
+            cl_stats.values.reserve(repetitions);
+            for (int i = 0; i < repetitions; ++i) {
+                auto total = cl_timer.measure("radix_cl_ops", [&] {
+                    CommandList commands;
+                    for (int k = 0; k < cl_ops; ++k) {
+                        lcpp_sort.SortKeys(commands, temp_k[k].view(), keys_in_k[k].view(), keys_out_k[k].view(), static_cast<uint>(num_items));
+                    }
+                    stream << commands.commit();
+                });
+                cl_stats.values.emplace_back(total / static_cast<float>(cl_ops));
+            }
+            auto bad = 0;
+            for (int k = 0; k < cl_ops; ++k) {
+                std::vector<uint> result(num_items);
+                stream << keys_out_k[k].copy_to(span{result}) << synchronize();
+                if (result != expected) { ++bad; }
+            }
+            print_stats("DeviceRadixSort.SortKeys", cl_stats, cub_stats, num_items,
+                        "[x" + std::to_string(cl_ops) + "/CL]");
+            if (bad != 0) {
+                std::fprintf(stderr, "cl_ops radix verification failed in %d/%d sets\n", bad, cl_ops);
+                return 3;
+            }
+        }
         if (is_cuda) {
             with_context(context_handle, [&] { check_cu(cuMemFree(cub_temp_ptr), "cuMemFree(radix temp)"); });
         }

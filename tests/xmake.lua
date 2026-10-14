@@ -45,7 +45,12 @@ add_test_target("device_reduce_test")
 add_test_target("device_scan_test")
 add_test_target("device_segment_reduce")
 add_test_target("device_radix_sort_one_sweep")
-add_test_target("host_enqueue_probe")
+  add_test_target("host_enqueue_probe")
+  -- Epoch D: compile-time policy sweep harness (measurement/evidence tool; not
+  -- part of the regression pass criteria).
+  add_test_target("policy_tune")
+add_test_target("vk_cuda_interop_reduce_test")
+add_test_target("vk_cuda_interop_ops_test")
 
 -- CUDA environment for the CUB baseline benchmark (nvcc + CUDA headers/libs).
 -- Mirrors LuisaCompute's cuda_ext rule; disables the targets when CUDA is absent.
