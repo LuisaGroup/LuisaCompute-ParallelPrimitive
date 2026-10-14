@@ -39,7 +39,28 @@ namespace luisa::parallel_primitive
 
 using namespace luisa::compute;
 
-template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD>
+// DeviceReduce policy default (epoch-4): BLOCK_SIZE x ITEMS_PER_THREAD tile.
+// Tuned on RTX 5060 (4M int32 Sum) after coalescing ConsumeFullTile loads to a
+// block-striped layout: 256x8 is the best *portable* policy (cuda 0.022 ms
+// ~1.11x CUB, dx 0.039 ms ~0.87x, vk 0.036 ms ~0.77x) and, unlike 256x16, keeps
+// the shared-memory footprint under the 32 KiB DX/HLSL floor for the default
+// *wide* element type used by ArgMin/ArgMax (IndexValuePairT, 8 bytes):
+//   (256*8 + 256*8/32) * 8 = 2112 * 8 = 16896 B <= 32 KiB
+//   (256*16 + 256*16/32)* 8 = 4224 * 8 = 33792 B >  32 KiB  (would break dx)
+// So ITEMS=16 matches cuda parity but is rejected for the all-type default.
+static constexpr size_t REDUCE_ITEMS_PER_THREAD = 8;
+
+// ReduceByKey runs a dedicated tile, independent of REDUCE_ITEMS_PER_THREAD.
+// Its kernel allocates THREE shared arrays each sized by the tile element count
+// (s_keys, s_values, and the two-phase-scatter s_scatter_keys at 8 B), so its
+// DX/HLSL 32 KiB floor binds ~3x sooner than the single-array Sum/Reduce path.
+// 256x8 would need (256*8 + 256*8/32) * (4 + 4 + 8) = 33792 B > 32 KiB and fail
+// on dx.  Freeze reduce-by-key at the epoch-3 validated 256x4 tile so its
+// behavior, results and shared footprint are unchanged from the committed
+// baseline, while the hot reduce ops use the tuned REDUCE_ITEMS_PER_THREAD.
+static constexpr size_t REDUCE_BY_KEY_ITEMS_PER_THREAD = 4;
+
+template <size_t BLOCK_SIZE = details::BLOCK_SIZE, size_t WARP_NUMS = details::WARP_SIZE, size_t ITEMS_PER_THREAD = REDUCE_ITEMS_PER_THREAD>
 class DeviceReduce : public LuisaModule
 {
   private:
@@ -47,6 +68,7 @@ class DeviceReduce : public LuisaModule
     uint m_warp_nums  = WARP_NUMS;
 
     uint   m_shared_mem_size = 0;
+    uint   m_rbk_shared_mem_size = 0;
     Device m_device;
 
     bool   m_created = false;
@@ -75,6 +97,9 @@ class DeviceReduce : public LuisaModule
         int num_elements_per_block = m_block_size * ITEMS_PER_THREAD;
         int extra_space            = num_elements_per_block / m_warp_nums;
         m_shared_mem_size          = (num_elements_per_block + extra_space);
+        // reduce-by-key uses its own (smaller, DX-floor-bound) tile
+        int rbk_elements_per_block = m_block_size * REDUCE_BY_KEY_ITEMS_PER_THREAD;
+        m_rbk_shared_mem_size      = rbk_elements_per_block + rbk_elements_per_block / m_warp_nums;
         m_created                  = true;
     }
 
@@ -113,7 +138,7 @@ class DeviceReduce : public LuisaModule
     static size_t GetReduceByKeyTempStorageBytes(size_t num_elements)
     {
         using FlagValuePairT = KeyValuePair<int, ValueType>;
-        int num_tiles = imax(1, (int)ceil((float)num_elements / (ITEMS_PER_THREAD * BLOCK_SIZE)));
+        int num_tiles = imax(1, (int)ceil((float)num_elements / (REDUCE_BY_KEY_ITEMS_PER_THREAD * BLOCK_SIZE)));
         size_t tile_count = details::WARP_SIZE + num_tiles;
 
         size_t bytes = 0;
@@ -293,7 +318,7 @@ class DeviceReduce : public LuisaModule
             luisa::deallocate_with_allocator(ptr);
         });
         
-        int num_tiles = imax(1, (int)ceil((float)num_elements / (ITEMS_PER_THREAD * m_block_size)));
+        int num_tiles = imax(1, (int)ceil((float)num_elements / (REDUCE_BY_KEY_ITEMS_PER_THREAD * m_block_size)));
         size_t tile_count = details::WARP_SIZE + num_tiles;
 
         size_t offset_bytes = 0;
@@ -474,11 +499,11 @@ class DeviceReduce : public LuisaModule
                              ReduceOp                     reduce_op,
                              uint                         num_items) noexcept
     {
-        uint tile_items = m_block_size * ITEMS_PER_THREAD;
+        uint tile_items = m_block_size * REDUCE_BY_KEY_ITEMS_PER_THREAD;
         uint num_tiles  = imax(1, (uint)ceil((float)num_items / tile_items));
 
 
-        using ReduceByKey = details::ReduceByKeyModule<KeyType, ValueType, BLOCK_SIZE, ITEMS_PER_THREAD>;
+        using ReduceByKey = details::ReduceByKeyModule<KeyType, ValueType, BLOCK_SIZE, REDUCE_BY_KEY_ITEMS_PER_THREAD>;
         using ReduceByKeyTileStateInitKernel = ReduceByKey::ScanTileStateInitKernel;
         using ReduceByKeyKernel              = ReduceByKey::ReduceByKeyKernel;
 
@@ -503,7 +528,7 @@ class DeviceReduce : public LuisaModule
         auto ms_reduce_by_key_it = ms_reduce_by_key_map.find(key);
         if(ms_reduce_by_key_it == ms_reduce_by_key_map.end())
         {
-            auto shader = ReduceByKey().compile(m_device, m_shared_mem_size, reduce_op);
+            auto shader = ReduceByKey().compile(m_device, m_rbk_shared_mem_size, reduce_op);
             ms_reduce_by_key_map.try_emplace(key, std::move(shader));
             ms_reduce_by_key_it = ms_reduce_by_key_map.find(key);
         }

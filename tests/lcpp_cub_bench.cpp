@@ -34,7 +34,7 @@
 #define LCPP_REDUCE_BLOCK 256u
 #endif
 #ifndef LCPP_REDUCE_ITEMS
-#define LCPP_REDUCE_ITEMS 4u
+#define LCPP_REDUCE_ITEMS 8u
 #endif
 #ifndef LCPP_REDUCE_WARP_REDUX
 #define LCPP_REDUCE_WARP_REDUX false
