@@ -107,20 +107,23 @@ class DeviceRadixSort : public LuisaModule
         // d_bins: num_portions * num_passes * RADIX_DIGITS * uint
         size_t bins_count = (size_t)num_portions * num_passes * RADIX_DIGITS;
         bytes += bins_count * sizeof(uint);
-        // d_lookback: max_num_blocks * RADIX_DIGITS * uint
+        // d_lookback: max_num_blocks * RADIX_DIGITS * uint (descriptor-aligned base)
+        bytes = align_up_view(bytes);
         size_t lookback_count = (size_t)max_num_blocks * RADIX_DIGITS;
         bytes += lookback_count * sizeof(uint);
         // extra key buffer (for multi-pass): num_items * sizeof(KeyType)
         if(num_passes > 1)
         {
-            bytes = align_up_uint(bytes, alignof(KeyType));
+            bytes = align_up_view(bytes);
             bytes += (size_t)num_items * sizeof(KeyType);
             // extra value buffer
-            bytes = align_up_uint(bytes, alignof(ValueType));
+            bytes = align_up_view(bytes);
             bytes += (size_t)num_items * sizeof(ValueType);
         }
-        // d_ctrs: num_portions * num_passes * uint
-        size_t ctrs_count = (size_t)num_portions * num_passes;
+        // d_ctrs: one descriptor-aligned 256-byte slot per (portion, pass);
+        // must mirror the runtime carving in onesweep_radix_sort().
+        bytes = align_up_view(bytes);
+        size_t ctrs_count = (size_t)num_portions * num_passes * descriptor_view_alignment_uints;
         bytes += ctrs_count * sizeof(uint);
         return bytes;
     }
@@ -227,29 +230,34 @@ class DeviceRadixSort : public LuisaModule
         auto d_bins_view = temp_storage.subview(offset_bytes / sizeof(uint), bins_count);
         offset_bytes += bins_count * sizeof(uint);
 
-        // d_lookback: max_num_blocks * RADIX_DIGITS * uint
+        // d_lookback: max_num_blocks * RADIX_DIGITS * uint (descriptor-aligned base)
+        offset_bytes = align_up_view(offset_bytes);
         size_t lookback_count = (size_t)max_num_blocks * RADIX_DIGITS;
         auto d_lookback_view = temp_storage.subview(offset_bytes / sizeof(uint), lookback_count);
         offset_bytes += lookback_count * sizeof(uint);
 
-        // extra key/value buffers for multi-pass
+        // extra key/value buffers for multi-pass (descriptor-aligned bases)
         BufferView<KeyType>   d_keys_tmp2_view;
         BufferView<ValueType> d_values_tmp2_view;
         if(!is_overwrite_okay && num_passes > 1)
         {
-            offset_bytes = align_up_uint(offset_bytes, alignof(KeyType));
+            offset_bytes = align_up_view(offset_bytes);
             size_t keys_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(KeyType));
             d_keys_tmp2_view = temp_storage.subview(offset_bytes / sizeof(uint), keys_uint_count).template as<KeyType>();
             offset_bytes += keys_uint_count * sizeof(uint);
 
-            offset_bytes = align_up_uint(offset_bytes, alignof(ValueType));
+            offset_bytes = align_up_view(offset_bytes);
             size_t values_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(ValueType));
             d_values_tmp2_view = temp_storage.subview(offset_bytes / sizeof(uint), values_uint_count).template as<ValueType>();
             offset_bytes += values_uint_count * sizeof(uint);
         }
 
-        // d_ctrs: num_portions * num_passes * uint
-        size_t ctrs_count = (size_t)num_portions * num_passes;
+        // d_ctrs: one descriptor-aligned 256-byte slot per (portion, pass) -- the
+        // per-pass counter is passed to the one-sweep kernel as a 1-element
+        // subview, whose offset must satisfy the descriptor-view alignment on
+        // the legacy Vulkan HLSL path. Mirrors GetSortPairsTempStorageBytes.
+        offset_bytes = align_up_view(offset_bytes);
+        size_t ctrs_count = (size_t)num_portions * num_passes * descriptor_view_alignment_uints;
         auto d_ctrs_view = temp_storage.subview(offset_bytes / sizeof(uint), ctrs_count);
 
         auto radix_sort_key = get_radix_sort_key<KeyType, ValueType, KEY_ONLY, IS_DESCENDING>();
@@ -358,7 +366,7 @@ class DeviceRadixSort : public LuisaModule
                 cmdlist
                     << (*ms_radix_sort_onesweep_ptr)(
                            d_lookback_view,
-                           d_ctrs_view.subview(portion * num_passes + pass, 1),
+                           d_ctrs_view.subview((portion * num_passes + pass) * descriptor_view_alignment_uints, 1),
                            d_bins_view.subview((portion * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS),
                            portion < num_portions - 1 ?
                                d_bins_view.subview(((portion + 1) * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS) :

@@ -147,32 +147,53 @@ detail::ShaderCacheKey get_radix_sort_key()
                                          detail::bool_ptr(IS_DESCENDING));
 }
 
-static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items)
-{
-    auto         block_size       = m_block_size;
-    unsigned int max_num_elements = num_items;
-    temp_storage_size             = 0;
-    unsigned int num_elements     = max_num_elements;  // input segment size
-    int          level            = 0;
-    do
-    {
-        // output segment size
-        unsigned int num_blocks = imax(1, (int)ceil((float)num_elements / (items_per_thread * block_size)));
-        if(num_blocks > 1)
-        {
-            level++;
-            temp_storage_size += num_blocks;
-        }
-        num_elements = num_blocks;
-    } while(num_elements > 1);
-    temp_storage_size += 1;
-}
-
 // Helper: round up byte_offset to the given alignment
 inline size_t align_up_uint(size_t byte_offset, size_t alignment)
 {
     return (byte_offset + alignment - 1) / alignment * alignment;
 }
+
+// Byte alignment for kernel-argument buffer subviews carved out of a temporary
+// storage buffer. The Vulkan legacy-HLSL (DXC) descriptor path validates every
+// dispatched buffer view with the device minStorageBufferOffsetAlignment (16 on
+// NVIDIA, larger on some hardware) and additionally requires whole elements;
+// 256 is a multiple of every element stride lcpp uses, so aligning every carved
+// region to 256 bytes satisfies both constraints on every backend and is a
+// no-op for cuda/dx. Regions are a few KB each, so the padding is negligible.
+static constexpr size_t descriptor_view_alignment = 256;
+static constexpr size_t descriptor_view_alignment_uints = descriptor_view_alignment / sizeof(uint);
+inline size_t align_up_view(size_t byte_offset) noexcept
+{
+    return align_up_uint(byte_offset, descriptor_view_alignment);
+}
+
+// Temp-storage size for the recursive device reduce, walking byte offsets so
+// that every recursion-level region is aligned to descriptor_view_alignment
+// (the subviews are passed to kernels as buffer arguments). `elem_size` is the
+// reduced element type size; the result is a count of those elements.
+static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items, size_t elem_size = sizeof(uint))
+{
+    auto block_size = m_block_size;
+    unsigned int max_num_elements = num_items;
+    temp_storage_size = 0;
+    size_t offset_bytes = 0;
+    unsigned int num_elements = max_num_elements;  // input segment size
+    while(true)
+    {
+        // output segment size
+        unsigned int num_blocks = imax(1, (int)ceil((float)num_elements / (items_per_thread * block_size)));
+        if(num_blocks > 1)
+        {
+            offset_bytes = align_up_view(offset_bytes);
+            offset_bytes += (size_t)num_blocks * elem_size;
+        }
+        num_elements = num_blocks;
+        if(num_elements <= 1) { break; }
+    }
+    offset_bytes = align_up_view(offset_bytes);
+    temp_storage_size = offset_bytes / elem_size + 1;
+}
+
 
 // Helper: convert byte size to uint element count (round up)
 inline size_t bytes_to_uint_count(size_t byte_size)

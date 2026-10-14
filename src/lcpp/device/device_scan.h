@@ -86,9 +86,9 @@ class DeviceScan : public LuisaModule
 
         size_t bytes = 0;
         bytes += tile_count * sizeof(uint);               // tile_status
-        bytes  = align_up_uint(bytes, alignof(Type4Byte));
+        bytes  = align_up_view(bytes);
         bytes += tile_count * sizeof(Type4Byte);          // tile_partial
-        bytes  = align_up_uint(bytes, alignof(Type4Byte));
+        bytes  = align_up_view(bytes);
         bytes += tile_count * sizeof(Type4Byte);          // tile_inclusive
         return bytes;
     }
@@ -103,11 +103,11 @@ class DeviceScan : public LuisaModule
 
         size_t bytes = 0;
         bytes += tile_count * sizeof(uint);                  // tile_status
-        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
+        bytes  = align_up_view(bytes);
         bytes += tile_count * sizeof(FlagValuePairT);        // tile_partial
-        bytes  = align_up_uint(bytes, sizeof(FlagValuePairT));
+        bytes  = align_up_view(bytes);
         bytes += tile_count * sizeof(FlagValuePairT);        // tile_inclusive
-        bytes  = align_up_uint(bytes, alignof(KeyType));
+        bytes  = align_up_view(bytes);
         bytes += num_tiles * sizeof(KeyType);                // d_prev_keys_in
         return bytes;
     }
@@ -132,13 +132,13 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(Type4Byte));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(Type4Byte) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<Type4Byte>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(Type4Byte));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(Type4Byte) / sizeof(uint);
@@ -165,13 +165,13 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(Type4Byte));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(Type4Byte) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<Type4Byte>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(Type4Byte));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(Type4Byte) / sizeof(uint);
@@ -226,19 +226,19 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_inclusive = temp_storage.subview(offset_bytes / sizeof(uint), inclusive_uint_count).template as<FlagValuePairT>();
         offset_bytes += inclusive_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(KeyType));
+        offset_bytes = align_up_view(offset_bytes);
 
         // d_prev_keys_in
         size_t prev_keys_uint_count = bytes_to_uint_count(num_tiles * sizeof(KeyType));
@@ -277,19 +277,19 @@ class DeviceScan : public LuisaModule
         // tile_status
         auto tile_status = temp_storage.subview(offset_bytes / sizeof(uint), tile_count);
         offset_bytes += tile_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_partial
         size_t partial_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_partial = temp_storage.subview(offset_bytes / sizeof(uint), partial_uint_count).template as<FlagValuePairT>();
         offset_bytes += partial_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, sizeof(FlagValuePairT));
+        offset_bytes = align_up_view(offset_bytes);
 
         // tile_inclusive
         size_t inclusive_uint_count = tile_count * sizeof(FlagValuePairT) / sizeof(uint);
         auto tile_inclusive = temp_storage.subview(offset_bytes / sizeof(uint), inclusive_uint_count).template as<FlagValuePairT>();
         offset_bytes += inclusive_uint_count * sizeof(uint);
-        offset_bytes = align_up_uint(offset_bytes, alignof(KeyType));
+        offset_bytes = align_up_view(offset_bytes);
 
         // d_prev_keys_in
         size_t prev_keys_uint_count = num_tiles * sizeof(KeyType) / sizeof(uint);
