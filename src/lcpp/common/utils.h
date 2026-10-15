@@ -92,23 +92,8 @@ struct Log2<N, 0, COUNT>
 };
 
 
-// The following overloads produce a cheap ShaderCacheKey for the per-module
-// shader caches.  The overload *signatures* (template parameters, concept
-// constraints and argument lists) are kept identical to the previous
-// string-returning versions so that every existing call site resolves to the
-// same overload and discriminates the same set of (data-type, operator)
-// combinations -- only the key representation changed, from a rebuilt
-// luisa::string to a few O(1) identity pointers.  See shader_cache.h.
-//
-// Note the data-type component uses the actual data element type the shader is
-// templated on (Type4Byte / KeyValueType / KeyType+ValueType) rather than the
-// KeyValuePair's inner value type, which is strictly finer than the old key and
-// can never merge two different element types onto one cached shader.
-
-// The remote branch switched the operator discriminator from a typeid name to a
-// hash of the generated reduction callable.  Those helpers are retained because
-// the newly added device_merge / device_topk / device_batched_topk headers build
-// their (string) cache keys directly from them.
+// Operators must be identified by their generated code: the same Callable or
+// functor type can produce different functions for different captured values.
 template <typename Type, typename BinaryOp>
 uint64_t get_binary_op_hash(BinaryOp op)
 {
@@ -128,21 +113,21 @@ uint64_t get_unary_op_hash(UnaryOp op)
 template <NumericT Type4Byte, typename ReduceOp>
 detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(), detail::op_ptr(op));
+    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(), get_binary_op_hash<Type4Byte>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp>
 detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(), detail::op_ptr(op));
+    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(), get_binary_op_hash<KeyValueType>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp, typename TransformOp>
 detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
     return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(),
-                                         detail::op_ptr(op),
-                                         detail::op_ptr(transform_op));
+                                         get_binary_op_hash<KeyValueType>(op),
+                                         get_unary_op_hash<KeyValueType>(transform_op));
 }
 
 template <typename KeyType, typename ValueType>
@@ -156,15 +141,15 @@ detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
     return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
                                          detail::type_ptr<ValueType>(),
-                                         detail::op_ptr(op));
+                                         get_binary_op_hash<ValueType>(op));
 }
 
 template <NumericT Type4Byte, typename ReduceOp, typename TransformOp>
 detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
     return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
-                                         detail::op_ptr(op),
-                                         detail::op_ptr(transform_op));
+                                         get_binary_op_hash<Type4Byte>(op),
+                                         get_unary_op_hash<Type4Byte>(transform_op));
 }
 
 
@@ -173,8 +158,8 @@ detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_o
 {
     return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
                                          detail::type_ptr<ValueType>(),
-                                         detail::op_ptr(op),
-                                         detail::op_ptr(transform_op));
+                                         get_binary_op_hash<ValueType>(op),
+                                         get_unary_op_hash<ValueType>(transform_op));
 }
 
 // Radix-sort cache key: the four per-call maps in DeviceRadixSort are all keyed
@@ -220,14 +205,13 @@ inline size_t align_up_view(size_t byte_offset) noexcept
 static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items, size_t elem_size = sizeof(uint))
 {
     auto block_size = m_block_size;
-    unsigned int max_num_elements = num_items;
     temp_storage_size = 0;
     size_t offset_bytes = 0;
-    unsigned int num_elements = max_num_elements;  // input segment size
+    size_t num_elements = num_items;  // input segment size
     while(true)
     {
         // output segment size
-        unsigned int num_blocks = imax(1, (int)ceil((float)num_elements / (items_per_thread * block_size)));
+        size_t num_blocks = std::max<size_t>(1u, ceil_div(num_elements, items_per_thread * block_size));
         if(num_blocks > 1)
         {
             offset_bytes = align_up_view(offset_bytes);

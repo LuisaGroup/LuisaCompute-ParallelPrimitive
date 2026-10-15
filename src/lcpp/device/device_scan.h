@@ -652,7 +652,7 @@ class DeviceScan : public LuisaModule
                        .dispatch(m_block_size * init_num_blocks);
 
         auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
-                                         detail::op_ptr(equality));
+                                         get_binary_op_hash<InputT>(equality));
         auto it = ms_exclusive_scan_transform_map.find(key);
         if(it == ms_exclusive_scan_transform_map.end())
         {
@@ -716,7 +716,7 @@ class DeviceScan : public LuisaModule
         cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
 
         auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
-                                         detail::op_ptr(equality));
+                                         get_binary_op_hash<InputT>(equality));
         auto it = ms_packed_exclusive_scan_transform_map.find(key);
         if(it == ms_packed_exclusive_scan_transform_map.end())
         {
@@ -911,7 +911,7 @@ class DeviceScan : public LuisaModule
                        .dispatch(m_block_size * init_num_blocks);
 
         auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
-                                         detail::op_ptr(transform));
+                                         get_unary_op_hash<InputT>(transform));
         auto it = ms_exclusive_scan_transform_map.find(key);
         if(it == ms_exclusive_scan_transform_map.end())
         {
@@ -975,7 +975,7 @@ class DeviceScan : public LuisaModule
         cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
 
         auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
-                                         detail::op_ptr(transform));
+                                         get_unary_op_hash<InputT>(transform));
         auto it = ms_packed_exclusive_scan_transform_map.find(key);
         if(it == ms_packed_exclusive_scan_transform_map.end())
         {
@@ -1079,10 +1079,9 @@ class DeviceScan : public LuisaModule
         }
 
         // scan
-        // use_initial_value selects a different compiled shader (remote);
-        // fold it into the local pointer-based cache key.
+        // use_initial_value selects a different compiled shader.
         auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
-                                                 detail::op_ptr(scan_op),
+                                                 get_binary_op_hash<Type4Byte>(scan_op),
                                                  detail::bool_ptr(use_initial_value));
         auto &scan_map = is_inclusive ? ms_inclusive_scan_map : ms_exclusive_scan_map;
         auto ms_scan_it = scan_map.find(key);
@@ -1192,7 +1191,7 @@ class DeviceScan : public LuisaModule
         cmdlist << (*ms_scan_tile_state_init_ptr)(tile_state, uint(num_tiles)).dispatch(m_block_size * init_num_blocks);
 
         auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
-                                         detail::op_ptr(scan_op),
+                                         get_binary_op_hash<Type4Byte>(scan_op),
                                          detail::bool_ptr(use_initial_value));
         auto& scan_map = is_inclusive ? ms_packed_inclusive_scan_map : ms_packed_exclusive_scan_map;
         auto  ms_scan_it = scan_map.find(key);
@@ -1302,12 +1301,11 @@ class DeviceScan : public LuisaModule
         }
 
         // scan
-        // the equality operator and use_initial_value select the compiled shader
-        // (remote); fold them into the local pointer-based cache key.
+        // The equality operator and use_initial_value also select the shader.
         auto key = detail::make_shader_cache_key(detail::type_ptr<KeyValue>(),
                                                  detail::type_ptr<ValueType>(),
-                                                 detail::op_ptr(scan_op),
-                                                 detail::op_ptr(equality_op),
+                                                 get_binary_op_hash<ValueType>(scan_op),
+                                                 get_binary_op_hash<KeyValue>(equality_op),
                                                  detail::bool_ptr(use_initial_value));
         auto& scan_by_key_map = is_inclusive ? ms_inclusive_scan_by_key_map : ms_exclusive_scan_by_key_map;
         auto ms_scan_by_it = scan_by_key_map.find(key);

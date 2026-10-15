@@ -1,23 +1,8 @@
 /*
- * Epoch 1: cheap, allocation-free key for the per-module shader caches.
- *
- * The device dispatch APIs (DeviceReduce / DeviceScan / DeviceRadixSort /
- * DeviceSegmentReduce) cache one compiled shader per (data-type, operator)
- * combination in a per-module-instance map.  The original key was a
- * `luisa::string` rebuilt on EVERY call by concatenating
- * `Type::of<T>()->description()` with `typeid(op).name()`; building that string
- * (allocation + long-string hashing) dominated the per-call host overhead
- * (~100-140 us) for small inputs.
- *
- * A shader is fully determined by compile-time quantities only: the data
- * element type(s) and the operator type(s).  We therefore key on a handful of
- * stable pointer values -- one `const luisa::compute::Type*` per data type
- * (a process-wide singleton from the type registry) and one `const
- * std::type_info*` per operator (unique per operator type, including distinct
- * lambdas) -- instead of a string.  Key construction, hashing and comparison
- * are all O(1) with no heap traffic, and every distinct operator type still
- * maps to its own shader, so a single module instance called with different
- * ops resolves the right cached shader exactly as before.
+ * Fixed-size keys for the per-module shader caches. Data types and boolean
+ * options use stable process-wide addresses. Operators use the hash of their
+ * generated callable, since objects of the same C++ type can emit different
+ * code. The key representation itself requires no string allocation.
  */
 
 #pragma once
@@ -26,9 +11,6 @@
   #include <cstddef>
   #include <cstdint>
   #include <cstdio>
-  #include <functional>
-  #include <typeinfo>
-  #include <utility>
 
   #include <luisa/ast/type.h>
   #include <luisa/core/stl/format.h>
@@ -39,21 +21,21 @@
 namespace luisa::parallel_primitive::detail
 {
 
-    /// A small fixed array of stable, process-wide identity pointers plus a
-    /// component count.  Equality compares the (few) pointers; the hash mixes
-    /// them with a splitmix-style avalanche.
+    /// Pointer identities and generated-function hashes occupy separate slot
+    /// kinds, even when their numeric values happen to match.
     struct ShaderCacheKey {
         static constexpr int MAX_SLOTS = 6;
-        std::array<const void*, MAX_SLOTS> ptrs{};
+        std::array<uint64_t, MAX_SLOTS> values{};
         uint8_t count = 0;
+        uint8_t hash_mask = 0;
 
         [[nodiscard]] bool operator==(const ShaderCacheKey& rhs) const noexcept
         {
-            if(count != rhs.count) {
+            if(count != rhs.count || hash_mask != rhs.hash_mask) {
                 return false;
             }
             for(int i = 0; i < count; ++i) {
-                if(ptrs[i] != rhs.ptrs[i]) {
+                if(values[i] != rhs.values[i]) {
                     return false;
                 }
             }
@@ -64,30 +46,51 @@ namespace luisa::parallel_primitive::detail
     struct ShaderCacheKeyHash {
         [[nodiscard]] size_t operator()(const ShaderCacheKey& k) const noexcept
         {
-            // splitmix64 avalanche over the pointer values.
+            // splitmix64 avalanche over the slot values and kinds.
             auto mix = [](uint64_t x) noexcept {
                 x += 0x9E3779B97F4A7C15ull;
                 x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
                 x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
                 return x ^ (x >> 31);
             };
-            uint64_t h = static_cast<uint64_t>(k.count);
+            uint64_t h = static_cast<uint64_t>(k.count)
+                         | (static_cast<uint64_t>(k.hash_mask) << 8u);
             for(int i = 0; i < k.count; ++i) {
-                h = mix(h ^ reinterpret_cast<uint64_t>(k.ptrs[i]));
+                h = mix(h ^ k.values[i]);
             }
             return static_cast<size_t>(h);
         }
     };
 
-    /// Build a key from up to ShaderCacheKey::MAX_SLOTS identity pointers.
-    template <typename... Ts>
-    [[nodiscard]] inline ShaderCacheKey make_shader_cache_key(const Ts*... ps) noexcept
+    struct ShaderCacheKeyComponent {
+        uint64_t value;
+        bool is_function_hash;
+    };
+
+    [[nodiscard]] inline ShaderCacheKeyComponent shader_cache_key_component(const void* identity) noexcept
     {
+        static_assert(sizeof(uintptr_t) <= sizeof(uint64_t));
+        return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(identity)), false};
+    }
+
+    [[nodiscard]] inline ShaderCacheKeyComponent shader_cache_key_component(uint64_t function_hash) noexcept
+    {
+        return {function_hash, true};
+    }
+
+    /// Build a key from identity pointers and full-width generated-function hashes.
+    template <typename... Ts>
+    [[nodiscard]] inline ShaderCacheKey make_shader_cache_key(Ts... components) noexcept
+    {
+        static_assert(sizeof...(Ts) <= ShaderCacheKey::MAX_SLOTS);
         ShaderCacheKey key;
-        const void*    raw[] = {static_cast<const void*>(ps)...};
-        key.count            = static_cast<uint8_t>(sizeof...(ps));
+        std::array<ShaderCacheKeyComponent, sizeof...(Ts)> raw{shader_cache_key_component(components)...};
+        key.count = static_cast<uint8_t>(sizeof...(Ts));
         for(uint8_t i = 0; i < key.count; ++i) {
-            key.ptrs[i] = raw[i];
+            key.values[i] = raw[i].value;
+            if(raw[i].is_function_hash) {
+                key.hash_mask |= static_cast<uint8_t>(1u << i);
+            }
         }
         return key;
     }
@@ -100,16 +103,6 @@ namespace luisa::parallel_primitive::detail
     [[nodiscard]] inline const void* type_ptr() noexcept
     {
         return static_cast<const void*>(luisa::compute::Type::of<T>());
-    }
-
-    /// Identity pointer for an operator *type*.  The operator object is only
-    /// used to deduce its static type; typeid on an lvalue returns the static
-    /// type, so this works for lambdas (unique closure type per definition site)
-    /// and named functors alike -- matching the old typeid(op).name() semantics.
-    template <typename Op>
-    [[nodiscard]] inline const void* op_ptr(const Op&) noexcept
-    {
-        return static_cast<const void*>(std::addressof(typeid(Op)));
     }
 
     /// One of two distinct, stable addresses used to fold a boolean template
@@ -138,8 +131,10 @@ namespace luisa::parallel_primitive::detail
         for(int i = 0; i < k.count; ++i)
         {
             if(i != 0) { out += ','; }
-            char buf[2 + 2 * sizeof(void*)];
-            std::snprintf(buf, sizeof(buf), "%p", k.ptrs[i]);
+            char buf[2 + 2 * sizeof(uint64_t) + 1];
+            std::snprintf(buf, sizeof(buf), "%c:%016llx",
+                          (k.hash_mask & (1u << i)) != 0 ? 'h' : 'p',
+                          static_cast<unsigned long long>(k.values[i]));
             out += buf;
         }
         out += ')';
@@ -149,7 +144,7 @@ namespace luisa::parallel_primitive::detail
 }  // namespace luisa::parallel_primitive::detail
 
 // fmt support so luisa::format can embed a ShaderCacheKey directly; keeps the
-// remote string-keyed call sites compiling against the local pointer-key type.
+// string-keyed call sites compiling against the fixed-size key type.
 template <>
 struct fmt::formatter<luisa::parallel_primitive::detail::ShaderCacheKey>
 {

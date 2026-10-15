@@ -255,7 +255,7 @@ class DeviceSegmentReduce : public LuisaModule
         size_t offset_uint = 0;
         size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
         auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
-        offset_uint = align_up_uint(offset_uint, descriptor_view_alignment_uints);
+        offset_uint = align_up_uint(offset_uint + in_kv_uint_count, descriptor_view_alignment_uints);
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
         auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
@@ -297,7 +297,7 @@ class DeviceSegmentReduce : public LuisaModule
         size_t offset_uint = 0;
         size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
         auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
-        offset_uint = align_up_uint(offset_uint, descriptor_view_alignment_uints);
+        offset_uint = align_up_uint(offset_uint + in_kv_uint_count, descriptor_view_alignment_uints);
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
         auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
@@ -340,7 +340,7 @@ class DeviceSegmentReduce : public LuisaModule
         size_t offset_uint = 0;
         size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
         auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
-        offset_uint = align_up_uint(offset_uint, descriptor_view_alignment_uints);
+        offset_uint = align_up_uint(offset_uint + in_kv_uint_count, descriptor_view_alignment_uints);
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
         auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 
@@ -383,7 +383,7 @@ class DeviceSegmentReduce : public LuisaModule
         size_t offset_uint = 0;
         size_t in_kv_uint_count  = bytes_to_uint_count(d_in.size() * sizeof(IVP));
         auto   d_in_kv           = temp_storage.subview(offset_uint, in_kv_uint_count).template as<IVP>();
-        offset_uint = align_up_uint(offset_uint, descriptor_view_alignment_uints);
+        offset_uint = align_up_uint(offset_uint + in_kv_uint_count, descriptor_view_alignment_uints);
         size_t out_kv_uint_count = bytes_to_uint_count(num_segments * sizeof(IVP));
         auto   d_out_kv = temp_storage.subview(offset_uint, out_kv_uint_count).template as<IVP>();
 

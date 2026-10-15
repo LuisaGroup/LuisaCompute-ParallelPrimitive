@@ -116,8 +116,6 @@ class DeviceReduce : public LuisaModule
       uint m_block_size = BLOCK_SIZE;
       uint m_warp_nums  = WARP_NUMS;
       uint m_shared_mem_size = 0;
-      // Epoch D: shared footprint of the wider, interop-only tile.
-      uint m_interop_shared_mem_size = 0;
       uint m_rbk_shared_mem_size = 0;
       Device m_device;
       // Optional vk-cuda interop sink (epoch A).  Null => pure-vulkan DSL path.
@@ -168,11 +166,6 @@ class DeviceReduce : public LuisaModule
         int num_elements_per_block = m_block_size * ITEMS_PER_THREAD;
         int extra_space = num_elements_per_block / m_warp_nums;
         m_shared_mem_size = (num_elements_per_block + extra_space);
-        // Epoch D: the wider tile the interop fast path may use for narrow
-        // integral elements (see REDUCE_INTEROP_ITEMS_PER_THREAD).
-        int interop_elements_per_block = m_block_size * REDUCE_INTEROP_ITEMS_PER_THREAD;
-        m_interop_shared_mem_size =
-            interop_elements_per_block + interop_elements_per_block / m_warp_nums;
         // reduce-by-key uses its own (smaller, DX-floor-bound) tile
         int rbk_elements_per_block = m_block_size * REDUCE_BY_KEY_ITEMS_PER_THREAD;
         m_rbk_shared_mem_size      = rbk_elements_per_block + rbk_elements_per_block / m_warp_nums;
@@ -216,7 +209,7 @@ class DeviceReduce : public LuisaModule
     static size_t GetReduceByKeyTempStorageBytes(size_t num_elements)
     {
         using FlagValuePairT = KeyValuePair<int, ValueType>;
-        int num_tiles = imax(1, (int)ceil((float)num_elements / (REDUCE_BY_KEY_ITEMS_PER_THREAD * BLOCK_SIZE)));
+        size_t num_tiles = std::max<size_t>(1u, ceil_div(num_elements, REDUCE_BY_KEY_ITEMS_PER_THREAD * BLOCK_SIZE));
         size_t tile_count = details::WARP_SIZE + num_tiles;
 
         size_t bytes = 0;
@@ -464,7 +457,8 @@ class DeviceReduce : public LuisaModule
             return;
         }
 
-        int num_tiles = imax(1, (int)ceil((float)num_elements / (REDUCE_BY_KEY_ITEMS_PER_THREAD * m_block_size)));
+        size_t num_tiles = std::max<size_t>(
+            1u, ceil_div(num_elements, REDUCE_BY_KEY_ITEMS_PER_THREAD * static_cast<size_t>(m_block_size)));
 
         size_t tile_count = details::WARP_SIZE + num_tiles;
 
@@ -662,13 +656,13 @@ class DeviceReduce : public LuisaModule
                 auto kernel = it->second.shader.template kernel<
                     vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ>,
                     vk_cuda_interop::CudaArg<Buffer<IndexValuePairT<Type4Byte>>, Usage::WRITE>>();
-                cmdlist << kernel(d_in, d_kv_out).dispatch(static_cast<uint>(d_in.size()));
+                cmdlist << kernel(d_in, d_kv_out).dispatch(static_cast<uint>(num_items));
                 launched = true;
             }
         }
         if(!launched)
         {
-            cmdlist << (*ms_arg_construct_ptr)(d_in, d_kv_out).dispatch(d_in.size());
+            cmdlist << (*ms_arg_construct_ptr)(d_in, d_kv_out).dispatch(static_cast<uint>(num_items));
         }
 
         return 0;
@@ -775,8 +769,21 @@ class DeviceReduce : public LuisaModule
         // transform_reduce_applies_transform_once_at_every_size).
         constexpr bool   kInteropWide  = reduce_interop_wide_tile_v<Type> &&
                                          std::is_same_v<TransformOp, IdentityOp>;
-        constexpr size_t kInteropItems = kInteropWide ? REDUCE_INTEROP_ITEMS_PER_THREAD
-                                        : ITEMS_PER_THREAD;
+        // A wider tile emits fewer partials than the portable sizing policy.
+        // Never narrow a caller's custom tile and exceed its scratch capacity.
+        constexpr size_t kInteropItems = kInteropWide
+                                            ? std::max(ITEMS_PER_THREAD, REDUCE_INTEROP_ITEMS_PER_THREAD)
+                                            : ITEMS_PER_THREAD;
+        constexpr size_t kInteropSharedMem = policy_shared_mem_size<BLOCK_SIZE, kInteropItems>();
+        // Equivalent transforms can select different tiles: IdentityOp enables
+        // the wider policy, while an identity lambda keeps the portable tile.
+        auto make_interop_key = [&]
+        {
+            return detail::make_shader_cache_key(detail::type_ptr<Type>(),
+                                                  get_binary_op_hash<Type>(reduce_op),
+                                                  get_unary_op_hash<Type>(transform_op),
+                                                  static_cast<uint64_t>(kInteropItems));
+        };
         // reduce_device_occupancy × subscription_factor
         // reduce_device_occupancy = sm_occupancy × sm_count
         // sm_occupancy = 8 sm_count = 128, subscription_factor = 5
@@ -816,16 +823,16 @@ class DeviceReduce : public LuisaModule
         const uint dsl_tile_items     = m_block_size * static_cast<uint>(ITEMS_PER_THREAD);
         auto       launched           = false;
         uint       tile_items         = dsl_tile_items;  // portable: the safe default
-        uint       num_tiles          = imax(1, (uint)ceil((float)num_items / tile_items));
+        uint       num_tiles          = std::max(1u, ceil_div(num_items, tile_items));
 
         if constexpr(interop_eligible)
         {
             if(m_interop != nullptr)
             {
-                const uint wide_tiles = imax(1, (uint)ceil((float)num_items / interop_tile_items));
+                const uint wide_tiles = std::max(1u, ceil_div(num_items, interop_tile_items));
                 if(wide_tiles > 1)
                 {
-                    auto key = get_type_and_op_desc<Type>(reduce_op, transform_op);
+                    auto key = make_interop_key();
                     auto it  = ms_reduce_interop_map.find(key);
                     if(it == ms_reduce_interop_map.end())
                     {
@@ -834,7 +841,7 @@ class DeviceReduce : public LuisaModule
                             ms_reduce_interop_map,
                             key,
                             InteropReduceShader().compile(
-                                m_interop->cuda_device(), m_interop_shared_mem_size, reduce_op, transform_op));
+                                m_interop->cuda_device(), kInteropSharedMem, reduce_op, transform_op));
                     }
                     if(it != ms_reduce_interop_map.end())
                     {
@@ -858,7 +865,7 @@ class DeviceReduce : public LuisaModule
                 }
                 else
                 {
-                    auto key = get_type_and_op_desc<Type>(reduce_op, transform_op);
+                    auto key = make_interop_key();
                     auto it  = ms_single_reduce_interop_map.find(key);
                     if(it == ms_single_reduce_interop_map.end())
                     {
@@ -867,7 +874,7 @@ class DeviceReduce : public LuisaModule
                             ms_single_reduce_interop_map,
                             key,
                             InteropReduceShader().compile_single_tile(
-                                m_interop->cuda_device(), m_interop_shared_mem_size, reduce_op, transform_op));
+                                m_interop->cuda_device(), kInteropSharedMem, reduce_op, transform_op));
                     }
                     if(it != ms_single_reduce_interop_map.end())
                     {
@@ -900,7 +907,7 @@ class DeviceReduce : public LuisaModule
             // re-derived here, so the narrow shader is never launched with wide
             // geometry and the recursion never inherits a mixed size.
             tile_items = dsl_tile_items;
-            num_tiles  = imax(1, (uint)ceil((float)num_items / tile_items));
+            num_tiles  = std::max(1u, ceil_div(num_items, tile_items));
             if(num_tiles > 1)
             {
                 auto key          = get_type_and_op_desc<Type>(reduce_op, transform_op);
@@ -1027,7 +1034,7 @@ class DeviceReduce : public LuisaModule
                                           uint                         num_items) noexcept
     {
         uint tile_items = m_block_size * REDUCE_BY_KEY_ITEMS_PER_THREAD;
-        uint num_tiles  = imax(1, (uint)ceil((float)num_items / tile_items));
+        uint num_tiles  = std::max(1u, ceil_div(num_items, tile_items));
 
 
         using ReduceByKey = details::ReduceByKeyModule<KeyType, ValueType, BLOCK_SIZE, REDUCE_BY_KEY_ITEMS_PER_THREAD>;
