@@ -1,5 +1,7 @@
 # CUDA and CUB parity performance receipt
 
+Update (2026-10-15): ordinary 4-byte CUDA/interop scans now select this policy by default. See the [default and segmented scan retest](scan-defaults-2026-10-15.md); the measurements below describe the earlier opt-in version.
+
 Date: 2026-10-13
 GPU: NVIDIA GeForce RTX 5090, compute capability 12.0
 Driver: 13010

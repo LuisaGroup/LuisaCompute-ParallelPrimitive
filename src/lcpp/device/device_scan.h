@@ -19,6 +19,7 @@
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/var.h>
 #include <lcpp/runtime/core.h>
+#include <lcpp/runtime/interop_dispatch.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/util_type.h>
 #include <lcpp/common/utils.h>
@@ -32,9 +33,13 @@ namespace luisa::parallel_primitive
 {
 
 using namespace luisa::compute;
+// The default policy selects a coalesced 320-thread, 25-item ordinary CUDA
+// scan for 4-byte values, including CUDA kernels imported through Vulkan
+// interop. Other backends, wider values, transform/adjacent scans, scan-by-key
+// and explicit custom policies keep the portable configuration below.
 template <size_t BLOCK_SIZE                         = details::BLOCK_SIZE,
           size_t WARP_NUMS                          = details::WARP_SIZE,
-          size_t ITEMS_PER_THREAD                   = details::ITEMS_PER_THREAD,
+          size_t ITEMS_PER_THREAD                   = 15,
           BlockLoadAlgorithm LOAD_ALGORITHM         = BlockLoadAlgorithm::BLOCK_LOAD_DIRECT,
           BlockStoreAlgorithm STORE_ALGORITHM       = BlockStoreAlgorithm::BLOCK_STORE_DIRECT,
           // CUDA-only opt-in for warp-local transpose synchronization.
@@ -44,10 +49,30 @@ template <size_t BLOCK_SIZE                         = details::BLOCK_SIZE,
 class DeviceScan : public LuisaModule
 {
   private:
+    static constexpr bool DEFAULT_POLICY =
+        BLOCK_SIZE == details::BLOCK_SIZE && WARP_NUMS == details::WARP_SIZE
+        && ITEMS_PER_THREAD == 15u
+        && LOAD_ALGORITHM == BlockLoadAlgorithm::BLOCK_LOAD_DIRECT
+        && STORE_ALGORITHM == BlockStoreAlgorithm::BLOCK_STORE_DIRECT
+        && !WARP_SYNC && !PACKED_TILE_STATE;
+    static constexpr size_t CUDA_BLOCK_SIZE = 320u;
+    static constexpr size_t CUDA_ITEMS_PER_THREAD = 25u;
+
+    template <typename T>
+    using CudaScanModule = details::ScanModule<
+        T,
+        CUDA_BLOCK_SIZE,
+        CUDA_ITEMS_PER_THREAD,
+        BlockLoadAlgorithm::BLOCK_LOAD_WARP_TRANSPOSE,
+        BlockStoreAlgorithm::BLOCK_STORE_WARP_TRANSPOSE,
+        true>;
+
     uint m_block_size = BLOCK_SIZE;
 
     uint   m_shared_mem_size = 0;
     Device m_device;
+    // Optional vk-cuda interop sink (epoch B).  Null => pure-vulkan DSL path.
+    InteropContext* m_interop = nullptr;
     bool   m_created = false;
 
     template <typename T>
@@ -74,11 +99,13 @@ class DeviceScan : public LuisaModule
         BufferView<KeyT>           previous_keys;
     };
 
-    [[nodiscard]] static size_t num_tiles_for(size_t num_items, size_t block_size)
+    [[nodiscard]] static size_t num_tiles_for(size_t num_items,
+                                              size_t block_size,
+                                              size_t items_per_thread = ITEMS_PER_THREAD)
     {
-        LUISA_ASSERT(block_size > 0u && ITEMS_PER_THREAD > 0u, "DeviceScan tile dimensions must be non-zero.");
+        LUISA_ASSERT(block_size > 0u && items_per_thread > 0u, "DeviceScan tile dimensions must be non-zero.");
         LUISA_ASSERT(num_items <= std::numeric_limits<uint>::max(), "Too many items for DeviceScan.");
-        return std::max<size_t>(1u, ceil_div(num_items, block_size * ITEMS_PER_THREAD));
+        return std::max<size_t>(1u, ceil_div(num_items, block_size * items_per_thread));
     }
 
     template <typename T>
@@ -144,9 +171,10 @@ class DeviceScan : public LuisaModule
 
     [[nodiscard]] static PackedScanTempViews packed_scan_temp_views(BufferView<uint> temp_storage,
                                                                       size_t         num_items,
-                                                                      size_t         block_size)
+                                                                      size_t         block_size,
+                                                                      size_t         items_per_thread = ITEMS_PER_THREAD)
     {
-        size_t tile_count = details::WARP_SIZE + num_tiles_for(num_items, block_size);
+        size_t tile_count = details::WARP_SIZE + num_tiles_for(num_items, block_size, items_per_thread);
         return {temp_storage.subview(0u, bytes_to_uint_count(tile_count * sizeof(ulong))).template as<ulong>()};
     }
 
@@ -193,7 +221,7 @@ class DeviceScan : public LuisaModule
         }
         LUISA_ASSERT(input.size() >= num_items, "DeviceScan input view is too small.");
         LUISA_ASSERT(output.size() >= num_items, "DeviceScan output view is too small.");
-        LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(scan_temp_storage_bytes<T>(num_items, m_block_size)),
+        LUISA_ASSERT(temp_storage.size() >= bytes_to_uint_count(GetTempStorageBytes<T>(num_items)),
                      "DeviceScan temporary storage is too small.");
     }
 
@@ -233,9 +261,18 @@ class DeviceScan : public LuisaModule
         return nullptr;
 #endif
     }
-    void create(Device& device, Stream* debug_stream = nullptr)
+    // `interop` is optional: pass a valid InteropContext (see
+    // lcpp/runtime/interop_dispatch.h) to launch the scan / scan-by-key
+    // kernels as cuda-backend modules inside the vk command buffer.  Without
+    // it (or when the context is null because the fast path is unavailable)
+    // every op keeps its pure-vulkan DSL dispatch path.
+    void create(Device& device, Stream* debug_stream = nullptr, InteropContext* interop = nullptr)
     {
-        m_device = device;
+        m_device                   = device;
+        // Epoch C per-op policy: `LCPP_INTEROP` (1|all|auto|a,b,c) decides
+        // per module whether this one takes the fast path; see
+        // lcpp/runtime/interop_dispatch.h.
+        m_interop = interop_for(interop, "scan");
 #ifndef NDEBUG
         m_debug_stream = debug_stream;
 #endif
@@ -246,6 +283,10 @@ class DeviceScan : public LuisaModule
         m_created                  = true;
     }
 
+    /// True when this module dispatches its scan kernels through the vk-cuda
+    /// interop fast path (cuda-compiled module, vk command buffer).
+    [[nodiscard]] bool interop_active() const noexcept { return m_interop != nullptr; }
+
     // ============================================================
     // GetTempStorageBytes: compute required temp buffer size (in bytes)
     // ============================================================
@@ -254,7 +295,16 @@ class DeviceScan : public LuisaModule
     template <typename T>
     static size_t GetTempStorageBytes(size_t num_items)
     {
-        return scan_temp_storage_bytes<T>(num_items, BLOCK_SIZE);
+        size_t bytes = scan_temp_storage_bytes<T>(num_items, BLOCK_SIZE);
+        if constexpr(DEFAULT_POLICY && sizeof(T) == sizeof(uint))
+        {
+            // The query has no device argument: reserve both the portable
+            // triple-buffer layout and the runtime-selected CUDA packed one.
+            size_t cuda_tiles = details::WARP_SIZE
+                                + num_tiles_for(num_items, CUDA_BLOCK_SIZE, CUDA_ITEMS_PER_THREAD);
+            bytes = std::max(bytes, align_up_temp_storage(cuda_tiles * sizeof(ulong)));
+        }
+        return bytes;
     }
 
     /// Temp storage bytes for ExclusiveScanByKey / InclusiveScanByKey
@@ -547,6 +597,105 @@ class DeviceScan : public LuisaModule
 
 
   private:
+    // Returns 1 after recording the CUDA path, 0 to use the original path,
+    // or a negative compilation error. Both launches are prepared before
+    // recording either one. An import failure can therefore retry the
+    // original portable layout without mixing
+    // packed CUDA state with the portable tile-status triple.
+    template <NumericT T, typename CompileScan>
+    [[nodiscard]] int try_dispatch_cuda_scan(CommandList& cmdlist,
+                                              BufferView<uint> temp_storage,
+                                              BufferView<T> input,
+                                              BufferView<T> output,
+                                              size_t num_items,
+                                              T initial_value,
+                                              const detail::ShaderCacheKey& key,
+                                              detail::ShaderCacheMap& scan_map,
+                                              detail::InteropShaderMap& interop_map,
+                                              CompileScan compile_scan)
+    {
+        static_assert(sizeof(T) == sizeof(uint));
+        if(m_interop == nullptr && m_device.backend_name() != "cuda")
+        {
+            return 0;
+        }
+        using ScanModule = CudaScanModule<T>;
+        using InitKernel = typename ScanModule::PackedScanTileStateInitKernel;
+        using ScanKernel = typename ScanModule::PackedScanKernel;
+        uint num_tiles = static_cast<uint>(num_tiles_for(num_items, CUDA_BLOCK_SIZE, CUDA_ITEMS_PER_THREAD));
+        uint init_threads = static_cast<uint>(CUDA_BLOCK_SIZE * ceil_div(size_t(num_tiles), CUDA_BLOCK_SIZE));
+        uint scan_threads = static_cast<uint>(CUDA_BLOCK_SIZE * num_tiles);
+        auto tile_state = packed_scan_temp_views(
+            temp_storage, num_items, CUDA_BLOCK_SIZE, CUDA_ITEMS_PER_THREAD).tile_state;
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<T>(),
+                                                     uint64_t(CUDA_BLOCK_SIZE),
+                                                     uint64_t(CUDA_ITEMS_PER_THREAD));
+        if(m_interop != nullptr)
+        {
+            auto init_it = ms_packed_scan_key_interop.find(init_key);
+            if(init_it == ms_packed_scan_key_interop.end())
+            {
+                init_it = import_into_interop_cache(
+                    m_interop,
+                    ms_packed_scan_key_interop,
+                    init_key,
+                    ScanModule().compile_packed_scan_tile_state_init(m_interop->cuda_device()));
+            }
+            if(m_interop == nullptr || init_it == ms_packed_scan_key_interop.end())
+            {
+                return 0;
+            }
+            auto scan_it = interop_map.find(key);
+            if(scan_it == interop_map.end())
+            {
+                scan_it = import_into_interop_cache(
+                    m_interop, interop_map, key, compile_scan(m_interop->cuda_device()));
+            }
+            if(m_interop == nullptr || scan_it == interop_map.end())
+            {
+                return 0;
+            }
+            auto init = init_it->second.shader.template kernel<
+                vk_cuda_interop::CudaArg<Buffer<ulong>, Usage::READ_WRITE>, uint>();
+            auto scan = scan_it->second.shader.template kernel<
+                vk_cuda_interop::CudaArg<Buffer<ulong>, Usage::READ_WRITE>,
+                vk_cuda_interop::CudaArg<Buffer<T>, Usage::READ>,
+                vk_cuda_interop::CudaArg<Buffer<T>, Usage::WRITE>,
+                T,
+                uint>();
+            cmdlist << init(tile_state, num_tiles).dispatch(init_threads);
+            cmdlist << scan(tile_state, input, output, initial_value, uint(num_items)).dispatch(scan_threads);
+            return 1;
+        }
+        auto init_it = ms_packed_scan_key.find(init_key);
+        if(init_it == ms_packed_scan_key.end())
+        {
+            auto shader = ScanModule().compile_packed_scan_tile_state_init(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            ms_packed_scan_key.try_emplace(init_key, std::move(shader));
+            init_it = ms_packed_scan_key.find(init_key);
+        }
+        auto scan_it = scan_map.find(key);
+        if(scan_it == scan_map.end())
+        {
+            auto shader = compile_scan(m_device);
+            if(!shader)
+            {
+                return -1;
+            }
+            scan_map.try_emplace(key, std::move(shader));
+            scan_it = scan_map.find(key);
+        }
+        auto init = reinterpret_cast<InitKernel*>(&(*init_it->second));
+        auto scan = reinterpret_cast<ScanKernel*>(&(*scan_it->second));
+        cmdlist << (*init)(tile_state, num_tiles).dispatch(init_threads);
+        cmdlist << (*scan)(tile_state, input, output, initial_value, uint(num_items)).dispatch(scan_threads);
+        return 1;
+    }
+
     template <NumericT InputT, typename TransformOp>
     void dispatch_scan_transform(CommandList&       cmdlist,
                                  BufferView<uint>   temp_storage,
@@ -606,7 +755,7 @@ class DeviceScan : public LuisaModule
                                                LOAD_ALGORITHM,
                                                STORE_ALGORITHM,
                                                WARP_SYNC>;
-        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<uint>());
         auto init_it  = ms_scan_key.find(init_key);
         if(init_it == ms_scan_key.end())
         {
@@ -627,9 +776,8 @@ class DeviceScan : public LuisaModule
         cmdlist << (*init_shader)(tile_states, tile_partial, tile_inclusive, num_tiles)
                        .dispatch(m_block_size * init_num_blocks);
 
-        auto key = luisa::format("adjacent+{}+{}",
-                                 luisa::compute::Type::of<InputT>()->description(),
-                                 equality.function().hash());
+        auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
+                                         get_binary_op_hash<InputT>(equality));
         auto it = ms_exclusive_scan_transform_map.find(key);
         if(it == ms_exclusive_scan_transform_map.end())
         {
@@ -672,7 +820,7 @@ class DeviceScan : public LuisaModule
                                                LOAD_ALGORITHM,
                                                STORE_ALGORITHM,
                                                WARP_SYNC>;
-        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<uint>());
         auto init_it  = ms_packed_scan_key.find(init_key);
         if(init_it == ms_packed_scan_key.end())
         {
@@ -692,9 +840,8 @@ class DeviceScan : public LuisaModule
         size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
         cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
 
-        auto key = luisa::format("adjacent+{}+{}",
-                                 luisa::compute::Type::of<InputT>()->description(),
-                                 equality.function().hash());
+        auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
+                                         get_binary_op_hash<InputT>(equality));
         auto it = ms_packed_exclusive_scan_transform_map.find(key);
         if(it == ms_packed_exclusive_scan_transform_map.end())
         {
@@ -731,6 +878,31 @@ class DeviceScan : public LuisaModule
         if(num_items == 0u)
         {
             return;
+        }
+        if constexpr(DEFAULT_POLICY && sizeof(Type4Byte) == sizeof(uint))
+        {
+            if(m_interop != nullptr || m_device.backend_name() == "cuda")
+            {
+                auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
+                                                         get_binary_op_hash<Type4Byte>(scan_op),
+                                                         detail::bool_ptr(use_initial_value),
+                                                         uint64_t(CUDA_BLOCK_SIZE),
+                                                         uint64_t(CUDA_ITEMS_PER_THREAD));
+                auto& scan_map = is_inclusive ? ms_packed_inclusive_scan_map : ms_packed_exclusive_scan_map;
+                auto& interop_map = is_inclusive ? ms_packed_inclusive_scan_interop_map
+                                                 : ms_packed_exclusive_scan_interop_map;
+                auto status = try_dispatch_cuda_scan(
+                    cmdlist, temp_storage, d_in, d_out, num_items, initial_value, key, scan_map, interop_map,
+                    [&](Device& device) {
+                        return CudaScanModule<Type4Byte>().template compile_packed<is_inclusive, use_initial_value>(
+                            device, CUDA_BLOCK_SIZE * CUDA_ITEMS_PER_THREAD, scan_op);
+                    });
+                if(status != 0)
+                {
+                    lcpp_check(status < 0 ? status : 0, cmdlist, debug_stream());
+                    return;
+                }
+            }
         }
         if constexpr(sizeof(Type4Byte) == sizeof(uint))
         {
@@ -867,7 +1039,7 @@ class DeviceScan : public LuisaModule
                                                LOAD_ALGORITHM,
                                                STORE_ALGORITHM,
                                                WARP_SYNC>;
-        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<uint>());
         auto init_it  = ms_scan_key.find(init_key);
         if(init_it == ms_scan_key.end())
         {
@@ -888,9 +1060,8 @@ class DeviceScan : public LuisaModule
         cmdlist << (*init_shader)(tile_states, tile_partial, tile_inclusive, num_tiles)
                        .dispatch(m_block_size * init_num_blocks);
 
-        auto key = luisa::format("transform+{}+{}",
-                                 luisa::compute::Type::of<InputT>()->description(),
-                                 transform.function().hash());
+        auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
+                                         get_unary_op_hash<InputT>(transform));
         auto it = ms_exclusive_scan_transform_map.find(key);
         if(it == ms_exclusive_scan_transform_map.end())
         {
@@ -933,7 +1104,7 @@ class DeviceScan : public LuisaModule
                                                LOAD_ALGORITHM,
                                                STORE_ALGORITHM,
                                                WARP_SYNC>;
-        auto init_key = luisa::string{luisa::compute::Type::of<uint>()->description()};
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<uint>());
         auto init_it  = ms_packed_scan_key.find(init_key);
         if(init_it == ms_packed_scan_key.end())
         {
@@ -953,9 +1124,8 @@ class DeviceScan : public LuisaModule
         size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
         cmdlist << (*init_shader)(tile_state, num_tiles).dispatch(m_block_size * init_num_blocks);
 
-        auto key = luisa::format("transform+{}+{}",
-                                 luisa::compute::Type::of<InputT>()->description(),
-                                 transform.function().hash());
+        auto key = detail::make_shader_cache_key(detail::type_ptr<InputT>(),
+                                         get_unary_op_hash<InputT>(transform));
         auto it = ms_packed_exclusive_scan_transform_map.find(key);
         if(it == ms_packed_exclusive_scan_transform_map.end())
         {
@@ -1002,7 +1172,7 @@ class DeviceScan : public LuisaModule
 
 
         size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
-        auto   init_key = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto   init_key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto   ms_tile_state_init_it = ms_scan_key.find(init_key);
         if(ms_tile_state_init_it == ms_scan_key.end())
         {
@@ -1020,17 +1190,51 @@ class DeviceScan : public LuisaModule
         }
         auto ms_scan_tile_state_init_ptr =
             reinterpret_cast<ScanTileStateInitKernel*>(&(*ms_tile_state_init_it->second));
-        if(!ms_scan_tile_state_init_ptr)
+        if(!ms_scan_tile_state_init_ptr) { return -1; }
+        uint init_threads = m_block_size * static_cast<uint>(init_num_blocks);
+        auto init_launched = false;
+        // ---- interop fast path: tile-state init ----
+        // Usage table: `InitializeWardStatus` only writes `tile_status`
+        // (head padding + per-tile INVALID); tile_partial / tile_inclusive are
+        // never touched by the init kernel.  They are declared READ_WRITE
+        // conservatively -- the following scan kernel is ordered behind this
+        // dispatch either way (tile_status RAW), so no extra barrier is paid.
+        if(m_interop != nullptr)
         {
-            return -1;
+            auto it = ms_scan_key_interop.find(init_key);
+            if(it == ms_scan_key_interop.end())
+            {
+                it = import_into_interop_cache(
+                    m_interop,
+                    ms_scan_key_interop,
+                    init_key,
+                    ScanShader().compile_scan_tile_state_init(m_interop->cuda_device()));
+            }
+            if(it != ms_scan_key_interop.end())
+            {
+                auto kernel = it->second.shader.template kernel<
+                    vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ_WRITE>,
+                    uint>();
+                cmdlist << kernel(tile_states, tile_partial, tile_inclusive, uint(num_tiles))
+                               .dispatch(init_threads);
+                init_launched = true;
+            }
         }
-        cmdlist << (*ms_scan_tile_state_init_ptr)(tile_states, tile_partial, tile_inclusive, uint(num_tiles))
-                       .dispatch(m_block_size * init_num_blocks);
+        if(!init_launched)
+        {
+            cmdlist << (*ms_scan_tile_state_init_ptr)(tile_states, tile_partial, tile_inclusive, uint(num_tiles))
+                           .dispatch(init_threads);
+        }
 
         // scan
-        auto key = luisa::format("{}+initial:{}", get_type_and_op_desc<Type4Byte>(scan_op), use_initial_value);
-        auto& scan_map   = is_inclusive ? ms_inclusive_scan_map : ms_exclusive_scan_map;
-        auto  ms_scan_it = scan_map.find(key);
+        // use_initial_value selects a different compiled shader.
+        auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
+                                                 get_binary_op_hash<Type4Byte>(scan_op),
+                                                 detail::bool_ptr(use_initial_value));
+        auto &scan_map = is_inclusive ? ms_inclusive_scan_map : ms_exclusive_scan_map;
+        auto ms_scan_it = scan_map.find(key);
         if(ms_scan_it == scan_map.end())
         {
             auto shader = ScanShader().template compile<is_inclusive, use_initial_value>(
@@ -1047,13 +1251,46 @@ class DeviceScan : public LuisaModule
             return -1;
         }
         auto ms_scan_ptr = reinterpret_cast<ScanShaderKernel*>(&(*ms_scan_it->second));
-        if(!ms_scan_ptr)
+        if(!ms_scan_ptr) { return -1; }
+        uint scan_threads = m_block_size * num_tiles;
+        auto scan_launched = false;
+        // ---- interop fast path: decoupled-look-back scan ----
+        // Usage table: the tile-state triple is the decoupled-look-back channel
+        // (volatile_write of partial/inclusive values + status words, then
+        // volatile_read/WaitForValid spin-polling by later tiles) so it is
+        // READ_WRITE; d_in is read once per element and never written; d_out is
+        // written and never read.
+        if(m_interop != nullptr)
         {
-            return -1;
+            auto &scan_interop_map = is_inclusive ? ms_inclusive_scan_interop_map : ms_exclusive_scan_interop_map;
+            auto  it               = scan_interop_map.find(key);
+            if(it == scan_interop_map.end())
+            {
+                auto compiled = ScanShader().template compile<is_inclusive, use_initial_value>(
+                    m_interop->cuda_device(), m_shared_mem_size, scan_op);
+                it = import_into_interop_cache(m_interop, scan_interop_map, key, compiled);
+            }
+            if(it != scan_interop_map.end())
+            {
+                auto kernel = it->second.shader.template kernel<
+                    vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::READ>,
+                    vk_cuda_interop::CudaArg<Buffer<Type4Byte>, Usage::WRITE>,
+                    Type4Byte,
+                    uint>();
+                cmdlist << kernel(tile_states, tile_partial, tile_inclusive, d_in, d_out, initial_value, uint(num_items))
+                               .dispatch(scan_threads);
+                scan_launched = true;
+            }
         }
-        cmdlist
-            << (*ms_scan_ptr)(tile_states, tile_partial, tile_inclusive, d_in, d_out, initial_value, static_cast<uint>(num_items))
-                   .dispatch(m_block_size * num_tiles);
+        if(!scan_launched)
+        {
+            cmdlist << (*ms_scan_ptr)(tile_states, tile_partial, tile_inclusive, d_in, d_out, initial_value, num_items)
+                           .dispatch(scan_threads);
+        }
+
         return 0;
     }
 
@@ -1079,7 +1316,7 @@ class DeviceScan : public LuisaModule
         using ScanShaderKernel           = ScanShader::PackedScanKernel;
 
         size_t init_num_blocks = ceil_div(num_tiles, m_block_size);
-        auto   init_key        = luisa::string{luisa::compute::Type::of<Type4Byte>()->description()};
+        auto init_key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>());
         auto   ms_tile_state_init_it = ms_packed_scan_key.find(init_key);
         if(ms_tile_state_init_it == ms_packed_scan_key.end())
         {
@@ -1103,7 +1340,9 @@ class DeviceScan : public LuisaModule
         }
         cmdlist << (*ms_scan_tile_state_init_ptr)(tile_state, uint(num_tiles)).dispatch(m_block_size * init_num_blocks);
 
-        auto key = luisa::format("{}+initial:{}", get_type_and_op_desc<Type4Byte>(scan_op), use_initial_value);
+        auto key = detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
+                                         get_binary_op_hash<Type4Byte>(scan_op),
+                                         detail::bool_ptr(use_initial_value));
         auto& scan_map = is_inclusive ? ms_packed_inclusive_scan_map : ms_packed_exclusive_scan_map;
         auto  ms_scan_it = scan_map.find(key);
         if(ms_scan_it == scan_map.end())
@@ -1171,24 +1410,58 @@ class DeviceScan : public LuisaModule
         }
         auto ms_scan_by_key_tile_state_init_ptr =
             reinterpret_cast<ScanByKeyTileStateInitKernel*>(&(*ms_scan_by_key_tile_state_init_it->second));
-        if(!ms_scan_by_key_tile_state_init_ptr)
+        if(!ms_scan_by_key_tile_state_init_ptr) { return -1; }
+        uint init_threads = m_block_size * static_cast<uint>(init_num_blocks);
+        auto init_launched = false;
+        // ---- interop fast path: tile-state init (+ d_prev_keys_in) ----
+        // Usage table: `InitializeWardStatus` writes tile_status, and the same
+        // kernel writes the one key preceding each tile into d_prev_keys_in;
+        // d_keys_in is read for it.  tile_partial / tile_inclusive are declared
+        // READ_WRITE conservatively (see the plain scan path above).
+        if(m_interop != nullptr)
         {
-            return -1;
+            auto it = ms_scan_by_key_tile_state_init_interop_map.find(init_key);
+            if(it == ms_scan_by_key_tile_state_init_interop_map.end())
+            {
+                it = import_into_interop_cache(
+                    m_interop,
+                    ms_scan_by_key_tile_state_init_interop_map,
+                    init_key,
+                    ScanByKeyShader().compile_scan_tile_state_init(m_interop->cuda_device()));
+            }
+            if(it != ms_scan_by_key_tile_state_init_interop_map.end())
+            {
+                auto kernel = it->second.shader.template kernel<
+                    vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<FlagValueT>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<FlagValueT>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<KeyValue>, Usage::READ>,
+                    vk_cuda_interop::CudaArg<Buffer<KeyValue>, Usage::WRITE>,
+                    int>();
+                cmdlist << kernel(tile_states, tile_partial, tile_inclusive, d_keys_in, d_prev_keys_in, int(num_tiles))
+                               .dispatch(init_threads);
+                init_launched = true;
+            }
         }
-        cmdlist << (*ms_scan_by_key_tile_state_init_ptr)(
-                       tile_states, tile_partial, tile_inclusive, d_keys_in, d_prev_keys_in, uint(num_tiles))
-                       .dispatch(m_block_size * init_num_blocks);
+        if(!init_launched)
+        {
+            cmdlist << (*ms_scan_by_key_tile_state_init_ptr)(
+                           tile_states, tile_partial, tile_inclusive, d_keys_in, d_prev_keys_in, uint(num_tiles))
+                           .dispatch(init_threads);
+        }
 
         // scan
-        auto key = luisa::format("{}+{}+initial:{}",
-                                 get_type_and_op_desc<KeyValue, ValueType>(scan_op),
-                                 get_binary_op_hash<KeyValue>(equality_op),
-                                 use_initial_value);
+        // The equality operator and use_initial_value also select the shader.
+        auto key = detail::make_shader_cache_key(detail::type_ptr<KeyValue>(),
+                                                 detail::type_ptr<ValueType>(),
+                                                 get_binary_op_hash<ValueType>(scan_op),
+                                                 get_binary_op_hash<KeyValue>(equality_op),
+                                                 detail::bool_ptr(use_initial_value));
         auto& scan_by_key_map = is_inclusive ? ms_inclusive_scan_by_key_map : ms_exclusive_scan_by_key_map;
         auto ms_scan_by_it = scan_by_key_map.find(key);
         if(ms_scan_by_it == scan_by_key_map.end())
         {
-            LUISA_INFO("Compiling Scan By Key shader for key: {}", key);
+            LUISA_INFO("Compiling Scan By Key shader (cache miss)");
             auto shader = ScanByKeyShader().template compile<is_inclusive, use_initial_value>(
                 m_device, m_shared_mem_size, scan_op, equality_op);
             if(!shader)
@@ -1203,41 +1476,90 @@ class DeviceScan : public LuisaModule
             return -1;
         }
         auto ms_scan_by_key_ptr = reinterpret_cast<ScanByKeyShaderKernel*>(&(*ms_scan_by_it->second));
-        if(!ms_scan_by_key_ptr)
+        if(!ms_scan_by_key_ptr) { return -1; }
+        uint scan_threads  = m_block_size * num_tiles;
+        auto scan_launched = false;
+        // ---- interop fast path: decoupled-look-back scan-by-key ----
+        // Usage table: same tile-state channel as the plain scan (READ_WRITE),
+        // d_keys_in / d_prev_keys_in / d_values_in are read only, d_values_out
+        // is written only.
+        if(m_interop != nullptr)
         {
-            return -1;
+            auto &scan_by_key_interop_map =
+                is_inclusive ? ms_inclusive_scan_by_key_interop_map : ms_exclusive_scan_by_key_interop_map;
+            auto it = scan_by_key_interop_map.find(key);
+            if(it == scan_by_key_interop_map.end())
+            {
+                auto compiled = ScanByKeyShader().template compile<is_inclusive, use_initial_value>(
+                    m_interop->cuda_device(), m_shared_mem_size, scan_op, equality_op);
+                it = import_into_interop_cache(m_interop, scan_by_key_interop_map, key, compiled);
+            }
+            if(it != scan_by_key_interop_map.end())
+            {
+                auto kernel = it->second.shader.template kernel<
+                    vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<FlagValueT>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<FlagValueT>, Usage::READ_WRITE>,
+                    vk_cuda_interop::CudaArg<Buffer<KeyValue>, Usage::READ>,
+                    vk_cuda_interop::CudaArg<Buffer<KeyValue>, Usage::READ>,
+                    vk_cuda_interop::CudaArg<Buffer<ValueType>, Usage::READ>,
+                    vk_cuda_interop::CudaArg<Buffer<ValueType>, Usage::WRITE>,
+                    ValueType,
+                    uint>();
+                cmdlist << kernel(tile_states,
+                                  tile_partial,
+                                  tile_inclusive,
+                                  d_keys_in,
+                                  d_prev_keys_in,
+                                  d_values_in,
+                                  d_values_out,
+                                  initial_value,
+                                  uint(num_items))
+                               .dispatch(scan_threads);
+                scan_launched = true;
+            }
         }
-        cmdlist << (*ms_scan_by_key_ptr)(tile_states,
-                                         tile_partial,
-                                         tile_inclusive,
-                                         d_keys_in,
-                                         d_prev_keys_in,
-                                         d_values_in,
-                                         d_values_out,
-                                         initial_value,
-                                         static_cast<uint>(num_items))
-                       .dispatch(m_block_size * num_tiles);
+        if(!scan_launched)
+        {
+            cmdlist << (*ms_scan_by_key_ptr)(
+                           tile_states, tile_partial, tile_inclusive, d_keys_in, d_prev_keys_in, d_values_in, d_values_out, initial_value, num_items)
+                           .dispatch(scan_threads);
+        }
         return 0;
     }
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_key;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_inclusive_scan_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_transform_map;
+    detail::ShaderCacheMap ms_scan_key;
+    detail::ShaderCacheMap ms_exclusive_scan_map;
+    detail::ShaderCacheMap ms_inclusive_scan_map;
+    detail::ShaderCacheMap ms_exclusive_scan_transform_map;
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_scan_key;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_exclusive_scan_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_inclusive_scan_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_packed_exclusive_scan_transform_map;
+    detail::ShaderCacheMap ms_packed_scan_key;
+    detail::ShaderCacheMap ms_packed_exclusive_scan_map;
+    detail::ShaderCacheMap ms_packed_inclusive_scan_map;
+    detail::ShaderCacheMap ms_packed_exclusive_scan_transform_map;
 
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_scan_by_key_tile_state_init_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_exclusive_scan_by_key_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_inclusive_scan_by_key_map;
+    detail::ShaderCacheMap ms_scan_by_key_tile_state_init_map;
+    detail::ShaderCacheMap ms_exclusive_scan_by_key_map;
+    detail::ShaderCacheMap ms_inclusive_scan_by_key_map;
+
+    // epoch B: vk-cuda interop kernels shadowing the maps above.  Declared
+    // after them so teardown order is the same; they must be destroyed before
+    // the vk device the borrowed m_interop points at (risk R6).
+    detail::InteropShaderMap ms_scan_key_interop;
+    detail::InteropShaderMap ms_exclusive_scan_interop_map;
+    detail::InteropShaderMap ms_inclusive_scan_interop_map;
+    detail::InteropShaderMap ms_packed_scan_key_interop;
+    detail::InteropShaderMap ms_packed_exclusive_scan_interop_map;
+    detail::InteropShaderMap ms_packed_inclusive_scan_interop_map;
+    detail::InteropShaderMap ms_scan_by_key_tile_state_init_interop_map;
+    detail::InteropShaderMap ms_exclusive_scan_by_key_interop_map;
+    detail::InteropShaderMap ms_inclusive_scan_by_key_interop_map;
 };
 
 // CUDA parity policy measured on Blackwell: the generic DSL scan reaches the
 // CUB 3.5.0 execution time most closely with 320 threads and 25 items/thread.
-// Keep this opt-in so the portable DeviceScan defaults remain unchanged.
+// This explicit policy remains available for callers that choose the geometry
+// themselves; DeviceScan<> selects it automatically for 4-byte CUDA scans.
 using DeviceScanCudaParity = DeviceScan<
     320u,
     details::WARP_SIZE,

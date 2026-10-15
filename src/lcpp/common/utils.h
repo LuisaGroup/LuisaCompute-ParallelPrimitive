@@ -15,6 +15,7 @@
 #include <luisa/dsl/func.h>
 #include <luisa/dsl/var.h>
 #include <lcpp/common/util_type.h>
+#include <lcpp/common/shader_cache.h>
 #include <lcpp/runtime/core.h>
 
 namespace luisa::parallel_primitive
@@ -91,6 +92,8 @@ struct Log2<N, 0, COUNT>
 };
 
 
+// Operators must be identified by their generated code: the same Callable or
+// functor type can produce different functions for different captured values.
 template <typename Type, typename BinaryOp>
 uint64_t get_binary_op_hash(BinaryOp op)
 {
@@ -108,84 +111,71 @@ uint64_t get_unary_op_hash(UnaryOp op)
 }
 
 template <NumericT Type4Byte, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    return luisa::format("{}+{}",
-                         luisa::compute::Type::of<Type4Byte>()->description(),
-                         get_binary_op_hash<Type4Byte>(op));
+    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(), get_binary_op_hash<Type4Byte>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    return luisa::format("{}+{}",
-                         luisa::compute::Type::of<KeyValueType>()->description(),
-                         get_binary_op_hash<KeyValueType>(op));
+    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(), get_binary_op_hash<KeyValueType>(op));
 }
 
 template <KeyValuePairType KeyValueType, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    return luisa::format("{}+{}+{}",
-                         luisa::compute::Type::of<KeyValueType>()->description(),
-                         get_binary_op_hash<KeyValueType>(op),
-                         get_unary_op_hash<KeyValueType>(transform_op));
+    return detail::make_shader_cache_key(detail::type_ptr<KeyValueType>(),
+                                         get_binary_op_hash<KeyValueType>(op),
+                                         get_unary_op_hash<KeyValueType>(transform_op));
 }
 
 template <typename KeyType, typename ValueType>
-luisa::string get_type_and_op_desc()
+detail::ShaderCacheKey get_type_and_op_desc()
 {
-    luisa::string_view key_desc   = luisa::compute::Type::of<KeyType>()->description();
-    luisa::string_view value_desc = luisa::compute::Type::of<ValueType>()->description();
-
-    return luisa::string(key_desc) + "+" + luisa::string(value_desc);
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(), detail::type_ptr<ValueType>());
 }
 
 template <typename KeyType, typename ValueType, typename ReduceOp>
-luisa::string get_type_and_op_desc(ReduceOp op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op)
 {
-    return luisa::format("{}+{}+{}",
-                         luisa::compute::Type::of<KeyType>()->description(),
-                         luisa::compute::Type::of<ValueType>()->description(),
-                         get_binary_op_hash<ValueType>(op));
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         get_binary_op_hash<ValueType>(op));
 }
 
 template <NumericT Type4Byte, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    return luisa::format("{}+{}+{}",
-                         luisa::compute::Type::of<Type4Byte>()->description(),
-                         get_binary_op_hash<Type4Byte>(op),
-                         get_unary_op_hash<Type4Byte>(transform_op));
+    return detail::make_shader_cache_key(detail::type_ptr<Type4Byte>(),
+                                         get_binary_op_hash<Type4Byte>(op),
+                                         get_unary_op_hash<Type4Byte>(transform_op));
 }
 
 
 template <typename KeyType, typename ValueType, typename ReduceOp, typename TransformOp>
-luisa::string get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
+detail::ShaderCacheKey get_type_and_op_desc(ReduceOp op, TransformOp transform_op)
 {
-    return luisa::format("{}+{}+{}+{}",
-                         luisa::compute::Type::of<KeyType>()->description(),
-                         luisa::compute::Type::of<ValueType>()->description(),
-                         get_binary_op_hash<ValueType>(op),
-                         get_unary_op_hash<ValueType>(transform_op));
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         get_binary_op_hash<ValueType>(op),
+                                         get_unary_op_hash<ValueType>(transform_op));
 }
 
-static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items)
+// Radix-sort cache key: the four per-call maps in DeviceRadixSort are all keyed
+// by (key type, value type, descending) in the original code.  KEY_ONLY is an
+// additional template parameter that only changes the one-sweep shader; it was
+// not encoded before (a latent collision when SortKeys<T> and SortPairs<T,T>
+// share an instance).  Encoding it here is strictly safer and costs at most one
+// extra identical compile for the key-independent reset/histogram/exclusive-sum
+// shaders.
+template <typename KeyType, typename ValueType, bool KEY_ONLY, bool IS_DESCENDING>
+detail::ShaderCacheKey get_radix_sort_key()
 {
-    auto   block_size   = m_block_size;
-    auto   tile_items   = items_per_thread * block_size;
-    size_t num_elements = num_items;
-    temp_storage_size   = 0;
-    do
-    {
-        size_t num_blocks = std::max<size_t>(1u, ceil_div(num_elements, tile_items));
-        if(num_blocks > 1)
-        {
-            temp_storage_size += num_blocks;
-        }
-        num_elements = num_blocks;
-    } while(num_elements > 1);
-    temp_storage_size += 1;
+    return detail::make_shader_cache_key(detail::type_ptr<KeyType>(),
+                                         detail::type_ptr<ValueType>(),
+                                         detail::bool_ptr(KEY_ONLY),
+                                         detail::bool_ptr(IS_DESCENDING));
 }
 
 // Helper: round up byte_offset to the given alignment
@@ -193,6 +183,47 @@ inline size_t align_up_uint(size_t byte_offset, size_t alignment)
 {
     return (byte_offset + alignment - 1) / alignment * alignment;
 }
+
+// Byte alignment for kernel-argument buffer subviews carved out of a temporary
+// storage buffer. The Vulkan legacy-HLSL (DXC) descriptor path validates every
+// dispatched buffer view with the device minStorageBufferOffsetAlignment (16 on
+// NVIDIA, larger on some hardware) and additionally requires whole elements;
+// 256 is a multiple of every element stride lcpp uses, so aligning every carved
+// region to 256 bytes satisfies both constraints on every backend and is a
+// no-op for cuda/dx. Regions are a few KB each, so the padding is negligible.
+static constexpr size_t descriptor_view_alignment = 256;
+static constexpr size_t descriptor_view_alignment_uints = descriptor_view_alignment / sizeof(uint);
+inline size_t align_up_view(size_t byte_offset) noexcept
+{
+    return align_up_uint(byte_offset, descriptor_view_alignment);
+}
+
+// Temp-storage size for the recursive device reduce, walking byte offsets so
+// that every recursion-level region is aligned to descriptor_view_alignment
+// (the subviews are passed to kernels as buffer arguments). `elem_size` is the
+// reduced element type size; the result is a count of those elements.
+static void get_temp_size_scan(size_t& temp_storage_size, size_t m_block_size, size_t items_per_thread, size_t num_items, size_t elem_size = sizeof(uint))
+{
+    auto block_size = m_block_size;
+    temp_storage_size = 0;
+    size_t offset_bytes = 0;
+    size_t num_elements = num_items;  // input segment size
+    while(true)
+    {
+        // output segment size
+        size_t num_blocks = std::max<size_t>(1u, ceil_div(num_elements, items_per_thread * block_size));
+        if(num_blocks > 1)
+        {
+            offset_bytes = align_up_view(offset_bytes);
+            offset_bytes += (size_t)num_blocks * elem_size;
+        }
+        num_elements = num_blocks;
+        if(num_elements <= 1) { break; }
+    }
+    offset_bytes = align_up_view(offset_bytes);
+    temp_storage_size = offset_bytes / elem_size + 1;
+}
+
 
 // Vulkan guarantees minStorageBufferOffsetAlignment is at most 256 bytes.
 // Keeping internal scratch-buffer views on this boundary also remains valid

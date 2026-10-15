@@ -26,6 +26,7 @@
 #include <luisa/dsl/var.h>
 #include <cstddef>
 #include <lcpp/runtime/core.h>
+#include <lcpp/runtime/interop_dispatch.h>
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/util_type.h>
 #include <lcpp/common/thread_operators.h>
@@ -37,9 +38,18 @@ namespace luisa::parallel_primitive
 {
 
 using namespace luisa::compute;
+// Radix one-sweep policy default (epoch-3): BLOCK_SIZE x ITEMS_PER_THREAD tile.
+// Tuned on RTX 5060 (4M uint32 SortKeys): 256x16 is the best portable policy
+// (cuda 0.43 ms ~ CUB parity, dx 0.67 ms, vk 2.48 ms) -- larger tiles cut the
+// block count (hence the per-pass lookback chain length and the 1M-uint lookback
+// reset volume) and improve per-thread ILP. Shared bytes ~= BLOCK*ITEMS*sizeof(k)
+// + (BLOCK/32)*RADIX_DIGITS*4 + RADIX_DIGITS*4; 256x16 uint32 ~= 26 KiB, under the
+// 32 KiB DX/HLSL floor. See docs/epoch3_radix_sort.md.
+static constexpr size_t RADIX_ITEMS_PER_THREAD = 16;
+
 template <size_t BLOCK_SIZE = details::BLOCK_SIZE,
           size_t WARP_NUMS = details::WARP_SIZE,
-          size_t ITEMS_PER_THREAD = details::ITEMS_PER_THREAD,
+          size_t ITEMS_PER_THREAD = RADIX_ITEMS_PER_THREAD,
           // Keep CUB's tuned 32-bit key-only onesweep policy by default while
           // allowing callers to benchmark a single policy end to end.
           bool CUB_SMALL_KEY_POLICY = true>
@@ -56,6 +66,9 @@ class DeviceRadixSort : public LuisaModule
 
     uint   m_shared_mem_size = 0;
     Device m_device;
+    // Optional vk-cuda interop sink (epoch B).  Null => pure-vulkan DSL path.
+    InteropContext* m_interop = nullptr;
+
     bool   m_created = false;
 
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_decomposed_key_shaders;
@@ -158,9 +171,18 @@ class DeviceRadixSort : public LuisaModule
         return nullptr;
 #endif
     }
-    void create(Device& device, Stream* debug_stream = nullptr)
+    // `interop` is optional: pass a valid InteropContext (see
+    // lcpp/runtime/interop_dispatch.h) to launch the four one-sweep radix
+    // kernel families as cuda-backend modules inside the vk command buffer.
+    // Without it (or when the context is null because the fast path is
+    // unavailable) every op keeps its pure-vulkan DSL dispatch path.
+    void create(Device& device, Stream* debug_stream = nullptr, InteropContext* interop = nullptr)
     {
-        m_device = device;
+        m_device                   = device;
+        // Epoch C per-op policy: `LCPP_INTEROP` (1|all|auto|a,b,c) decides
+        // per module whether this one takes the fast path; see
+        // lcpp/runtime/interop_dispatch.h.
+        m_interop = interop_for(interop, "radix");
 #ifndef NDEBUG
         m_debug_stream = debug_stream;
 #endif
@@ -170,73 +192,173 @@ class DeviceRadixSort : public LuisaModule
         m_created                  = true;
     }
 
+    /// True when this module dispatches its radix kernels through the vk-cuda
+    /// interop fast path (cuda-compiled module, vk command buffer).
+    [[nodiscard]] bool interop_active() const noexcept { return m_interop != nullptr; }
+
     // ============================================================
     // GetTempStorageBytes: compute required temp buffer size (in bytes)
     // ============================================================
 
-    /// Temp storage bytes for SortPairs / SortPairsDescending
+    // One-sweep temp-storage layout: the SINGLE source of truth for both the
+    // public Get*TempStorageBytes entry points and the runtime carving inside
+    // onesweep_radix_sort(). Sizing and carving used to live in three separate
+    // byte-walks that drifted apart across the CUB-parity merge (the key-only
+    // sizing kept the pre-merge `num_portions * num_passes` counter footprint
+    // and `align_up_uint(alignof)` bases while the merged runtime carve used a
+    // `descriptor_view_alignment_uints`-sized counter slot with `align_up_view`
+    // bases), producing an under-sized temp buffer and a subview overflow.
+    // Both sides now derive from this one helper, so they cannot disagree.
+    struct OnesweepTempLayout
+    {
+        uint   radix_bits;
+        uint   radix_digits;
+        uint   portion_size;
+        uint   num_passes;
+        uint   num_portions;
+        uint   max_num_blocks;
+        size_t bins_count;         // uints
+        size_t lookback_count;     // uints
+        size_t keys_tmp2_count;    // uints
+        size_t values_tmp2_count;  // uints
+        size_t ctrs_count;         // uints
+        size_t bins_off;           // uint-element offsets, as passed to subview
+        size_t lookback_off;
+        size_t keys_tmp2_off;
+        size_t values_tmp2_off;
+        size_t ctrs_off;
+        size_t total_bytes;
+    };
+
+    // One-sweep tile geometry, split into two policies:
+    //   * the CUB-parity "tuned" key-only tile (384 threads x 20 items) that is
+    //     CUDA/Vulkan-optimal but needs >32 KiB of group shared and therefore
+    //     cannot be codegen'd on the legacy-HLSL DX backend (hard 32 KiB cap,
+    //     hlsl_codegen.cpp);
+    //   * the epoch-3.5 "conservative" class tile (BLOCK_SIZE x
+    //     radix_effective_items_v<ITEMS_PER_THREAD, KeyType>) that was DX-safe
+    //     before the merge and stays within the shared budget on every backend.
+    // The two only differ for 4-byte key-only sorts under CUB_SMALL_KEY_POLICY;
+    // for pairs and wider keys they coincide. The runtime dispatch selects one
+    // per backend (see onesweep_radix_sort); the device-less public sizing entry
+    // points always reserve the conservative tile because it is a footprint
+    // SUPSET of the tuned tile (a smaller-or-equal tile => >= max_num_blocks =>
+    // >= lookback bytes, while bins/ctrs scale with num_portions/num_passes and
+    // the key/value scratch with num_items, none of which grows for the larger
+    // tuned tile). See the static_assert in GetSortKeysTempStorageBytes.
+    template <typename KeyType>
+    static constexpr uint onesweep_conservative_block_threads_v = static_cast<uint>(BLOCK_SIZE);
+    template <typename KeyType>
+    static constexpr uint onesweep_conservative_items_v =
+        static_cast<uint>(radix_effective_items_v<ITEMS_PER_THREAD, KeyType>);
+    template <typename KeyType, bool KEY_ONLY>
+    static constexpr uint onesweep_tuned_block_threads_v =
+        KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u
+            ? 384u
+            : static_cast<uint>(BLOCK_SIZE);
+    template <typename KeyType, bool KEY_ONLY>
+    static constexpr uint onesweep_tuned_items_v = static_cast<uint>(radix_effective_items_v<
+        (KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 20u : static_cast<uint>(ITEMS_PER_THREAD)),
+        KeyType>);
+
+    // block_threads / items_per_thread are the EFFECTIVE one-sweep geometry for
+    // the carve/sizing being computed: the runtime dispatch passes the
+    // backend-selected tile, the public sizing entry points pass the
+    // conservative class tile (the footprint superset). The byte-walk below is
+    // the SINGLE source of truth shared by both, so the allocated temp storage
+    // and the runtime carve can never disagree (the merged key-only path
+    // previously sized d_ctrs at 1 uint/(portion,pass) and the multi-pass bases
+    // at alignof(KeyType) while the carve used descriptor_view_alignment_uints
+    // slots and 256-byte bases -> subview overflow).
+    template <typename KeyType, typename ValueType>
+    [[nodiscard]] static OnesweepTempLayout compute_onesweep_temp_layout(uint num_items,
+                                                                         uint begin_bit,
+                                                                         uint end_bit,
+                                                                         uint block_threads,
+                                                                         uint items_per_thread)
+    {
+        OnesweepTempLayout L{};
+        L.radix_bits   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
+        L.radix_digits = 1u << L.radix_bits;
+
+        const uint tile_items    = block_threads * items_per_thread;
+        L.portion_size   = ((1u << 28u) - 1u) / tile_items * tile_items;
+        L.num_passes     = ceil_div(end_bit - begin_bit, L.radix_bits);
+        L.num_portions   = ceil_div(num_items, L.portion_size);
+        L.max_num_blocks = ceil_div(std::min(num_items, L.portion_size), tile_items);
+
+        L.bins_count        = static_cast<size_t>(L.num_portions) * L.num_passes * L.radix_digits;
+        L.lookback_count    = static_cast<size_t>(L.max_num_blocks) * L.radix_digits;
+        L.ctrs_count        = static_cast<size_t>(L.num_portions) * L.num_passes * descriptor_view_alignment_uints;
+        L.keys_tmp2_count   = bytes_to_uint_count(static_cast<size_t>(num_items) * sizeof(KeyType));
+        L.values_tmp2_count = bytes_to_uint_count(static_cast<size_t>(num_items) * sizeof(ValueType));
+
+        // Byte cursor mirroring the runtime carve exactly; the per-pass counter
+        // subview (onesweep_radix_sort) needs a descriptor-aligned slot per
+        // (portion, pass), and every carved region starts on the view alignment.
+        size_t off = 0u;  // bytes
+        L.bins_off = off / sizeof(uint);
+        off += L.bins_count * sizeof(uint);
+
+        off = align_up_view(off);
+        L.lookback_off = off / sizeof(uint);
+        off += L.lookback_count * sizeof(uint);
+
+        if(L.num_passes > 1u)
+        {
+            off = align_up_view(off);
+            L.keys_tmp2_off = off / sizeof(uint);
+            off += L.keys_tmp2_count * sizeof(uint);
+
+            off = align_up_view(off);
+            L.values_tmp2_off = off / sizeof(uint);
+            off += L.values_tmp2_count * sizeof(uint);
+        }
+
+        off = align_up_view(off);
+        L.ctrs_off = off / sizeof(uint);
+        off += L.ctrs_count * sizeof(uint);
+
+        L.total_bytes = off;
+        return L;
+    }
+
+    // Device-less sizing: reserve a footprint that is a superset of BOTH one-sweep
+    // geometries the runtime dispatch may select (tuned 384x20 on CUDA/Vulkan vs
+    // the conservative class tile on DX). A region scales monotonically with the
+    // tile (smaller tile => more blocks/portions => larger bins/lookback/ctrs), so
+    // the SMALLER tile of the two dominates and max(conservative, tuned) is a
+    // superset of whichever geometry the backend eventually carves. For pairs the
+    // two geometries coincide so the max is trivial; for the documented key-only
+    // policies (128x4, 256x16) the conservative tile is the smaller one, but
+    // wider-tile policies (e.g. 256x32) flip that -- taking the max keeps sizing
+    // correct for every instantiation instead of assuming conservative is always
+    // the superset.
+    template <typename KeyType, typename ValueType, bool KEY_ONLY>
+    [[nodiscard]] static size_t onesweep_sizing_bytes(uint num_items)
+    {
+        const uint cb = onesweep_conservative_block_threads_v<KeyType>;
+        const uint ci = onesweep_conservative_items_v<KeyType>;
+        const uint tb = onesweep_tuned_block_threads_v<KeyType, KEY_ONLY>;
+        const uint ti = onesweep_tuned_items_v<KeyType, KEY_ONLY>;
+        const auto full_bits = static_cast<uint>(sizeof(KeyType) * 8u);
+        const auto cons = compute_onesweep_temp_layout<KeyType, ValueType>(num_items, 0u, full_bits, cb, ci);
+        const auto tuned = compute_onesweep_temp_layout<KeyType, ValueType>(num_items, 0u, full_bits, tb, ti);
+        return std::max(cons.total_bytes, tuned.total_bytes);
+    }
+
+    /// Temp storage bytes for SortPairs / SortPairsDescending.
     template <typename KeyType, typename ValueType>
     static size_t GetSortPairsTempStorageBytes(uint num_items)
     {
-        const uint RADIX_BITS          = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
-        const uint RADIX_DIGITS        = 1 << RADIX_BITS;
-        const uint ONESWEEP_TILE_ITEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
-        const auto PORTION_SIZE = ((1u << 28u) - 1u) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
-
-        auto num_passes     = ceil_div((uint)(sizeof(KeyType) * 8), RADIX_BITS);
-        auto num_portions   = ceil_div(num_items, PORTION_SIZE);
-        auto max_num_blocks = ceil_div(std::min(num_items, PORTION_SIZE), ONESWEEP_TILE_ITEMS);
-
-        size_t bytes = 0;
-        // d_bins: num_portions * num_passes * RADIX_DIGITS * uint
-        size_t bins_count = (size_t)num_portions * num_passes * RADIX_DIGITS;
-        bytes += bins_count * sizeof(uint);
-        // d_lookback: max_num_blocks * RADIX_DIGITS * uint
-        size_t lookback_count = (size_t)max_num_blocks * RADIX_DIGITS;
-        bytes += lookback_count * sizeof(uint);
-        // extra key buffer (for multi-pass): num_items * sizeof(KeyType)
-        if(num_passes > 1)
-        {
-            bytes = align_up_uint(bytes, alignof(KeyType));
-            bytes += (size_t)num_items * sizeof(KeyType);
-            // extra value buffer
-            bytes = align_up_uint(bytes, alignof(ValueType));
-            bytes += (size_t)num_items * sizeof(ValueType);
-        }
-        // d_ctrs: num_portions * num_passes * uint
-        size_t ctrs_count = (size_t)num_portions * num_passes;
-        bytes += ctrs_count * sizeof(uint);
-        return bytes;
+        return onesweep_sizing_bytes<KeyType, ValueType, false>(num_items);
     }
 
-    /// Temp storage bytes for SortKeys / SortKeysDescending
+    /// Temp storage bytes for SortKeys / SortKeysDescending.
     template <typename KeyType>
     static size_t GetSortKeysTempStorageBytes(uint num_items)
     {
-        constexpr uint onesweep_block_threads =
-            CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 384u : BLOCK_SIZE;
-        constexpr uint onesweep_items_per_thread =
-            CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 20u : ITEMS_PER_THREAD;
-        const uint radix_bits = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
-        const uint radix_digits = 1u << radix_bits;
-        const uint onesweep_tile_items = onesweep_items_per_thread * onesweep_block_threads;
-        const auto portion_size = ((1u << 28u) - 1u) / onesweep_tile_items * onesweep_tile_items;
-        const auto num_passes = ceil_div(static_cast<uint>(sizeof(KeyType) * 8u), radix_bits);
-        const auto num_portions = ceil_div(num_items, portion_size);
-        const auto max_num_blocks = ceil_div(std::min(num_items, portion_size), onesweep_tile_items);
-
-        size_t bytes = 0u;
-        bytes += static_cast<size_t>(num_portions) * num_passes * radix_digits * sizeof(uint);
-        bytes += static_cast<size_t>(max_num_blocks) * radix_digits * sizeof(uint);
-        if(num_passes > 1u)
-        {
-            bytes = align_up_uint(bytes, alignof(KeyType));
-            bytes += static_cast<size_t>(num_items) * sizeof(KeyType);
-            bytes = align_up_uint(bytes, alignof(KeyType));
-            bytes += static_cast<size_t>(num_items) * sizeof(KeyType);
-        }
-        bytes += static_cast<size_t>(num_portions) * num_passes * sizeof(uint);
-        return bytes;
+        return onesweep_sizing_bytes<KeyType, KeyType, true>(num_items);
     }
 
 
@@ -905,55 +1027,88 @@ class DeviceRadixSort : public LuisaModule
     {
         const uint RADIX_BITS   = OneSweepSmallKeyTunedPolicy<KeyType>::ONESWEEP_RADIX_BITS;
         const uint RADIX_DIGITS = 1 << RADIX_BITS;
-        constexpr uint ONESWEEP_BLOCK_THREADS =
-            KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 384u : BLOCK_SIZE;
-        constexpr uint ONESWEEP_ITEMS_PER_THREAD =
-            KEY_ONLY && CUB_SMALL_KEY_POLICY && sizeof(KeyType) == 4u ? 20u : ITEMS_PER_THREAD;
-        constexpr uint ONESWEEP_TILE_ITEMS = ONESWEEP_ITEMS_PER_THREAD * ONESWEEP_BLOCK_THREADS;
+        // Runtime, backend-aware one-sweep tile policy.
+        //   * Tuned (CUB parity): 384 threads x 20 items for 4-byte key-only
+        //     sorts -- CUDA/Vulkan-optimal, but >32 KiB of group shared, so it
+        //     cannot be codegen'd on the legacy-HLSL DX backend (hard 32 KiB cap,
+        //     hlsl_codegen.cpp 'shared_size <= 32768').
+        //   * Conservative (epoch-3.5): the class tile BLOCK_SIZE x
+        //     radix_effective_items_v<ITEMS_PER_THREAD, KeyType>, the DX-safe
+        //     geometry kept within the shared budget on every backend.
+        // The public Get*TempStorageBytes sizing always reserves the conservative
+        // (superset) footprint, so the tuned carve still fits it; on DX the carve
+        // uses the exact conservative layout. For pairs and keys wider than 4
+        // bytes the two geometries coincide, so this only diverges for 4-byte
+        // key-only sorts. See radix_effective_items_v / the geometry helpers.
+        constexpr uint ONESWEEP_BLOCK_THREADS   = onesweep_tuned_block_threads_v<KeyType, KEY_ONLY>;
+        constexpr uint ONESWEEP_ITEMS_PER_THREAD = onesweep_tuned_items_v<KeyType, KEY_ONLY>;
+        constexpr uint CONSERVATIVE_BLOCK_THREADS = onesweep_conservative_block_threads_v<KeyType>;
+        constexpr uint CONSERVATIVE_ITEMS_PER_THREAD = onesweep_conservative_items_v<KeyType>;
 
-        const auto PORTION_SIZE = ((1u << 28u) - 1u) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
+        // DX -> conservative tile (fits 32 KiB HLSL shared); every other backend
+        // (cuda, vk, and the vk-cuda interop path) keeps the tuned CUB-parity tile.
+        const bool on_dx_backend  = m_device.backend_name() == "dx";
+        const bool use_tuned      = !on_dx_backend;
+        const uint chosen_block_threads      = use_tuned ? ONESWEEP_BLOCK_THREADS : CONSERVATIVE_BLOCK_THREADS;
+        const uint chosen_items_per_thread   = use_tuned ? ONESWEEP_ITEMS_PER_THREAD : CONSERVATIVE_ITEMS_PER_THREAD;
+        const uint chosen_tile_items         = chosen_block_threads * chosen_items_per_thread;
+
+        const auto PORTION_SIZE = ((1u << 28u) - 1u) / chosen_tile_items * chosen_tile_items;
 
         auto num_passes     = ceil_div(end_bit - begin_bit, RADIX_BITS);
         auto num_portions   = ceil_div(num_items, PORTION_SIZE);
-        auto max_num_blocks = ceil_div(std::min(num_items, PORTION_SIZE), ONESWEEP_TILE_ITEMS);
 
-        // Carve out sub-buffers from temp_storage
-        size_t offset_bytes = 0;
+        // Carve out sub-buffers from temp_storage. The offsets, element counts and
+        // total footprint come from the same shared helper the public
+        // Get*TempStorageBytes entry points use, evaluated with the SAME runtime
+        // geometry selected above, so the allocated temp storage (conservative,
+        // a superset) and this carve can never disagree.
+        const auto layout = compute_onesweep_temp_layout<KeyType, ValueType>(
+            num_items, begin_bit, end_bit, chosen_block_threads, chosen_items_per_thread);
+
+#ifndef NDEBUG
+        {
+            // The caller sized the buffer with the public Get* entry points, which
+            // reserve max(conservative, tuned) over the FULL key range; the
+            // runtime-chosen geometry over the actual [begin_bit,end_bit) range can
+            // never request more than that superset.
+            const size_t sized_bytes = onesweep_sizing_bytes<KeyType, ValueType, KEY_ONLY>(num_items);
+            LUISA_ASSERT(layout.total_bytes <= sized_bytes,
+                         "DeviceRadixSort: runtime one-sweep carve exceeds public temp sizing.");
+        }
+#endif
 
         // d_bins: num_portions * num_passes * RADIX_DIGITS * uint
-        size_t bins_count  = (size_t)num_portions * num_passes * RADIX_DIGITS;
-        auto   d_bins_view = temp_storage.subview(offset_bytes / sizeof(uint), bins_count);
-        offset_bytes += bins_count * sizeof(uint);
+        const size_t bins_count = layout.bins_count;
+        auto         d_bins_view = temp_storage.subview(layout.bins_off, bins_count);
 
-        // d_lookback: max_num_blocks * RADIX_DIGITS * uint
-        size_t lookback_count  = (size_t)max_num_blocks * RADIX_DIGITS;
-        auto   d_lookback_view = temp_storage.subview(offset_bytes / sizeof(uint), lookback_count);
-        offset_bytes += lookback_count * sizeof(uint);
+        // d_lookback: max_num_blocks * RADIX_DIGITS * uint (descriptor-aligned base)
+        const size_t lookback_count = layout.lookback_count;
+        auto         d_lookback_view = temp_storage.subview(layout.lookback_off, lookback_count);
 
-        // extra key/value buffers for multi-pass
+        // extra key/value buffers for multi-pass (descriptor-aligned bases); the
+        // layout always reserves them when num_passes > 1, but they are only needed
+        // -- and only used (see the ping-pong below) -- when in-place overwrite is
+        // not allowed by the caller.
         BufferView<KeyType>   d_keys_tmp2_view;
         BufferView<ValueType> d_values_tmp2_view;
         if(!is_overwrite_okay && num_passes > 1)
         {
-            offset_bytes           = align_up_uint(offset_bytes, alignof(KeyType));
-            size_t keys_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(KeyType));
             d_keys_tmp2_view =
-                temp_storage.subview(offset_bytes / sizeof(uint), keys_uint_count).template as<KeyType>();
-            offset_bytes += keys_uint_count * sizeof(uint);
-
-            offset_bytes             = align_up_uint(offset_bytes, alignof(ValueType));
-            size_t values_uint_count = bytes_to_uint_count((size_t)num_items * sizeof(ValueType));
+                temp_storage.subview(layout.keys_tmp2_off, layout.keys_tmp2_count).template as<KeyType>();
             d_values_tmp2_view =
-                temp_storage.subview(offset_bytes / sizeof(uint), values_uint_count).template as<ValueType>();
-            offset_bytes += values_uint_count * sizeof(uint);
+                temp_storage.subview(layout.values_tmp2_off, layout.values_tmp2_count).template as<ValueType>();
         }
 
-        // d_ctrs: num_portions * num_passes * uint
-        size_t ctrs_count  = (size_t)num_portions * num_passes;
-        auto   d_ctrs_view = temp_storage.subview(offset_bytes / sizeof(uint), ctrs_count);
+        // d_ctrs: one descriptor-aligned 256-byte slot per (portion, pass) -- the
+        // per-pass counter is passed to the one-sweep kernel as a 1-element
+        // subview, whose offset must satisfy the descriptor-view alignment on
+        // the legacy Vulkan HLSL path. Shares compute_onesweep_temp_layout with
+        // GetSortPairsTempStorageBytes / GetSortKeysTempStorageBytes.
+        const size_t ctrs_count = layout.ctrs_count;
+        auto         d_ctrs_view = temp_storage.subview(layout.ctrs_off, ctrs_count);
 
-        auto radix_sort_key = get_type_and_op_desc<KeyType, ValueType>()
-                              + luisa::string(IS_DESCENDING ? "_desc" : "_asc");
+        auto radix_sort_key = get_radix_sort_key<KeyType, ValueType, KEY_ONLY, IS_DESCENDING>();
 
 
         // reset keys
@@ -981,12 +1136,41 @@ class DeviceRadixSort : public LuisaModule
             return -1;
         }
 
-        cmdlist << (*ms_radix_sort_reset_ptr)(d_bins_view, 0u).dispatch(bins_count)
-                << (*ms_radix_sort_reset_ptr)(d_ctrs_view, 0u).dispatch(ctrs_count);
+        // ---- interop fast path: reset kernels ----
+        // Usage table: the reset kernel writes exactly one entry per dispatch
+        // thread (`d_bins_out.write(dispatch_id().x, init_value)`) and never
+        // reads the buffer, so WRITE is the accurate contract.
+        auto reset_interop_it = ms_radix_sort_reset_interop_map.end();
+        if(m_interop != nullptr)
+        {
+            reset_interop_it = ms_radix_sort_reset_interop_map.find(radix_sort_key);
+            if(reset_interop_it == ms_radix_sort_reset_interop_map.end())
+            {
+                reset_interop_it = import_into_interop_cache(
+                    m_interop,
+                    ms_radix_sort_reset_interop_map,
+                    radix_sort_key,
+                    RadixSortReset().compile(m_interop->cuda_device()));
+            }
+        }
+        if(reset_interop_it != ms_radix_sort_reset_interop_map.end())
+        {
+            auto kernel = reset_interop_it->second.shader.template kernel<
+                vk_cuda_interop::CudaArg<Buffer<uint>, Usage::WRITE>,
+                uint>();
+            cmdlist << kernel(d_bins_view, 0u).dispatch(static_cast<uint>(bins_count))
+                    << kernel(d_ctrs_view, 0u).dispatch(static_cast<uint>(ctrs_count));
+        }
+        else
+        {
+            cmdlist << (*ms_radix_sort_reset_ptr)(d_bins_view, 0u).dispatch(bins_count)
+                    << (*ms_radix_sort_reset_ptr)(d_ctrs_view, 0u).dispatch(ctrs_count);
+        }
 
         // radix sort histogram
         using RadixSortHistogram =
-            details::RadixSortHistogramModule<KeyType, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
+            details::RadixSortHistogramModule<KeyType, IS_DESCENDING, RADIX_BITS, BLOCK_SIZE, WARP_NUMS,
+                                          radix_effective_items_v<ITEMS_PER_THREAD, KeyType>>;
         using RadixSortHistogramKernel  = RadixSortHistogram::RadixSortHistogramKernel;
         auto ms_radix_sort_histogram_it = ms_radix_sort_histogram_map.find(radix_sort_key);
         if(ms_radix_sort_histogram_it == ms_radix_sort_histogram_map.end())
@@ -1011,9 +1195,41 @@ class DeviceRadixSort : public LuisaModule
         }
         const auto num_sms             = BLOCK_SIZE;
         const auto histo_blocks_per_sm = 1;
-        cmdlist << (*ms_radix_sort_histogram_ptr)(
-                       d_bins_view, ByteBufferView{d_keys.current()}, num_items, begin_bit, end_bit)
-                       .dispatch(num_sms * histo_blocks_per_sm * m_block_size);
+        const auto histo_threads       = static_cast<uint>(num_sms * histo_blocks_per_sm * m_block_size);
+        auto histogram_interop_it      = ms_radix_sort_histogram_interop_map.end();
+        // ---- interop fast path: histogram ----
+        // Usage table: d_bins_out is accumulated atomically
+        // (`atomic(...).fetch_add(count)`) hence READ_WRITE; the key channel is
+        // a read-only ByteBuffer.
+        if(m_interop != nullptr)
+        {
+            histogram_interop_it = ms_radix_sort_histogram_interop_map.find(radix_sort_key);
+            if(histogram_interop_it == ms_radix_sort_histogram_interop_map.end())
+            {
+                histogram_interop_it = import_into_interop_cache(
+                    m_interop,
+                    ms_radix_sort_histogram_interop_map,
+                    radix_sort_key,
+                    RadixSortHistogram().compile(m_interop->cuda_device()));
+            }
+        }
+        if(histogram_interop_it != ms_radix_sort_histogram_interop_map.end())
+        {
+            auto kernel = histogram_interop_it->second.shader.template kernel<
+                vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                vk_cuda_interop::CudaArg<ByteBuffer, Usage::READ>,
+                uint,
+                uint,
+                uint>();
+            cmdlist << kernel(d_bins_view, ByteBufferView{d_keys.current()}, num_items, begin_bit, end_bit)
+                           .dispatch(histo_threads);
+        }
+        else
+        {
+            cmdlist << (*ms_radix_sort_histogram_ptr)(
+                           d_bins_view, ByteBufferView{d_keys.current()}, num_items, begin_bit, end_bit)
+                           .dispatch(histo_threads);
+        }
 
         // exclusive scan
         using RadixSortExclusiveSum = details::RadixSortExclusiveSumModule<RADIX_DIGITS, BLOCK_SIZE, WARP_NUMS>;
@@ -1041,7 +1257,33 @@ class DeviceRadixSort : public LuisaModule
             return -1;
         }
 
-        cmdlist << (*ms_radix_sort_exclusive_sum_ptr)(d_bins_view).dispatch(num_passes * m_block_size);
+        const auto exclusive_sum_threads = static_cast<uint>(num_passes) * m_block_size;
+        auto       exclusive_sum_interop_it = ms_radix_sort_exclusive_sum_interop_map.end();
+        // ---- interop fast path: per-digit exclusive scan ----
+        // Usage table: the kernel reads its 256-bin block out of d_bins and
+        // writes the exclusive prefix back into the same range => READ_WRITE.
+        if(m_interop != nullptr)
+        {
+            exclusive_sum_interop_it = ms_radix_sort_exclusive_sum_interop_map.find(radix_sort_key);
+            if(exclusive_sum_interop_it == ms_radix_sort_exclusive_sum_interop_map.end())
+            {
+                exclusive_sum_interop_it = import_into_interop_cache(
+                    m_interop,
+                    ms_radix_sort_exclusive_sum_interop_map,
+                    radix_sort_key,
+                    RadixSortExclusiveSum().compile(m_interop->cuda_device()));
+            }
+        }
+        if(exclusive_sum_interop_it != ms_radix_sort_exclusive_sum_interop_map.end())
+        {
+            auto kernel = exclusive_sum_interop_it->second.shader.template kernel<
+                vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>>();
+            cmdlist << kernel(d_bins_view).dispatch(exclusive_sum_threads);
+        }
+        else
+        {
+            cmdlist << (*ms_radix_sort_exclusive_sum_ptr)(d_bins_view).dispatch(exclusive_sum_threads);
+        }
 
         // one sweep
         auto d_keys_tmp   = d_keys.alternate();
@@ -1052,22 +1294,36 @@ class DeviceRadixSort : public LuisaModule
             d_values.d_buffer[1] = d_values_tmp2_view;
         }
 
-        using RadixSortOneSweep =
-            details::RadixSortOneSweepModule<KeyType,
-                                             ValueType,
-                                             KEY_ONLY,
-                                             IS_DESCENDING,
-                                             RADIX_BITS,
-                                             ONESWEEP_BLOCK_THREADS,
-                                             WARP_NUMS,
-                                             ONESWEEP_ITEMS_PER_THREAD>;
-        using RadixSortOneSweepKernel = RadixSortOneSweep::RadixSortOneSweepKernel;
+        // Both one-sweep geometries are instantiated as separate module types:
+        //   * tuned    (CUDA/Vulkan, CUB parity; DX cannot codegen it >32 KiB),
+        //   * conservative (DX-safe class tile).
+        // They differ ONLY in the codegen-only BLOCK_SIZE / ITEMS_PER_THREAD
+        // non-type template arguments; the exported kernel descriptor type
+        // (Shader<1, ...args...>) is identical for both, so a single
+        // RadixSortOneSweepKernel pointer type covers either geometry and the
+        // runtime backend (use_tuned) decides which module is compiled+dispatched.
+        using RadixSortOneSweepTuned =
+            details::RadixSortOneSweepModule<KeyType, ValueType, KEY_ONLY, IS_DESCENDING, RADIX_BITS,
+                                             ONESWEEP_BLOCK_THREADS, WARP_NUMS, ONESWEEP_ITEMS_PER_THREAD>;
+        using RadixSortOneSweepConservative =
+            details::RadixSortOneSweepModule<KeyType, ValueType, KEY_ONLY, IS_DESCENDING, RADIX_BITS,
+                                             CONSERVATIVE_BLOCK_THREADS, WARP_NUMS, CONSERVATIVE_ITEMS_PER_THREAD>;
+        // Same descriptor type for both geometries (block/items are codegen-only).
+        using RadixSortOneSweepKernel = RadixSortOneSweepTuned::RadixSortOneSweepKernel;
 
-        auto onesweep_radix_sort_key   = radix_sort_key + (KEY_ONLY ? "_keys" : "_pairs");
+        // the local pointer-based radix key already folds in KEY_ONLY (see
+        // get_radix_sort_key), so the remote "_keys"/"_pairs" suffix is
+        // redundant and does not apply to the allocation-free key type.
+        // The cache key does NOT encode the tile geometry, but a DeviceRadixSort
+        // instance is bound to a single device, hence a single backend, hence a
+        // single geometry for the lifetime of the cache -- so the tuned and
+        // conservative variants can never collide across geometries here.
+        const auto &onesweep_radix_sort_key = radix_sort_key;
         auto ms_radix_sort_onesweep_it = ms_radix_sort_one_sweep_map.find(onesweep_radix_sort_key);
         if(ms_radix_sort_onesweep_it == ms_radix_sort_one_sweep_map.end())
         {
-            auto shader = RadixSortOneSweep().compile(m_device);
+            auto shader = use_tuned ? RadixSortOneSweepTuned().compile(m_device)
+                                    : RadixSortOneSweepConservative().compile(m_device);
             if(!shader)
             {
                 return -1;
@@ -1086,6 +1342,41 @@ class DeviceRadixSort : public LuisaModule
             return -1;
         }
 
+        // ---- interop fast path: the one-sweep kernel ----
+        // This is the kernel the whole epoch is about: its rank (MatchAny) and
+        // its volatile look-back spin-polling are exactly the constructs the
+        // XIR->SPIR-V path lowers poorly and native CUDA lowers well.
+        //
+        // Usage table (per launch, cross-portion carry included):
+        //   d_lookback        READ_WRITE  partial/global look-back channel
+        //                                 (volatile_read spin + volatile_write)
+        //   d_ctrs            READ_WRITE  atomic block-index counter
+        //   d_bins_in         READ        this portion/pass digit offsets
+        //   d_bins_out        WRITE       the (portion+1) carry for this pass
+        //   d_keys_in  (Byte) READ        keys of this portion
+        //   d_keys_out (Byte) WRITE       scatter destination (the alternate
+        //                                 buffer, a different allocation from
+        //                                 d_keys_in even when the ranges
+        //                                 overlap)
+        //   d_values_in       READ        values of this portion
+        //   d_values_out      WRITE       scatter destination
+        auto onesweep_interop_it = ms_radix_sort_one_sweep_interop_map.end();
+        if(m_interop != nullptr)
+        {
+            onesweep_interop_it = ms_radix_sort_one_sweep_interop_map.find(radix_sort_key);
+            if(onesweep_interop_it == ms_radix_sort_one_sweep_interop_map.end())
+            {
+                onesweep_interop_it = import_into_interop_cache(
+                    m_interop,
+                    ms_radix_sort_one_sweep_interop_map,
+                    radix_sort_key,
+                    // The interop fast path is the vk-cuda module (compiled on a
+                    // CUDA device), which is never the DX backend, so it always
+                    // takes the tuned CUB-parity tile.
+                    RadixSortOneSweepTuned().compile(m_interop->cuda_device()));
+            }
+        }
+
         for(uint current_bit = begin_bit, pass = 0; current_bit < end_bit; current_bit += RADIX_BITS, ++pass)
         {
             uint num_bit = std::min(end_bit - current_bit, RADIX_BITS);
@@ -1093,29 +1384,80 @@ class DeviceRadixSort : public LuisaModule
             for(uint portion = 0; portion < num_portions; ++portion)
             {
                 uint portion_num_items = std::min(num_items - portion * PORTION_SIZE, PORTION_SIZE);
-                uint num_blocks        = ceil_div(portion_num_items, ONESWEEP_TILE_ITEMS);
+                uint num_blocks        = ceil_div(portion_num_items, chosen_tile_items);
 
-                cmdlist << (*ms_radix_sort_reset_ptr)(d_lookback_view, 0u).dispatch(lookback_count);
+                if(reset_interop_it != ms_radix_sort_reset_interop_map.end())
+                {
+                    auto kernel = reset_interop_it->second.shader.template kernel<
+                        vk_cuda_interop::CudaArg<Buffer<uint>, Usage::WRITE>,
+                        uint>();
+                    cmdlist << kernel(d_lookback_view, 0u).dispatch(static_cast<uint>(lookback_count));
+                }
+                else
+                {
+                    cmdlist << (*ms_radix_sort_reset_ptr)(d_lookback_view, 0u).dispatch(lookback_count);
+                }
+
+                auto bins_out_view =
+                    portion < num_portions - 1 ?
+                        d_bins_view.subview(((portion + 1) * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS) :
+                        d_bins_view.subview(0, RADIX_DIGITS);  // dummy: last portion, bins_out unused but must be valid-sized
+                auto ctrs_view = d_ctrs_view.subview((portion * num_passes + pass) * descriptor_view_alignment_uints, 1);
+                auto bins_in_view = d_bins_view.subview((portion * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS);
+                // KEY_ONLY: pass a 1-element dummy view instead of an empty one --
+                // Vulkan forbids empty storage-buffer descriptors, and the
+                // values are never read/written when KEY_ONLY is true.
+                auto values_in_view = KEY_ONLY ? d_values.current().subview(0, 1) :
+                                                 d_values.current().subview(portion * PORTION_SIZE, portion_num_items);
+                auto values_out_view = KEY_ONLY ? d_values.alternate().subview(0, 1) :
+                                                  d_values.alternate().subview(portion * PORTION_SIZE, portion_num_items);
+                auto keys_in_view =
+                    ByteBufferView{d_keys.current().subview(portion * PORTION_SIZE, portion_num_items)};
+                auto keys_out_view = ByteBufferView{d_keys.alternate()};
 
                 // dispatch
-                cmdlist
-                    << (*ms_radix_sort_onesweep_ptr)(
-                           d_lookback_view,
-                           d_ctrs_view.subview(portion * num_passes + pass, 1),
-                           d_bins_view.subview((portion * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS),
-                           portion < num_portions - 1 ?
-                               d_bins_view.subview(((portion + 1) * num_passes + pass) * RADIX_DIGITS, RADIX_DIGITS) :
-                               d_bins_view.subview(0, RADIX_DIGITS),  // dummy: last portion, bins_out unused but must be valid-sized
-                           ByteBufferView{d_keys.current().subview(portion * PORTION_SIZE, portion_num_items)},
-                           ByteBufferView{d_keys.alternate()},
-                           KEY_ONLY ? d_values.current().subview(0u, 1u) :
-                                      d_values.current().subview(portion * PORTION_SIZE, portion_num_items),
-                           KEY_ONLY ? d_values.alternate().subview(0u, 1u) :
-                                      d_values.alternate().subview(portion * PORTION_SIZE, portion_num_items),
-                           portion_num_items,
-                           current_bit,
-                           num_bit)
-                           .dispatch(num_blocks * ONESWEEP_BLOCK_THREADS);
+                if(onesweep_interop_it != ms_radix_sort_one_sweep_interop_map.end())
+                {
+                    auto kernel = onesweep_interop_it->second.shader.template kernel<
+                        vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                        vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ_WRITE>,
+                        vk_cuda_interop::CudaArg<Buffer<uint>, Usage::READ>,
+                        vk_cuda_interop::CudaArg<Buffer<uint>, Usage::WRITE>,
+                        vk_cuda_interop::CudaArg<ByteBuffer, Usage::READ>,
+                        vk_cuda_interop::CudaArg<ByteBuffer, Usage::WRITE>,
+                        vk_cuda_interop::CudaArg<Buffer<ValueType>, Usage::READ>,
+                        vk_cuda_interop::CudaArg<Buffer<ValueType>, Usage::WRITE>,
+                        uint,
+                        uint,
+                        uint>();
+                    cmdlist << kernel(d_lookback_view,
+                                      ctrs_view,
+                                      bins_in_view,
+                                      bins_out_view,
+                                      keys_in_view,
+                                      keys_out_view,
+                                      values_in_view,
+                                      values_out_view,
+                                      portion_num_items,
+                                      current_bit,
+                                      num_bit)
+                                   .dispatch(num_blocks * chosen_block_threads);
+                }
+                else
+                {
+                    cmdlist << (*ms_radix_sort_onesweep_ptr)(d_lookback_view,
+                                                             ctrs_view,
+                                                             bins_in_view,
+                                                             bins_out_view,
+                                                             keys_in_view,
+                                                             keys_out_view,
+                                                             values_in_view,
+                                                             values_out_view,
+                                                             portion_num_items,
+                                                             current_bit,
+                                                             num_bit)
+                                   .dispatch(num_blocks * chosen_block_threads);
+                }
             }
             if(!is_overwrite_okay && pass == 0)
             {
@@ -1133,9 +1475,16 @@ class DeviceRadixSort : public LuisaModule
     }
 
   private:
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_histogram_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_exclusive_sum_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_one_sweep_map;
-    luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> ms_radix_sort_reset_map;
+    detail::ShaderCacheMap ms_radix_sort_histogram_map;
+    detail::ShaderCacheMap ms_radix_sort_exclusive_sum_map;
+    detail::ShaderCacheMap ms_radix_sort_one_sweep_map;
+    detail::ShaderCacheMap ms_radix_sort_reset_map;
+
+    // epoch B: vk-cuda interop kernels shadowing the four maps above (risk R6:
+    // destroyed with the module, hence before the vk device they borrow).
+    detail::InteropShaderMap ms_radix_sort_histogram_interop_map;
+    detail::InteropShaderMap ms_radix_sort_exclusive_sum_interop_map;
+    detail::InteropShaderMap ms_radix_sort_one_sweep_interop_map;
+    detail::InteropShaderMap ms_radix_sort_reset_interop_map;
 };
 }  // namespace luisa::parallel_primitive

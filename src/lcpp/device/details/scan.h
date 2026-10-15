@@ -257,6 +257,16 @@ namespace details
 
                     ArrayVar<Type4Byte, ITEMS_PER_THREAD> items;
                     SmemTypePtr<Type4Byte> s_data = new SmemType<Type4Byte>{shared_mem_size};
+                    // Coalesced (block-striped) global I/O transposed through shared
+                    // memory so the per-thread register array stays in the blocked,
+                    // thread-major order that BlockScan requires for an order-correct
+                    // prefix sum. Thread `thid` fetches tile positions
+                    // {i*BLOCK + thid} (adjacent threads -> adjacent addresses) into
+                    // shared, then reads the blocked range {thid*ITEMS + i} back into
+                    // registers. The end bound `num_remaining` is compared against the
+                    // RELATIVE tile position before adding `tile_start`, exactly as the
+                    // previous guarded DIRECT load did.
+                    UInt block_stride = UInt(BLOCK_SIZE);
                     $if(is_last_tile)
                     {
                         BlockLoad<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, LOAD_ALGORITHM, WARP_SYNC>(s_data).Load(
@@ -267,6 +277,7 @@ namespace details
                         BlockLoad<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, LOAD_ALGORITHM, WARP_SYNC>(s_data).Load(
                             d_in, items, tile_start);
                     };
+
                     ArrayVar<Type4Byte, ITEMS_PER_THREAD> output_items;
                     $if(tile_id == 0u)
                     {
@@ -319,6 +330,7 @@ namespace details
                     {
                         BlockStore<Type4Byte, BLOCK_SIZE, ITEMS_PER_THREAD, STORE_ALGORITHM, WARP_SYNC>(s_data).Store(
                             output_items, d_out, tile_start);
+
                     };
         }
 
