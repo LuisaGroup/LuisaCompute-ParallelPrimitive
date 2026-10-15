@@ -1,5 +1,7 @@
 # Default and segmented scan performance, 2026-10-15
 
+These tables describe the first optimization pass. The subsequent [long segmented scan follow-up](segmented-scan-long-2026-10-15.md) reaches CUB parity at 4M/4096 and improves larger segments further.
+
 Measured library commit: `ae0d0f1c66d8060aea0eee49c6d799bad2a39dd8`.
 Frozen before version: `ee963595708fa7029533d81fa557afc4f83a202e`.
 LuisaCompute: `fac75f60bc1f8925559852e002dc261e47dd1f4d`, including merged PR #279.
@@ -20,7 +22,7 @@ Times below are the median of five per-process medians. Speedup is the median of
 | InclusiveSegmentedSum, 256 items/segment | 53.176 | 8.120 | 11.232 | 6.55x | 0.720x |
 | InclusiveSegmentedSum, 4096 items/segment | 996.416 | 14.192 | 7.584 | 69.78x | 1.873x |
 
-The ordinary scan is within run-to-run variation of CUB. Short segments are faster in this workload. Long segments still take about 1.87 times CUB despite the large improvement.
+The ordinary scan is within run-to-run variation of CUB. Short segments are faster in this workload. At this first-pass commit, long segments take about 1.87 times CUB despite the large improvement.
 The long-segment baseline varied from 886.824 to 1093.584 us; the optimized version varied from 14.176 to 14.296 us.
 
 ## Host submission and completion
