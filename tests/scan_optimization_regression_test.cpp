@@ -220,7 +220,8 @@ void segmented(Runner& r, bool short_segments = false)
     }
     else
     {
-        lengths = {0u, 1u, 31u, 32u, 33u, 255u, 256u, 257u, 2047u, 2048u, 2049u, 4095u, 4096u, 4097u, 8193u};
+        lengths = {0u,    1u,    31u,   32u,   33u,   255u,  256u,   257u,   2047u,  2048u, 2049u,
+                   4095u, 4096u, 4097u, 8191u, 8192u, 8193u, 16383u, 16384u, 16385u, 32769u};
     }
     std::vector<uint> begins, ends, packed;
     uint              input_size  = 3u;
@@ -524,6 +525,12 @@ int main(int argc, char* argv[])
         segmented<double>(runner, true);
         segmented<int, 128u>(runner, true);
         segmented<int, 32u>(runner, true);
+        if(device.backend_name() == "cuda")
+        {
+            // Large custom blocks use the warp fallback to retain enough
+            // registers per thread, including partially filled final tiles.
+            segmented<int, 1024u>(runner);
+        }
         segmented_many(runner, true);
         segmented_many(runner, false);
         segmented_nonassociative(runner);

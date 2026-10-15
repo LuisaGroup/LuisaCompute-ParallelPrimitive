@@ -15,6 +15,7 @@
 #include <lcpp/common/type_trait.h>
 #include <lcpp/common/utils.h>
 #include <lcpp/runtime/core.h>
+#include <luisa/dsl/func.h>
 #include <luisa/dsl/sugar.h>
 
 namespace luisa::parallel_primitive
@@ -31,6 +32,7 @@ class DeviceSegmentedScan : public LuisaModule
 {
   private:
     static_assert(BLOCK_SIZE > 0u, "DeviceSegmentedScan block size must be positive.");
+    static constexpr size_t LONG_ITEMS_PER_THREAD = 8u;
 
     Device m_device;
     bool   m_created = false;
@@ -221,6 +223,157 @@ class DeviceSegmentedScan : public LuisaModule
     }
 
   private:
+    [[nodiscard]] static UInt transpose_index(const UInt& logical_index)
+    {
+        // Offset consecutive 32-element rows by one shared-memory bank.
+        return logical_index + logical_index / 32u;
+    }
+
+    static void sync_transpose(bool cuda_warp_sync)
+    {
+        if(cuda_warp_sync)
+        {
+            static ExternalCallable<void(uint)> syncwarp{"__syncwarp"};
+            syncwarp(UInt(0xffffffffu));
+        }
+        else
+        {
+            sync_block();
+        }
+    }
+
+    template <bool INCLUSIVE, bool USE_INITIAL_VALUE, NumericT T>
+    static void emit_block_sum(const BufferVar<T>&    input_buffer,
+                               const BufferVar<T>&    output_buffer,
+                               const BufferVar<uint>& begin_offsets_buffer,
+                               const BufferVar<uint>& end_offsets_buffer,
+                               const BufferVar<uint>& output_begin_offsets_buffer,
+                               const UInt&            num_segments,
+                               const UInt&            segment_base,
+                               const Var<T>&          initial_value,
+                               uint                   warp_size,
+                               uint                   warps_per_block,
+                               bool                   cuda_warp_sync)
+    {
+        constexpr uint TILE_ITEMS   = static_cast<uint>(BLOCK_SIZE * LONG_ITEMS_PER_THREAD);
+        constexpr uint SHARED_ITEMS = TILE_ITEMS + TILE_ITEMS / 32u;
+        UInt segment = segment_base + block_id().x;
+        $if(segment < num_segments)
+        {
+            UInt input_begin  = begin_offsets_buffer.read(segment);
+            UInt input_end    = end_offsets_buffer.read(segment);
+            UInt output_begin = output_begin_offsets_buffer.read(segment);
+            $if(input_begin < input_end)
+            {
+                UInt thread     = thread_id().x;
+                UInt lane       = warp_lane_id();
+                UInt warp       = thread / warp_size;
+                UInt warp_begin = warp * (warp_size * static_cast<uint>(LONG_ITEMS_PER_THREAD));
+                UInt item_count = input_end - input_begin;
+                UInt tile_begin = 0u;
+                Var<T> carry    = T{};
+                if constexpr(USE_INITIAL_VALUE)
+                {
+                    carry = initial_value;
+                }
+                Shared<T> transpose_storage{SHARED_ITEMS};
+                Shared<T> warp_totals{warps_per_block};
+                $while(tile_begin < item_count)
+                {
+                    UInt tile_size = min(item_count - tile_begin, static_cast<uint>(TILE_ITEMS));
+                    ArrayVar<T, LONG_ITEMS_PER_THREAD> values;
+                    // Each warp owns an independent padded shared window.
+                    // Batch coalesced global loads before publishing to it.
+                    ArrayVar<T, LONG_ITEMS_PER_THREAD> striped_values;
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = warp_begin + lane + static_cast<uint>(item) * warp_size;
+                        striped_values[item] = T{};
+                        $if(relative < tile_size)
+                        {
+                            striped_values[item] = input_buffer.read(input_begin + tile_begin + relative);
+                        };
+                    }
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = warp_begin + lane + static_cast<uint>(item) * warp_size;
+                        transpose_storage.write(transpose_index(relative), striped_values[item]);
+                    }
+                    sync_transpose(cuda_warp_sync);
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = thread * static_cast<uint>(LONG_ITEMS_PER_THREAD) + static_cast<uint>(item);
+                        values[item] = transpose_storage.read(transpose_index(relative));
+                    }
+
+                    Var<T> thread_total = values[0u];
+                    for(size_t item = 1u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        thread_total += values[item];
+                    }
+                    Var<T> thread_prefix = warp_prefix_sum(thread_total);
+                    $if(lane == warp_size - 1u)
+                    {
+                        warp_totals.write(warp, thread_prefix + thread_total);
+                    };
+                    // Publish warp totals and finish every shared-window read
+                    // before the output transpose can reuse that window.
+                    sync_block();
+                    Var<T> warp_prefix = T{};
+                    Var<T> tile_total  = T{};
+                    for(uint preceding_warp = 0u; preceding_warp < warps_per_block; ++preceding_warp)
+                    {
+                        Var<T> partial = warp_totals.read(preceding_warp);
+                        $if(preceding_warp < warp)
+                        {
+                            warp_prefix += partial;
+                        };
+                        tile_total += partial;
+                    }
+                    Var<T> prefix = carry + warp_prefix + thread_prefix;
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        Var<T> value = values[item];
+                        if constexpr(INCLUSIVE)
+                        {
+                            prefix += value;
+                            values[item] = prefix;
+                        }
+                        else
+                        {
+                            values[item] = prefix;
+                            prefix += value;
+                        }
+                    }
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = thread * static_cast<uint>(LONG_ITEMS_PER_THREAD) + static_cast<uint>(item);
+                        transpose_storage.write(transpose_index(relative), values[item]);
+                    }
+                    sync_transpose(cuda_warp_sync);
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = warp_begin + lane + static_cast<uint>(item) * warp_size;
+                        striped_values[item] = transpose_storage.read(transpose_index(relative));
+                    }
+                    for(size_t item = 0u; item < LONG_ITEMS_PER_THREAD; ++item)
+                    {
+                        UInt relative = warp_begin + lane + static_cast<uint>(item) * warp_size;
+                        $if(relative < tile_size)
+                        {
+                            output_buffer.write(output_begin + tile_begin + relative, striped_values[item]);
+                        };
+                    }
+                    // Guard shared-window reuse and the next tile's warp-total
+                    // writes, including CUDA's independently scheduled lanes.
+                    sync_block();
+                    carry += tile_total;
+                    tile_begin += tile_size;
+                };
+            };
+        };
+    }
+
     template <bool INCLUSIVE, bool USE_INITIAL_VALUE, NumericT T>
     static void emit_warp_sum(const BufferVar<T>&    input_buffer,
                               const BufferVar<T>&    output_buffer,
@@ -305,22 +458,28 @@ class DeviceSegmentedScan : public LuisaModule
                       T                initial_value,
                       uint             warp_size)
     {
-        constexpr uint ITEMS_PER_THREAD = 8u;
-        constexpr uint TILE_ITEMS       = static_cast<uint>(BLOCK_SIZE) * ITEMS_PER_THREAD;
-        const uint     warps_per_block  = static_cast<uint>(BLOCK_SIZE) / warp_size;
-        const uint     warp_total_count = warps_per_block * ITEMS_PER_THREAD;
-        const bool     pin_warp_size    = m_device.backend_name() != "vk";
-        // This selects a geometry, not a length limit: long ragged segments
-        // still work in the warp kernel by processing more tiles.
-        const bool warp_per_segment = input.size() / num_segments <= warp_size * ITEMS_PER_THREAD;
+        constexpr uint SHORT_ITEMS_PER_THREAD = 8u;
+        const uint     warps_per_block        = static_cast<uint>(BLOCK_SIZE) / warp_size;
+        const bool     pin_warp_size          = m_device.backend_name() != "vk";
+        const bool     cuda_warp_sync         = m_device.backend_name() == "cuda" && warp_size == details::WARP_SIZE;
+        constexpr size_t TILE_ITEMS           = BLOCK_SIZE * LONG_ITEMS_PER_THREAD;
+        const size_t shared_bytes             = (TILE_ITEMS + TILE_ITEMS / 32u + warps_per_block) * sizeof(T);
+        // The transpose needs two register arrays as well as shared storage.
+        // Keep register headroom for large custom blocks by using the warp
+        // kernel, which also handles long ragged segments through more tiles.
+        const bool warp_per_segment = input.size() / num_segments <= warp_size * SHORT_ITEMS_PER_THREAD
+                                      || BLOCK_SIZE > 256u
+                                      || shared_bytes > m_device.compute_max_shared_memory_size();
         using SegmentedScanShader =
             Shader<1, Buffer<T>, Buffer<T>, Buffer<uint>, Buffer<uint>, Buffer<uint>, uint, uint, T>;
-        auto key = luisa::format("device_segmented_sum+inclusive:{}+initial:{}+warp:{}+pinned:{}+warp_segment:{}+{}",
+        auto key = luisa::format("device_segmented_sum+inclusive:{}+initial:{}+warp:{}+pinned:{}+warp_segment:{}+long_items:{}+cuda_sync:{}+{}",
                                  INCLUSIVE,
                                  USE_INITIAL_VALUE,
                                  warp_size,
                                  pin_warp_size,
                                  warp_per_segment,
+                                 LONG_ITEMS_PER_THREAD,
+                                 cuda_warp_sync,
                                  get_type_and_op_desc<T>(SumOp{}));
         auto shader_it = m_scan_shaders.find(key);
         if(shader_it == m_scan_shaders.end())
@@ -328,7 +487,7 @@ class DeviceSegmentedScan : public LuisaModule
             U<SegmentedScanShader> shader = nullptr;
             lazy_compile(m_device,
                          shader,
-                         [warp_size, warps_per_block, warp_total_count, pin_warp_size, warp_per_segment](
+                         [warp_size, warps_per_block, pin_warp_size, warp_per_segment, cuda_warp_sync](
                              BufferVar<T>    input_buffer,
                              BufferVar<T>    output_buffer,
                              BufferVar<uint> begin_offsets_buffer,
@@ -361,108 +520,17 @@ class DeviceSegmentedScan : public LuisaModule
                                                                            warps_per_block);
                                  return;
                              }
-                             UInt segment = segment_base_var + block_id().x;
-                             $if(segment < num_segments_var)
-                             {
-                                 UInt input_begin  = begin_offsets_buffer.read(segment);
-                                 UInt input_end    = end_offsets_buffer.read(segment);
-                                 UInt output_begin = output_begin_offsets_buffer.read(segment);
-                                 $if(input_begin < input_end)
-                                 {
-                                     UInt thread     = thread_id().x;
-                                     UInt lane       = warp_lane_id();
-                                     UInt warp       = thread / warp_size;
-                                     UInt item_count = input_end - input_begin;
-                                     UInt tile_begin = 0u;
-                                     Var<T> carry    = T{};
-                                     if constexpr(USE_INITIAL_VALUE)
-                                     {
-                                         carry = initial_value_var;
-                                     }
-                                     Shared<T> warp_totals{warp_total_count + 1u};
-                                     $while(tile_begin < item_count)
-                                     {
-                                         UInt tile_size = min(item_count - tile_begin, static_cast<uint>(TILE_ITEMS));
-                                         UInt active_warp_totals =
-                                             ((tile_size + static_cast<uint>(BLOCK_SIZE) - 1u)
-                                              / static_cast<uint>(BLOCK_SIZE))
-                                             * warps_per_block;
-                                         std::array<Var<T>, ITEMS_PER_THREAD> local_prefix;
-                                         // Striped rows coalesce both loads and stores. Every
-                                         // lane participates, with zero padding in the tail.
-                                         for(uint item = 0u; item < ITEMS_PER_THREAD; ++item)
-                                         {
-                                             $if(item * static_cast<uint>(BLOCK_SIZE) < tile_size)
-                                             {
-                                                 UInt relative = thread + item * static_cast<uint>(BLOCK_SIZE);
-                                                 Var<T> value  = T{};
-                                                 $if(relative < tile_size)
-                                                 {
-                                                     value = input_buffer.read(input_begin + tile_begin + relative);
-                                                 };
-                                                 Var<T> prefix = warp_prefix_sum(value);
-                                                 local_prefix[item] = prefix;
-                                                 if constexpr(INCLUSIVE)
-                                                 {
-                                                     local_prefix[item] += value;
-                                                 }
-                                                 $if(lane == warp_size - 1u)
-                                                 {
-                                                     warp_totals.write(item * warps_per_block + warp, prefix + value);
-                                                 };
-                                             };
-                                         }
-                                         sync_block();
-                                         // Only the first warp scans the row-major warp totals;
-                                         // cross-warp communication stays in shared memory.
-                                         $if(warp == 0u)
-                                         {
-                                             Var<T> preceding = T{};
-                                             for(uint base = 0u; base < warp_total_count; base += warp_size)
-                                             {
-                                                 $if(base < active_warp_totals)
-                                                 {
-                                                     UInt index   = base + lane;
-                                                     Var<T> value = T{};
-                                                     $if(index < active_warp_totals)
-                                                     {
-                                                         value = warp_totals.read(index);
-                                                     };
-                                                     Var<T> prefix    = warp_prefix_sum(value);
-                                                     Var<T> inclusive = prefix + value;
-                                                     $if(index < active_warp_totals)
-                                                     {
-                                                         warp_totals.write(index, preceding + prefix);
-                                                     };
-                                                     preceding += warp_read_lane(inclusive, warp_size - 1u);
-                                                 };
-                                             }
-                                             $if(lane == 0u)
-                                             {
-                                                 warp_totals.write(warp_total_count, preceding);
-                                             };
-                                         };
-                                         sync_block();
-                                         Var<T> tile_total = warp_totals.read(warp_total_count);
-                                         for(uint item = 0u; item < ITEMS_PER_THREAD; ++item)
-                                         {
-                                             UInt relative = thread + item * static_cast<uint>(BLOCK_SIZE);
-                                             $if(relative < tile_size)
-                                             {
-                                                 Var<T> prefix = carry + warp_totals.read(item * warps_per_block + warp)
-                                                                 + local_prefix[item];
-                                                 output_buffer.write(output_begin + tile_begin + relative, prefix);
-                                             };
-                                         }
-                                         // All reads of the offsets finish before the next tile
-                                         // overwrites shared memory. All tile inputs were loaded
-                                         // before any output, so exact in-place scans are safe.
-                                         sync_block();
-                                         carry += tile_total;
-                                         tile_begin += tile_size;
-                                     };
-                                 };
-                             };
+                             emit_block_sum<INCLUSIVE, USE_INITIAL_VALUE>(input_buffer,
+                                                                         output_buffer,
+                                                                         begin_offsets_buffer,
+                                                                         end_offsets_buffer,
+                                                                         output_begin_offsets_buffer,
+                                                                         num_segments_var,
+                                                                         segment_base_var,
+                                                                         initial_value_var,
+                                                                         warp_size,
+                                                                         warps_per_block,
+                                                                         cuda_warp_sync);
                          });
             m_scan_shaders.try_emplace(key, std::move(shader));
             shader_it = m_scan_shaders.find(key);
