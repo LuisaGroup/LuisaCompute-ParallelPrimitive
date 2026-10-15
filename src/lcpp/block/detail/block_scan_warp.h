@@ -61,23 +61,16 @@ namespace details
                            ScanOp                  scan_op,
                            const Var<Type4Byte>&   initial_value)
         {
-            Var<Type4Byte> inclusive_output;
-            WarpScan<Type4Byte, WARP_SIZE, WarpScanAlgorithm::WARP_SHUFFLE>().Scan(
-                thread_data, inclusive_output, exclusive_output, scan_op, initial_value);
-
-            Var<Type4Byte> warp_prefix =
-                ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate, initial_value);
-
-            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
-            UInt lane_id = warp_lane_id() % compute::UInt(WARP_SIZE);
-
-            $if(warp_id != 0)
+            // Scan raw warp aggregates first. Applying the seed inside every
+            // warp would count it again when combining the warp prefixes.
+            ExclusiveScan(m_shared_mem, thread_data, exclusive_output, block_aggregate, scan_op);
+            $if(thread_id().x == 0u)
             {
-                exclusive_output = scan_op(warp_prefix, exclusive_output);
-                $if(lane_id == 0)
-                {
-                    exclusive_output = warp_prefix;
-                };
+                exclusive_output = initial_value;
+            }
+            $else
+            {
+                exclusive_output = scan_op(initial_value, exclusive_output);
             };
         }
 
@@ -142,16 +135,8 @@ namespace details
                            ScanOp                  scan_op,
                            const Var<Type4Byte>&   initial_value)
         {
-            WarpScan<Type4Byte, WARP_SIZE>().InclusiveScan(thread_data, inclusive_output, scan_op);
-
-            Var<Type4Byte> warp_prefix =
-                ComputeWarpPrefix(m_shared_mem, scan_op, inclusive_output, block_aggregate, initial_value);
-
-            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
-            $if(warp_id != 0)
-            {
-                inclusive_output = scan_op(warp_prefix, inclusive_output);
-            };
+            InclusiveScan(m_shared_mem, thread_data, inclusive_output, block_aggregate, scan_op);
+            inclusive_output = scan_op(initial_value, inclusive_output);
         }
 
         template <typename ScanOp, typename BlockPrefixCallbackOp>
@@ -215,26 +200,6 @@ namespace details
             return warp_prefix;
         }
 
-        template <typename ScanOp>
-        Var<Type4Byte> ComputeWarpPrefix(SmemTypePtr<Type4Byte>& m_shared_mem,
-                                         ScanOp                  scan_op,
-                                         const Var<Type4Byte>&   warp_aggregate,
-                                         Var<Type4Byte>&         block_aggregate,
-                                         const Var<Type4Byte>&   initial_value)
-        {
-            Var<Type4Byte> warp_prefix =
-                ComputeWarpPrefix(m_shared_mem, scan_op, warp_aggregate, block_aggregate);
-
-            warp_prefix = scan_op(initial_value, warp_prefix);
-
-            UInt warp_id = thread_id().x / compute::UInt(WARP_SIZE);
-            $if(warp_id == 0)
-            {
-                warp_prefix = initial_value;
-            };
-
-            return warp_prefix;
-        }
     };
 }  // namespace details
 }  // namespace luisa::parallel_primitive
