@@ -208,10 +208,20 @@ void ordinary(Runner& r)
 }
 
 template <typename T, size_t Block = details::BLOCK_SIZE>
-void segmented(Runner& r)
+void segmented(Runner& r, bool short_segments = false)
 {
-    const std::array<uint, 15u> lengths{
-        0u, 1u, 31u, 32u, 33u, 255u, 256u, 257u, 2047u, 2048u, 2049u, 4095u, 4096u, 4097u, 8193u};
+    std::vector<uint> lengths;
+    if(short_segments)
+    {
+        // A low average can contain a long outlier. Forty-one segments also
+        // leave a partial final block in the warp policy.
+        lengths = {0u, 1u, 31u, 32u, 33u, 127u, 128u, 129u, 255u, 256u, 257u, 4097u};
+        lengths.resize(41u, 3u);
+    }
+    else
+    {
+        lengths = {0u, 1u, 31u, 32u, 33u, 255u, 256u, 257u, 2047u, 2048u, 2049u, 4095u, 4096u, 4097u, 8193u};
+    }
     std::vector<uint> begins, ends, packed;
     uint              input_size  = 3u;
     uint              output_size = 5u;
@@ -237,7 +247,8 @@ void segmented(Runner& r)
              << output_offsets.copy_from(luisa::span{packed}) << synchronize();
     DeviceSegmentedScan<Block> scan;
     scan.create(r.device);
-    const auto prefix = std::string{"segmented."} + type_name<T>() + ".block=" + std::to_string(Block);
+    const auto prefix = std::string{"segmented."} + type_name<T>() + ".block=" + std::to_string(Block)
+                        + (short_segments ? ".short_ragged" : ".long_ragged");
     check(scan.template GetTempStorageBytes<T>(size, lengths.size()) == 0u, prefix + ".zero_temp");
     // Modes include the built-in initial-value SumOp entry points.
     for(uint mode = 0u; mode < 4u; ++mode)
@@ -353,10 +364,12 @@ void block_initial(Runner& r)
     expect_equal(actual, expected, "block.scalar.initial_and_raw_aggregate");
 }
 
-void segmented_many(Runner& r)
+void segmented_many(Runner& r, bool block_policy)
 {
-    constexpr uint    segments = 65537u;
-    constexpr uint    n        = 2u * segments;
+    const uint        segments_per_block = block_policy ? 1u : 256u / r.device.compute_warp_size();
+    const uint        boundary           = 65535u * segments_per_block;
+    const uint        segments           = boundary + 2u;
+    const uint        n                  = 2u * segments;
     std::vector<int>  host(n + 8u, 1), sentinel(n + 8u, -777);
     std::vector<uint> begins(segments), ends(segments);
     for(uint s = 0u; s < segments; ++s)
@@ -366,12 +379,17 @@ void segmented_many(Runner& r)
     }
     // Exercise an empty segment next to the split as well as a nonempty one
     // on either side. Offset buffers retain their original aligned views.
-    ends[65534u]      = begins[65534u];
-    auto input        = r.device.create_buffer<int>(host.size());
+    ends[boundary - 1u] = begins[boundary - 1u];
+    // A larger input view selects the block heuristic without making all
+    // segments long. Unused capacity is never read by either policy.
+    const size_t input_capacity =
+        block_policy ? (size_t{r.device.compute_warp_size()} * 8u + 1u) * segments : host.size();
+    auto input        = r.device.create_buffer<int>(input_capacity);
     auto output       = r.device.create_buffer<int>(host.size());
     auto begin_buffer = r.device.create_buffer<uint>(segments);
     auto end_buffer   = r.device.create_buffer<uint>(segments);
-    r.stream << input.copy_from(luisa::span{host}) << begin_buffer.copy_from(luisa::span{begins})
+    r.stream << input.view(0u, host.size()).copy_from(luisa::span{host})
+             << begin_buffer.copy_from(luisa::span{begins})
              << end_buffer.copy_from(luisa::span{ends}) << synchronize();
     DeviceSegmentedScan<> scan;
     scan.create(r.device);
@@ -394,7 +412,9 @@ void segmented_many(Runner& r)
                 commands, {}, input.view(), output.view(), begin_buffer.view(), end_buffer.view(), segments);
         std::vector<int> actual(output.size());
         r.stream << commands.commit() << output.copy_to(luisa::span{actual}) << synchronize();
-        expect_equal(actual, expected, inclusive ? "segmented.65537.inclusive" : "segmented.65537.exclusive");
+        auto label = std::string{"segmented.chunk."} + (block_policy ? "block" : "warp")
+                     + (inclusive ? ".inclusive" : ".exclusive");
+        expect_equal(actual, expected, label);
     }
 }
 
@@ -498,7 +518,14 @@ int main(int argc, char* argv[])
         segmented<double>(runner);
         segmented<int, 128u>(runner);
         segmented<int, 32u>(runner);
-        segmented_many(runner);
+        segmented<int>(runner, true);
+        segmented<uint>(runner, true);
+        segmented<float>(runner, true);
+        segmented<double>(runner, true);
+        segmented<int, 128u>(runner, true);
+        segmented<int, 32u>(runner, true);
+        segmented_many(runner, true);
+        segmented_many(runner, false);
         segmented_nonassociative(runner);
     }
     std::printf("Scan optimization result: %zu checks, %zu failures\n", checks, failures);

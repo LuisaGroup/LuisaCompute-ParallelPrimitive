@@ -234,6 +234,7 @@ stream << cmdlist.commit() << synchronize();
 - [x] **DeviceSelect** - Flagged/FlaggedIf, predicate, unique, and unique-by-key copy/in-place selection
 - [x] **DeviceSegmentReduce** - Segmented reduction operations
 - [x] **DeviceSegmentedScan** - Inclusive/exclusive scans with shared or independent output offsets
+  - Built-in 32-bit sums cooperate within a warp or block; general operators retain serial left-to-right evaluation.
 - [x] **DeviceSegmentedRadixSort** - Numeric bit-range copy and DoubleBuffer sorting within segments
 - [x] **DeviceSegmentedSort** - Ordered/stable copy and DoubleBuffer sorting within segments
 - [x] **DeviceTopK** - Min/max key and pair selection with numeric or decomposed keys
@@ -331,6 +332,7 @@ build and GPU test runs.
 - [x] `DeviceScan::ExclusiveScanByKey` - Segmented exclusive scan with keys
 - [x] `DeviceScan::InclusiveScanInit` - Inclusive scan with an explicit initial value
 - [x] `DeviceScanCudaParity` - CUDA packed warp-transpose policy tuned for CUB parity (`320` threads, `25` items/thread)
+- [x] `DeviceScan<>` automatically selects this policy for ordinary 4-byte CUDA and Vulkan CUDA interop scans; other backends and scan variants retain their portable policies
 - [x] Custom key equality and distinct key/value types
 
 ### Priority 2: Sorting and Merging
