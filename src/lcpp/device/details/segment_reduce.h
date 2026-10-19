@@ -8,6 +8,7 @@
 
 #pragma once
 #include <cstddef>
+#include <type_traits>
 #include <luisa/dsl/sugar.h>
 #include <luisa/dsl/func.h>
 #include <luisa/dsl/var.h>
@@ -40,6 +41,80 @@ namespace details
         using AgentReduceT =
             AgentReduce<Type4Byte, ReduceOp, TransformOp, BLOCK_SIZE, ITEMS_PER_THREAD, WARP_SIZE>;
 
+      private:
+        struct CudaBlockSum
+        {
+            static Var<Type4Byte> reduce(const Var<Type4Byte>& input, UInt valid_items)
+            {
+                constexpr uint warps = BLOCK_SIZE / details::WARP_SIZE;
+                UInt thid = thread_id().x;
+                UInt warp = thid / UInt(details::WARP_SIZE);
+                UInt lane = thid % UInt(details::WARP_SIZE);
+                Var<Type4Byte> value{Type4Byte{0}};
+                $if(thid < min(valid_items, UInt(BLOCK_SIZE)))
+                {
+                    value = input;
+                };
+                Var<Type4Byte> aggregate = warp_active_sum(value);
+                Shared<Type4Byte> warp_totals{warps};
+                $if(lane == 0u)
+                {
+                    warp_totals.write(warp, aggregate);
+                };
+                sync_block();
+                Var<Type4Byte> result{Type4Byte{0}};
+                $if(warp == 0u)
+                {
+                    value = Type4Byte{0};
+                    $if(lane < UInt(warps))
+                    {
+                        value = warp_totals.read(lane);
+                    };
+                    result = warp_active_sum(value);
+                };
+                return result;
+            }
+
+            template <typename ReduceOp>
+            Var<Type4Byte> Reduce(const Var<Type4Byte>& input, ReduceOp)
+            {
+                return reduce(input, UInt(BLOCK_SIZE));
+            }
+
+            template <typename ReduceOp>
+            Var<Type4Byte> Reduce(const Var<Type4Byte>& input, ReduceOp, UInt valid_items)
+            {
+                return reduce(input, valid_items);
+            }
+        };
+
+        template <typename ReduceOp>
+        static Var<Type4Byte> consume_range(Device& device,
+                                           SmemTypePtr<Type4Byte>& shared,
+                                           BufferVar<Type4Byte>& input,
+                                           ReduceOp reduce_op,
+                                           UInt begin,
+                                           UInt end)
+        {
+            if constexpr(WARP_SIZE == details::WARP_SIZE && BLOCK_SIZE % details::WARP_SIZE == 0u
+                         && (std::is_same_v<Type4Byte, int> || std::is_same_v<Type4Byte, uint>)
+                         && std::is_same_v<std::remove_cvref_t<ReduceOp>, SumOp>)
+            {
+                if(device.backend_name() == "cuda")
+                {
+                    constexpr size_t cuda_items =
+                        BLOCK_SIZE == details::BLOCK_SIZE && ITEMS_PER_THREAD == details::ITEMS_PER_THREAD ?
+                            16u : ITEMS_PER_THREAD;
+                    using CudaAgent = AgentReduceImpl<Type4Byte, ReduceOp, IdentityOp,
+                                                      CudaBlockSum, false, BLOCK_SIZE, cuda_items>;
+                    return CudaAgent(shared, input, reduce_op, IdentityOp{}, thread_id().x)
+                        .ConsumeRange(begin, end);
+                }
+            }
+            return AgentReduceT<ReduceOp>(shared, input, reduce_op).ConsumeRange(begin, end);
+        }
+
+      public:
         template <typename ReduceOp>
         U<SegmentReduceKernel> compile(Device& device, size_t shared_mem_size, ReduceOp reduce_op)
         {
@@ -76,11 +151,8 @@ namespace details
                              {
                                  SmemTypePtr<Type4Byte> smem_data = new SmemType<Type4Byte>{shared_mem_size};
                                  Var<Type4Byte> block_aggregate =
-                                     AgentReduceT<ReduceOp>(smem_data,
-                                                            d_arr_in,
-                                                            reduce_op,
-                                                            luisa::parallel_primitive::IdentityOp())
-                                         .ConsumeRange(segment_begin, segment_end);
+                                     consume_range(device, smem_data, d_arr_in, reduce_op,
+                                                   segment_begin, segment_end);
                                  $if(thread_id().x == 0)
                                  {
                                      if constexpr(KeyValuePairType<Type4Byte>)
@@ -174,8 +246,8 @@ namespace details
 
                         SmemTypePtr<Type4Byte> smem_data = new SmemType<Type4Byte>{shared_mem_size};
                         Var<Type4Byte>         block_aggregate =
-                            AgentReduceT<ReduceOp>(smem_data, d_arr_in, reduce_op, luisa::parallel_primitive::IdentityOp())
-                                .ConsumeRange(segment_begin, segment_begin + d_segment_size);
+                            consume_range(device, smem_data, d_arr_in, reduce_op,
+                                          segment_begin, segment_begin + d_segment_size);
 
                         $if(thid == 0)
                         {

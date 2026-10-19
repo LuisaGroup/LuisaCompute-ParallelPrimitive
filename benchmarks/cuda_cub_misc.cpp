@@ -194,7 +194,9 @@ struct Benchmark {
 
     void run(const char *name, CubMiscOp operation, const CaseData &data,
              const std::function<void(CommandList &, const Views &)> &encode) {
-        if (!filter.empty() && std::string{name}.find(filter) == std::string::npos) { return; }
+        if (filter == "rle-segmentreduce") {
+            if (operation != CubMiscOp::run_length_encode && operation != CubMiscOp::segment_sum) { return; }
+        } else if (!filter.empty() && std::string{name}.find(filter) == std::string::npos) { return; }
         std::fprintf(stderr, "# case=%s starting\n", name);
         const auto input_size = data.input.size();
         const bool full_capacity = operation == CubMiscOp::select || operation == CubMiscOp::unique ||
@@ -462,31 +464,34 @@ int main(int argc, char **argv) {
             histogram.HistogramEven(cmd, BufferView<uint>{}, v.input, v.aux, 257u, 0, 256, n);
         });
     }
-    {
+    for (unsigned run_length : {1u, 16u, 4096u}) {
         CaseData data;
         data.input.resize(n);
-        for (size_t i = 0u; i < n; ++i) { data.input[i] = static_cast<int>(i / 16u); }
-        const auto runs = (n + 15u) / 16u;
+        for (size_t i = 0u; i < n; ++i) { data.input[i] = static_cast<int>(i / run_length); }
+        const auto runs = (n + run_length - 1u) / run_length;
         data.expected.resize(runs);
         std::iota(data.expected.begin(), data.expected.end(), 0);
         data.expected_count = static_cast<unsigned>(runs);
-        data.temp_bytes = DeviceSelect<>::GetTempStorageBytes(n);
-        DeviceSelect<> unique;
-        unique.create(device);
-        bench.run("DeviceSelect.Unique.run16", CubMiscOp::unique, data, [&](CommandList &cmd, const Views &v) {
-            unique.Unique(cmd, v.temp, v.input, v.output, v.count, n);
-        });
-        data.expected_aux.assign(runs, 16u);
-        data.expected_aux.back() = static_cast<unsigned>(n - (runs - 1u) * 16u);
+        if (run_length == 16u) {
+            data.temp_bytes = DeviceSelect<>::GetTempStorageBytes(n);
+            DeviceSelect<> unique;
+            unique.create(device);
+            bench.run("DeviceSelect.Unique.run16", CubMiscOp::unique, data, [&](CommandList &cmd, const Views &v) {
+                unique.Unique(cmd, v.temp, v.input, v.output, v.count, n);
+            });
+        }
+        data.expected_aux.assign(runs, run_length);
+        data.expected_aux.back() = static_cast<unsigned>(n - (runs - 1u) * run_length);
         data.temp_bytes = DeviceRunLengthEncode<>::GetTempStorageBytes(n);
         DeviceRunLengthEncode<> rle;
         rle.create(device);
-        bench.run("DeviceRunLengthEncode.Encode.run16", CubMiscOp::run_length_encode, data,
+        const auto name = "DeviceRunLengthEncode.Encode.run" + std::to_string(run_length);
+        bench.run(name.c_str(), CubMiscOp::run_length_encode, data,
                   [&](CommandList &cmd, const Views &v) {
                       rle.Encode(cmd, v.temp, v.input, v.output, v.aux, v.count, n);
                   });
     }
-    for (unsigned segment_size : {256u, 4096u}) {
+    for (unsigned segment_size : {32u, 256u, 4096u, 16384u}) {
         CaseData data;
         data.input.resize(n);
         for (size_t i = 0u; i < n; ++i) { data.input[i] = static_cast<int>(i % 13u) - 6; }
@@ -502,8 +507,8 @@ int main(int argc, char **argv) {
         }
         DeviceSegmentReduce<> reduce;
         reduce.create(device);
-        const char *name = segment_size == 256u ? "DeviceSegmentReduce.Sum.seg256" : "DeviceSegmentReduce.Sum.seg4096";
-        bench.run(name, CubMiscOp::segment_sum, data, [&](CommandList &cmd, const Views &v) {
+        const auto name = "DeviceSegmentReduce.Sum.seg" + std::to_string(segment_size);
+        bench.run(name.c_str(), CubMiscOp::segment_sum, data, [&](CommandList &cmd, const Views &v) {
             reduce.Sum(cmd, BufferView<uint>{}, v.input, v.output, static_cast<unsigned>(segments),
                        v.offsets.subview(0u, segments), v.offsets.subview(1u, segments));
         });

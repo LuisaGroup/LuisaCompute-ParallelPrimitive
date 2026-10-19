@@ -22,7 +22,7 @@ class DeviceRunLengthEncode : public LuisaModule
   private:
     using ScanT = DeviceScan<BLOCK_SIZE, WARP_NUMS, ITEMS_PER_THREAD>;
     using CompactT =
-        details::CompactModule<BLOCK_SIZE == details::BLOCK_SIZE ? 384u : BLOCK_SIZE,
+        details::CompactModule<BLOCK_SIZE,
                                ITEMS_PER_THREAD == details::ITEMS_PER_THREAD ? 15u : ITEMS_PER_THREAD>;
 
     Device m_device;
@@ -35,6 +35,7 @@ class DeviceRunLengthEncode : public LuisaModule
     luisa::shared_ptr<luisa::compute::Resource> m_run_offset_shader;
     luisa::shared_ptr<luisa::compute::Resource> m_run_length_shader;
     luisa::shared_ptr<luisa::compute::Resource> m_offset_length_shader;
+    luisa::shared_ptr<luisa::compute::Resource> m_vector_offset_length_shader;
     luisa::unordered_map<luisa::string, luisa::shared_ptr<luisa::compute::Resource>> m_run_length_shader_map;
     luisa::shared_ptr<luisa::compute::Resource> m_non_trivial_flag_shader;
     luisa::shared_ptr<luisa::compute::Resource> m_non_trivial_scatter_shader;
@@ -157,6 +158,64 @@ class DeviceRunLengthEncode : public LuisaModule
                                        BufferView<uint> count,
                                        size_t           num_items)
     {
+        if(offsets.size() >= 4u && lengths.size() >= 4u
+           && offsets.offset_bytes() % 16u == 0u && lengths.offset_bytes() % 16u == 0u
+           && offsets.stride() == sizeof(uint) && lengths.stride() == sizeof(uint))
+        {
+            using Kernel = Shader<1, Buffer<uint4>, Buffer<uint>, Buffer<uint4>, Buffer<uint>, Buffer<uint>, uint>;
+            if(!m_vector_offset_length_shader)
+            {
+                U<Kernel> shader = nullptr;
+                lazy_compile(m_device,
+                             shader,
+                             [](BufferVar<uint4> offset_packets,
+                                BufferVar<uint> offsets_buffer,
+                                BufferVar<uint4> length_packets,
+                                BufferVar<uint> lengths_buffer,
+                                BufferVar<uint> count_buffer,
+                                UInt num_elements) noexcept
+                             {
+                                 set_block_size(BLOCK_SIZE);
+                                 UInt lane = dispatch_id().x;
+                                 UInt runs = count_buffer.read(0u);
+                                 UInt packets = runs / 4u;
+                                 UInt packet = lane;
+                                 $while(packet < packets)
+                                 {
+                                     UInt4 offsets = offset_packets.read(packet);
+                                     UInt end = num_elements;
+                                     $if(packet * 4u + 4u < runs)
+                                     {
+                                         end = offsets_buffer.read(packet * 4u + 4u);
+                                     };
+                                     length_packets.write(packet, make_uint4(offsets.y - offsets.x,
+                                                                            offsets.z - offsets.y,
+                                                                            offsets.w - offsets.z,
+                                                                            end - offsets.w));
+                                     packet += dispatch_size().x;
+                                 };
+                                 UInt tail = packets * 4u + lane;
+                                 $if(lane < runs % 4u)
+                                 {
+                                     UInt end = num_elements;
+                                     $if(tail + 1u < runs)
+                                     {
+                                         end = offsets_buffer.read(tail + 1u);
+                                     };
+                                     lengths_buffer.write(tail, end - offsets_buffer.read(tail));
+                                 };
+                             });
+                m_vector_offset_length_shader = std::move(shader);
+            }
+            auto shader = reinterpret_cast<Kernel*>(&(*m_vector_offset_length_shader));
+            size_t threads = std::min(ceil_div(num_items, size_t{4u}),
+                                      ceil_div(num_items, CompactT::TILE_ITEMS) * BLOCK_SIZE);
+            // Keep all three scalar tail lanes active for small inputs.
+            threads = std::max(threads, size_t{3u});
+            cmdlist << (*shader)(offsets.template as<uint4>(), offsets, lengths.template as<uint4>(),
+                                lengths, count, static_cast<uint>(num_items)).dispatch(threads);
+            return;
+        }
         using Kernel = Shader<1, Buffer<uint>, Buffer<uint>, Buffer<uint>, uint>;
         if(!m_offset_length_shader)
         {

@@ -82,6 +82,125 @@ int main(int argc, char* argv[])
         return 3;
     }
 
+    "segment_reduce_ragged_initial_types_and_custom_policies"_test = [&]
+    {
+        auto check_policy = [&]<typename T, typename Reducer>(T, Reducer& module)
+        {
+            const luisa::vector<uint> lengths{0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u,
+                                               127u, 128u, 255u, 256u, 257u, 1023u,
+                                               1024u, 1025u, 4096u, 16384u, 0u};
+            const uint count = static_cast<uint>(lengths.size());
+            luisa::vector<uint> begins(count), ends(count);
+            uint items = 0u;
+            for(uint s = 0u; s < count; ++s)
+            {
+                begins[s] = items;
+                items += lengths[s];
+                ends[s] = items;
+                ++items;
+            }
+            constexpr uint padding = 64u;
+            luisa::vector<T> input(items + 2u * padding, T{});
+            for(uint i = 0u; i < items; ++i)
+            {
+                input[padding + i] = static_cast<T>(static_cast<int>(i % 13u) - 6);
+            }
+            auto in = device.create_buffer<T>(input.size());
+            auto out = device.create_buffer<T>(count + 2u * padding);
+            auto begin_buffer = device.create_buffer<uint>(count);
+            auto end_buffer = device.create_buffer<uint>(count);
+            stream << in.copy_from(luisa::span{input})
+                   << begin_buffer.copy_from(luisa::span{begins})
+                   << end_buffer.copy_from(luisa::span{ends});
+            for(uint mode = 0u; mode < 3u; ++mode)
+            {
+                luisa::vector<T> result(out.size(), T{111});
+                auto expected = result;
+                T initial = mode == 0u ? T{} : mode == 1u ? T{7} : T{3};
+                for(uint s = 0u; s < count; ++s)
+                {
+                    T aggregate = initial;
+                    for(uint i = begins[s]; i < ends[s]; ++i)
+                    {
+                        aggregate = mode == 2u ? std::max(aggregate, input[padding + i]) :
+                                                static_cast<T>(aggregate + input[padding + i]);
+                    }
+                    expected[padding + s] = aggregate;
+                }
+                CommandList commands;
+                auto input_view = in.view().subview(padding, items);
+                auto output_view = out.view().subview(padding, count);
+                if(mode == 0u)
+                {
+                    module.Sum(commands, BufferView<uint>{}, input_view, output_view,
+                               count, begin_buffer.view(), end_buffer.view());
+                }
+                else if(mode == 1u)
+                {
+                    module.Reduce(commands, BufferView<uint>{}, input_view, output_view,
+                                  count, begin_buffer.view(), end_buffer.view(), SumOp{}, initial);
+                }
+                else
+                {
+                    module.Reduce(commands, BufferView<uint>{}, input_view, output_view,
+                                  count, begin_buffer.view(), end_buffer.view(), MaxOp{}, initial);
+                }
+                stream << out.copy_from(luisa::span{result}) << commands.commit()
+                       << out.copy_to(luisa::span{result}) << synchronize();
+                expect(result == expected);
+            }
+        };
+        check_policy(int{}, reducer);
+        check_policy(uint{}, reducer);
+        check_policy(float{}, reducer);
+        check_policy(luisa::ulong{}, reducer);
+        DeviceSegmentReduce<128u, 32u, 8u> smaller;
+        DeviceSegmentReduce<512u, 32u, 4u> larger;
+        smaller.create(device, &stream);
+        larger.create(device, &stream);
+        check_policy(int{}, smaller);
+        check_policy(int{}, larger);
+    };
+
+    "segment_reduce_fixed_full_tiles_and_tails"_test = [&]
+    {
+        auto check_policy = [&](auto& module)
+        {
+            for(uint span : {128u, 257u, 4096u})
+            {
+                constexpr uint count = 13u;
+                luisa::vector<int> input(count * span);
+                for(uint i = 0u; i < input.size(); ++i)
+                {
+                    input[i] = static_cast<int>(i % 13u) - 6;
+                }
+                auto in = device.create_buffer<int>(input.size());
+                auto out = device.create_buffer<int>(count);
+                luisa::vector<int> expected(count, 7);
+                for(uint s = 0u; s < count; ++s)
+                {
+                    for(uint i = s * span; i < (s + 1u) * span; ++i)
+                    {
+                        expected[s] += input[i];
+                    }
+                }
+                CommandList commands;
+                module.Reduce(commands, BufferView<uint>{}, in.view(), out.view(), count, span, SumOp{}, 7);
+                luisa::vector<int> result(count);
+                stream << in.copy_from(luisa::span{input}) << commands.commit()
+                       << out.copy_to(luisa::span{result}) << synchronize();
+                expect(result == expected);
+            }
+        };
+        check_policy(reducer);
+        DeviceSegmentReduce<128u, 32u, 8u> smaller;
+        DeviceSegmentReduce<512u, 32u, 4u> larger;
+        smaller.create(device, &stream);
+        larger.create(device, &stream);
+        check_policy(smaller);
+        check_policy(larger);
+    };
+
     "segment_reduce"_test = [&]
     {
         constexpr int32_t    array_size = 1024;
