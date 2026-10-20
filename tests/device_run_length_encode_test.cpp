@@ -73,7 +73,8 @@ int main(int argc, char* argv[])
 
     "device_run_length_encode_long_runs_across_fused_tiles"_test = [&]
     {
-        for(uint count : {1u, 5759u, 5760u, 5761u, 230413u})
+        for(uint count : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 10u, 12u,
+                          3839u, 3840u, 3841u, 5759u, 5760u, 5761u, 230413u, 230414u})
         {
             auto in      = device.create_buffer<int>(count);
             auto unique  = device.create_buffer<int>(count);
@@ -82,7 +83,7 @@ int main(int argc, char* argv[])
             auto temp    = device.create_buffer<uint>(
                 bytes_to_uint_count(DeviceRunLengthEncode<>::GetTempStorageBytes(count)));
             luisa::vector<uint> poison(temp.size(), 99u);
-            for(uint run_length : {1u, 17u, 18001u, count})
+            for(uint run_length : {1u, 2u, 17u, 18001u, count})
             {
                 luisa::vector<int>  input(count);
                 luisa::vector<int>  expected;
@@ -115,6 +116,64 @@ int main(int argc, char* argv[])
                 expect(result_lengths == expected_lengths);
             }
         }
+    };
+
+    "device_run_length_encode_typed_subviews_and_custom_policies"_test = [&]
+    {
+        auto check_policy = [&]<typename T, typename Encoder>(T, Encoder& encoder)
+        {
+            constexpr uint count = 23054u;
+            constexpr uint padding = 64u;
+            luisa::vector<T> input(count + 2u * padding, T{99});
+            luisa::vector<T> expected(input.size(), T{99});
+            luisa::vector<uint> expected_lengths(input.size(), 99u);
+            uint expected_count = 0u;
+            for(uint i = 0u; i < count; ++i)
+            {
+                // Mix dense, sparse and headless tiles in the same dispatch.
+                const uint phase = (i / 3840u) % 6u;
+                const int key = phase == 0u || phase == 4u ? static_cast<int>(i) :
+                                phase == 1u || phase == 2u ? -7 :
+                                phase == 3u ? static_cast<int>((i / 17u) % 23u) - 11 : -4;
+                input[padding + i] = static_cast<T>(key);
+                if(i == 0u || input[padding + i] != input[padding + i - 1u])
+                {
+                    expected[padding + expected_count] = input[padding + i];
+                    expected_lengths[padding + expected_count] = 0u;
+                    ++expected_count;
+                }
+                ++expected_lengths[padding + expected_count - 1u];
+            }
+            auto in = device.create_buffer<T>(input.size());
+            auto unique = device.create_buffer<T>(input.size());
+            auto lengths = device.create_buffer<uint>(input.size());
+            auto runs = device.create_buffer<uint>(1u);
+            auto temp = device.create_buffer<uint>(bytes_to_uint_count(Encoder::GetTempStorageBytes(count)));
+            luisa::vector<uint> poison(temp.size(), 99u);
+            luisa::vector<T> values(input.size(), T{99});
+            luisa::vector<uint> result_lengths(input.size(), 99u);
+            CommandList commands;
+            encoder.Encode(commands, temp.view(), in.view().subview(padding, count),
+                           unique.view().subview(padding, count), lengths.view().subview(padding, count),
+                           runs.view(), count);
+            uint result_count = 0u;
+            stream << in.copy_from(luisa::span{input}) << unique.copy_from(luisa::span{values})
+                   << lengths.copy_from(luisa::span{result_lengths}) << temp.copy_from(luisa::span{poison})
+                   << commands.commit() << unique.copy_to(luisa::span{values})
+                   << lengths.copy_to(luisa::span{result_lengths})
+                   << runs.copy_to(luisa::span{&result_count, 1u}) << synchronize();
+            expect(result_count == expected_count);
+            expect(values == expected);
+            expect(result_lengths == expected_lengths);
+        };
+        check_policy(uint{}, run_length_encode);
+        check_policy(float{}, run_length_encode);
+        DeviceRunLengthEncode<128u, 32u, 8u> smaller;
+        DeviceRunLengthEncode<512u, 32u, 4u> larger;
+        smaller.create(device);
+        larger.create(device);
+        check_policy(int{}, smaller);
+        check_policy(int{}, larger);
     };
 
     "device_run_length_encode_matches_cub_examples"_test = [&]
