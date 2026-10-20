@@ -47,19 +47,33 @@ args[sourceIndex] = path.join(root, 'benchmarks/cuda_cub_misc.cpp');
 args[outputIndex + 1] = path.join(root, 'build/cuda_cub_misc.o');
 args.unshift('-I' + path.join(cuda, 'include'));
 args.unshift('-I' + lcpp);
-const cubArgs = [
+const cubFlags = [
     '-std=c++20', '-O3', '-lineinfo', '-arch=' + options.arch,
     '-I' + path.join(cccl, 'cub'),
     '-I' + path.join(cccl, 'thrust'),
     '-I' + path.join(cccl, 'libcudacxx/include'),
-    '-c', 'benchmarks/cub_misc.cu', '-o', 'build/cub_misc.o',
 ];
+const cubArgs = [...cubFlags, '-c', 'benchmarks/cub_misc.cu', '-o', 'build/cub_misc.o'];
 const nvcc = path.join(cuda, 'bin/nvcc');
 const nvccVersion = spawnSync(nvcc, ['--version'], { encoding: 'utf8' });
 if (nvccVersion.status !== 0) throw new Error('Cannot query nvcc version.');
+const manifest = spawnSync(nvcc, [...cubFlags, '-M', 'benchmarks/cub_misc.cu'], {
+    cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+});
+if (manifest.error) throw manifest.error;
+if (manifest.status !== 0) throw new Error('Cannot query CUB dependencies:\n' + manifest.stderr);
+const separator = manifest.stdout.indexOf(':');
+if (separator < 0) throw new Error('Invalid NVCC dependency manifest.');
+// NVCC emits Make prerequisites with escaped whitespace and line continuations.
+const prerequisites = manifest.stdout.slice(separator + 1).replace(/\\\r?\n/g, ' ')
+    .match(/(?:\\[^\r\n]|[^\s\\])+/g);
+if (!prerequisites?.length) throw new Error('Empty NVCC dependency manifest.');
+const dependencies = [...new Set(prerequisites.map(file =>
+    path.resolve(root, file.replace(/\\(.)/g, '$1').replace(/\$\$/g, '$'))))].sort();
 const sourceHash = createHash('sha256');
-for (const file of ['benchmarks/cub_misc.cu', 'benchmarks/cub_misc.h', path.join(cccl, 'cub/cub/version.cuh')]) {
-    sourceHash.update(fs.readFileSync(path.resolve(root, file)));
+sourceHash.update(JSON.stringify(dependencies));
+for (const file of dependencies) {
+    sourceHash.update(createHash('sha256').update(fs.readFileSync(file)).digest());
 }
 const fingerprint = JSON.stringify({ cccl, cuda, args: cubArgs, nvcc: nvccVersion.stdout, source: sourceHash.digest('hex') });
 const stamp = path.join(root, 'build/cub_misc.build.json');

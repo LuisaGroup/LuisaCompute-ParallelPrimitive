@@ -159,6 +159,27 @@ performance claims. git diff --check and the benchmark helper syntax check pass.
 Full repository build/test, other backends and application end-to-end timing
 were not run.
 
+### PR #7 review follow-up, 2026-10-20
+
+The benchmark helper now regenerates the NVCC dependency manifest with the
+same compilation flags and hashes every prerequisite's path and contents.
+This includes transitive CCCL, CUDA and host headers, not just version headers.
+Old cache stamps require a rebuild. Failed dependency discovery rejects reuse.
+
+`node --test benchmarks/rebuild_cuda_cub_misc.test.cjs` reproduces stale reuse
+before the fix and passes afterward with real NVCC. It covers same-size header
+edits with restored timestamps, dependency-list changes, missing headers,
+paths containing spaces and reuse without recompiling a matching object.
+The test requires CUDA and the benchmark SDK libraries; otherwise it skips.
+
+The actual benchmark was rebuilt, matching reuse passed, and all 17 cases
+passed CPU/LCPP/CUB checks at both 1M and 4M with five samples each. Existing
+CUDA RLE (979 assertions) and SegmentReduce (126 assertions) tests were rerun
+and passed. No kernel code changed. The performance tables and sanitizer/Nsight
+results above remain the 2026-10-19 measurements, not new performance evidence.
+The full suite, sanitizer and profiler were not rerun for this helper-only fix.
+Logs are local under `build/pr7-review-20261020/`, including `results.json`.
+
 ## Reproduce
 
 Use the SDK/compiler versions above. The tested XMake configuration disables
@@ -184,8 +205,8 @@ build/linux/x86_64/release/device_segment_reduce --backend=cuda
 
 The helper's `--lcpp DIR` selects frozen baseline headers without changing the
 active checkout. `--reuse-cub 1` only reuses an object whose recorded paths,
-compiler version, flags and source fingerprint match. Default behavior rebuilds
-the CUB object. Omit the case filter to run all 17 cases.
+compiler version, flags and transitive dependency fingerprint match. Default
+behavior rebuilds the CUB object. Omit the case filter to run all 17 cases.
 
 ## Saved evidence
 
