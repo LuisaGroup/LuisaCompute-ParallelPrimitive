@@ -172,6 +172,17 @@ class CompactModule : public LuisaModule
                         BlockLoad<FlagT, BLOCK_THREADS, ITEMS_PER_THREAD, BlockLoadAlgorithm::BLOCK_LOAD_WARP_TRANSPOSE, true> flag_load;
                         flag_load.Load(flag_buffer, flag_items, tile_start, valid_items, FlagT{});
                     }
+                    Var<T> predecessor;
+                    if constexpr(SELECTION == CompactSelection::Adjacent && STORE_OFFSETS)
+                    {
+                        UInt lane = warp_lane_id();
+                        predecessor = warp_read_lane(items[ITEMS_PER_THREAD - 1u], max(lane, 1u) - 1u);
+                        UInt local = thread_id().x * UInt(ITEMS_PER_THREAD);
+                        $if(lane == 0u & local < valid_items & tile_start + local > 0u)
+                        {
+                            predecessor = input_buffer.read(tile_start + local - 1u);
+                        };
+                    }
                     ArrayVar<uint, ITEMS_PER_THREAD> selected;
                     for(size_t item = 0u; item < ITEMS_PER_THREAD; ++item)
                     {
@@ -199,8 +210,15 @@ class CompactModule : public LuisaModule
                                     }
                                     else
                                     {
-                                        keep = !selection(input_buffer.read(tile_start + local - 1u),
-                                                          items[item]);
+                                        if constexpr(STORE_OFFSETS)
+                                        {
+                                            keep = !selection(predecessor, items[item]);
+                                        }
+                                        else
+                                        {
+                                            keep = !selection(input_buffer.read(tile_start + local - 1u),
+                                                              items[item]);
+                                        }
                                     }
                                 };
                             }
