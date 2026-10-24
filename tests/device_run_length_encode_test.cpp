@@ -74,6 +74,7 @@ int main(int argc, char* argv[])
     "device_run_length_encode_long_runs_across_fused_tiles"_test = [&]
     {
         for(uint count : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 10u, 12u,
+                          31u, 32u, 33u, 127u, 128u, 129u, 479u, 480u, 481u,
                           3839u, 3840u, 3841u, 5759u, 5760u, 5761u, 230413u, 230414u})
         {
             auto in      = device.create_buffer<int>(count);
